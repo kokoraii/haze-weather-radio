@@ -92,6 +92,8 @@ pub(crate) enum PipelineSpecError {
         "named GStreamer elements may contain only letters, numbers, underscores, and hyphens"
     )]
     InvalidElementName,
+    #[error("deinterlace algorithm, backend, and parity combination is unsupported")]
+    InvalidDeinterlaceCombination,
 }
 
 macro_rules! string_id {
@@ -196,7 +198,6 @@ impl PipelineSpec {
                 return Err(PipelineSpecError::DuplicateOutputId);
             }
             if output.enabled {
-                output.validate(self.program_map.as_ref())?;
                 match (self.audio.topology, output.audio.codec) {
                     (AudioTopologyMode::PreserveNativeTracks, AudioCodecPolicy::Encode(_)) => {
                         return Err(PipelineSpecError::PreserveNativeRequiresMatchInput)
@@ -206,6 +207,7 @@ impl PipelineSpec {
                     }
                     _ => {}
                 }
+                output.validate(self.program_map.as_ref())?;
             }
         }
         Ok(())
@@ -224,11 +226,13 @@ impl ProgramInput {
         match self {
             Self::Device(input) => {
                 validate_text("device ID", &input.persistent_id)?;
-                input.decoder.validate()
+                input.decoder.validate()?;
+                input.deinterlace.validate()
             }
             Self::UriOrFile(input) => {
                 validate_text("input location", &input.location)?;
-                input.decoder.validate()
+                input.decoder.validate()?;
+                input.deinterlace.validate()
             }
             Self::Dummy(input) => input.format.validate(),
         }
@@ -254,6 +258,7 @@ pub(crate) struct DeviceInput {
     pub(crate) backend: DeviceBackend,
     pub(crate) persistent_id: String,
     pub(crate) decoder: DecoderPreference,
+    pub(crate) deinterlace: DeinterlaceSpec,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -261,6 +266,7 @@ pub(crate) struct UriInput {
     pub(crate) location: String,
     pub(crate) demux_hint: DemuxHint,
     pub(crate) decoder: DecoderPreference,
+    pub(crate) deinterlace: DeinterlaceSpec,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,6 +301,139 @@ impl DecoderPreference {
             return Err(PipelineSpecError::InvalidElementName);
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeinterlaceAlgorithm {
+    Yadif,
+    Bwdif,
+    MotionAdaptive,
+}
+
+impl DeinterlaceAlgorithm {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Yadif => "yadif",
+            Self::Bwdif => "bwdif",
+            Self::MotionAdaptive => "motion_adaptive",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeinterlaceBackend {
+    Auto,
+    Software,
+    Vaapi,
+    QuickSync,
+    D3d11,
+    Cuda,
+    Vulkan,
+    OpenGl,
+}
+
+impl DeinterlaceBackend {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Software => "software",
+            Self::Vaapi => "vaapi",
+            Self::QuickSync => "quicksync",
+            Self::D3d11 => "d3d11",
+            Self::Cuda => "cuda",
+            Self::Vulkan => "vulkan",
+            Self::OpenGl => "opengl",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeinterlaceCadence {
+    Field,
+    Frame,
+}
+
+impl DeinterlaceCadence {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Field => "field",
+            Self::Frame => "frame",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeinterlaceParity {
+    Auto,
+    TopFirst,
+    BottomFirst,
+}
+
+impl DeinterlaceParity {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::TopFirst => "tff",
+            Self::BottomFirst => "bff",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DeinterlaceSpec {
+    pub(crate) algorithm: DeinterlaceAlgorithm,
+    pub(crate) backend: DeinterlaceBackend,
+    pub(crate) cadence: DeinterlaceCadence,
+    pub(crate) parity: DeinterlaceParity,
+}
+
+impl Default for DeinterlaceSpec {
+    fn default() -> Self {
+        Self {
+            algorithm: DeinterlaceAlgorithm::Yadif,
+            backend: DeinterlaceBackend::Software,
+            cadence: DeinterlaceCadence::Field,
+            parity: DeinterlaceParity::Auto,
+        }
+    }
+}
+
+impl DeinterlaceSpec {
+    fn validate(self) -> Result<(), PipelineSpecError> {
+        if self.backend != DeinterlaceBackend::Auto
+            && self.backend != DeinterlaceBackend::Software
+            && self.parity != DeinterlaceParity::Auto
+        {
+            return Err(PipelineSpecError::InvalidDeinterlaceCombination);
+        }
+        let supported = match self.algorithm {
+            DeinterlaceAlgorithm::Yadif => matches!(
+                self.backend,
+                DeinterlaceBackend::Auto | DeinterlaceBackend::Software | DeinterlaceBackend::Cuda
+            ),
+            DeinterlaceAlgorithm::Bwdif => matches!(
+                self.backend,
+                DeinterlaceBackend::Auto
+                    | DeinterlaceBackend::Software
+                    | DeinterlaceBackend::Cuda
+                    | DeinterlaceBackend::Vulkan
+            ),
+            DeinterlaceAlgorithm::MotionAdaptive => matches!(
+                self.backend,
+                DeinterlaceBackend::Auto
+                    | DeinterlaceBackend::Software
+                    | DeinterlaceBackend::Vaapi
+                    | DeinterlaceBackend::QuickSync
+                    | DeinterlaceBackend::D3d11
+                    | DeinterlaceBackend::OpenGl
+            ),
+        };
+        if supported {
+            Ok(())
+        } else {
+            Err(PipelineSpecError::InvalidDeinterlaceCombination)
+        }
     }
 }
 
@@ -496,6 +635,14 @@ impl ChannelLayout {
             Self::Mono => 1,
             Self::Stereo => 2,
             Self::Surround51 => 6,
+        }
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mono => "mono",
+            Self::Stereo => "stereo",
+            Self::Surround51 => "surround_5_1",
         }
     }
 }
@@ -1145,6 +1292,30 @@ mod tests {
         assert_eq!(input.format.frame_rate.numerator.get(), 30_000);
         assert_eq!(input.format.frame_rate.denominator.get(), 1_001);
         assert_eq!(input.format.scan, ScanMode::Progressive);
+    }
+
+    #[test]
+    fn deinterlace_domain_rejects_invalid_backend_and_parity_combinations() {
+        assert_eq!(DeinterlaceSpec::default().validate(), Ok(()));
+        let invalid_backend = DeinterlaceSpec {
+            algorithm: DeinterlaceAlgorithm::Yadif,
+            backend: DeinterlaceBackend::Vaapi,
+            ..DeinterlaceSpec::default()
+        };
+        assert_eq!(
+            invalid_backend.validate(),
+            Err(PipelineSpecError::InvalidDeinterlaceCombination)
+        );
+        let invalid_parity = DeinterlaceSpec {
+            algorithm: DeinterlaceAlgorithm::MotionAdaptive,
+            backend: DeinterlaceBackend::Vaapi,
+            parity: DeinterlaceParity::TopFirst,
+            ..DeinterlaceSpec::default()
+        };
+        assert_eq!(
+            invalid_parity.validate(),
+            Err(PipelineSpecError::InvalidDeinterlaceCombination)
+        );
     }
 
     #[test]

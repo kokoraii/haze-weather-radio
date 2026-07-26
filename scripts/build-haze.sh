@@ -78,6 +78,10 @@ require_gstreamer_build_environment() {
     echo "pkg-config is required to build haze-cgen with gstreamer-rs" >&2
     exit 1
   fi
+  if ! command -v gst-inspect-1.0 >/dev/null 2>&1; then
+    echo "gst-inspect-1.0 is required to validate the haze-cgen runtime" >&2
+    exit 1
+  fi
   local missing=()
   local package
   for package in gstreamer-1.0 gstreamer-app-1.0 gstreamer-audio-1.0 gstreamer-video-1.0; do
@@ -87,6 +91,23 @@ require_gstreamer_build_environment() {
   done
   if (( ${#missing[@]} > 0 )); then
     printf 'Missing GStreamer pkg-config package(s) required for haze-cgen: %s\n' "${missing[*]}" >&2
+    exit 1
+  fi
+  local missing_elements=()
+  local element
+  for element in x264enc avenc_aac flvmux; do
+    if ! gst-inspect-1.0 "$element" >/dev/null 2>&1; then
+      missing_elements+=("$element")
+    fi
+  done
+  if ! gst-inspect-1.0 rtmp2sink >/dev/null 2>&1 \
+    && ! gst-inspect-1.0 rtmpsink >/dev/null 2>&1; then
+    missing_elements+=("rtmp2sink-or-rtmpsink")
+  fi
+  if (( ${#missing_elements[@]} > 0 )); then
+    printf 'Missing GStreamer element(s) required by the bundled CGEN profile: %s\n' "${missing_elements[*]}" >&2
+    echo "Install the GStreamer x264, libav, FLV, and RTMP plugins before building a portable runtime." >&2
+    echo "Package examples: Debian/Ubuntu gstreamer1.0-plugins-ugly, RHEL/AlmaLinux gstreamer1-plugins-ugly, FreeBSD gstreamer1-plugins-x264." >&2
     exit 1
   fi
 }
@@ -273,8 +294,8 @@ copy_gstreamer_runtime() {
   fi
 }
 
+require_gstreamer_build_environment
 if [[ "$skip_cargo_build" -eq 0 ]]; then
-  require_gstreamer_build_environment
   cargo_profile_args=()
   if [[ "$profile" == "release" ]]; then
     cargo_profile_args=(--release)

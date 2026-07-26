@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <cgenEncoders schema_version="2" updated_at="2026-07-03T17:43:17Z">
   <feed id="CFSP-CAP" updated_at="2026-07-03T17:43:17Z">
-    <video codec="x264enc" bitrate_kbps="12000" gop="15" bframes="0"></video>
+    <video codec="x264enc" bitrate_kbps="8000" gop="120" bframes="0" preset="veryfast" tune="zerolatency"></video>
     <audio codec="avenc_aac" bitrate_kbps="192"></audio>
   </feed>
   <output id="primary" updated_at="2026-07-03T17:43:17Z">
-    <video codec="x264enc" bitrate_kbps="12000" gop="15" bframes="0"></video>
+    <video codec="x264enc" bitrate_kbps="8000" gop="120" bframes="0" preset="veryfast" tune="zerolatency"></video>
     <audio codec="avenc_aac" bitrate_kbps="192"></audio>
   </output>
 </cgenEncoders>

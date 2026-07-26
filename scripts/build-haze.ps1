@@ -172,11 +172,37 @@ function Assert-Clang64GStreamerBuildEnvironment {
     $Clang64Bin = Join-Path $Clang64Root "bin"
     $Clang64Lib = Join-Path $Clang64Root "lib"
     $PkgConfig = Join-Path $Clang64Bin "pkg-config.exe"
+    $GstInspect = Join-Path $Clang64Bin "gst-inspect-1.0.exe"
     foreach ($Package in @("gstreamer-1.0", "gstreamer-app-1.0", "gstreamer-audio-1.0", "gstreamer-video-1.0")) {
         & $PkgConfig --exists $Package
         if ($LASTEXITCODE -ne 0) {
             throw "required MSYS2 CLANG64 GStreamer pkg-config package not found: $Package. Install mingw-w64-clang-x86_64-gstreamer and mingw-w64-clang-x86_64-gst-plugins-base."
         }
+    }
+    if (-not (Test-Path -LiteralPath $GstInspect -PathType Leaf)) {
+        throw "required MSYS2 CLANG64 GStreamer inspector not found: $GstInspect"
+    }
+    $MissingElements = New-Object System.Collections.Generic.List[string]
+    foreach ($Element in @("x264enc", "avenc_aac", "flvmux")) {
+        & $GstInspect $Element *> $null
+        if ($LASTEXITCODE -ne 0) {
+            [void] $MissingElements.Add($Element)
+        }
+    }
+    $HasRtmpSink = $false
+    foreach ($Element in @("rtmp2sink", "rtmpsink")) {
+        & $GstInspect $Element *> $null
+        if ($LASTEXITCODE -eq 0) {
+            $HasRtmpSink = $true
+            break
+        }
+    }
+    if (-not $HasRtmpSink) {
+        [void] $MissingElements.Add("rtmp2sink-or-rtmpsink")
+    }
+    if ($MissingElements.Count -gt 0) {
+        $Joined = [string]::Join(", ", $MissingElements)
+        throw "missing GStreamer element(s) required by the bundled CGEN profile: $Joined. Install mingw-w64-clang-x86_64-gst-plugins-ugly, mingw-w64-clang-x86_64-gst-libav, mingw-w64-clang-x86_64-gst-plugins-bad, and mingw-w64-clang-x86_64-gst-plugins-good."
     }
 
     foreach ($RequiredPath in @(

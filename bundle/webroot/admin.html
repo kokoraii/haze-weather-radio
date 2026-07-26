@@ -145,8 +145,8 @@
         .cgen-actions { display: flex; flex-wrap: wrap; gap: 6px; }
         .cgen-actions button { min-height: 30px; justify-content: center; }
         .cgen-preview-wrap { position: relative; padding: 8px; border: 1px solid var(--border-deep); border-radius: var(--radius-sm); background: #050505; box-shadow: var(--bevel-sunken); }
-        .cgen-preview,
-        .cgen-preview-stream { display: block; width: 100%; aspect-ratio: 16 / 9; border: 1px solid rgba(255,255,255,.18); background: #000; object-fit: contain; }
+        .cgen-preview { display: block; width: 100%; aspect-ratio: 16 / 9; border: 1px solid rgba(255,255,255,.18); background: #000; object-fit: contain; }
+        .cgen-preview-stream { display: block; width: 100%; height: auto; border: 1px solid rgba(255,255,255,.18); background: #000; object-fit: contain; image-rendering: auto; }
         .cgen-preview-stream[hidden] { display: none; }
         .cgen-meta-list { display: grid; gap: 6px; }
         .cgen-meta-list div { min-width: 0; padding: 7px 8px; border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); background: color-mix(in srgb, var(--bg) 38%, transparent); box-shadow: var(--bevel-sunken); }
@@ -1148,6 +1148,44 @@
                                         <span>Decoder</span>
                                         <select id="cgenHardwareDecoder"></select>
                                     </label>
+                                    <p class="cgen-subsection cgen-conditional" data-cgen-input-option="uri_or_file stream device">Deinterlacing</p>
+                                    <label class="daemon-field cgen-conditional" data-cgen-input-option="uri_or_file stream device">
+                                        <span>Algorithm</span>
+                                        <select id="cgenDeinterlaceAlgorithm">
+                                            <option value="yadif" selected>YADIF</option>
+                                            <option value="bwdif">BWDIF</option>
+                                            <option value="motion_adaptive">Motion adaptive</option>
+                                        </select>
+                                    </label>
+                                    <label class="daemon-field cgen-conditional" data-cgen-input-option="uri_or_file stream device">
+                                        <span>Backend</span>
+                                        <select id="cgenDeinterlaceBackend">
+                                            <option value="software" selected>Software</option>
+                                            <option value="auto">Best available</option>
+                                            <option value="vaapi">VA-API</option>
+                                            <option value="quicksync">Intel Quick Sync</option>
+                                            <option value="d3d11">Direct3D 11</option>
+                                            <option value="cuda">NVIDIA CUDA</option>
+                                            <option value="vulkan">Vulkan</option>
+                                            <option value="opengl">OpenGL</option>
+                                        </select>
+                                    </label>
+                                    <label class="daemon-field cgen-conditional" data-cgen-input-option="uri_or_file stream device">
+                                        <span>Output cadence</span>
+                                        <select id="cgenDeinterlaceCadence">
+                                            <option value="field" selected>Field rate, one frame per field</option>
+                                            <option value="frame">Frame rate, one frame per pair</option>
+                                        </select>
+                                    </label>
+                                    <label class="daemon-field cgen-conditional" data-cgen-input-option="uri_or_file stream device">
+                                        <span>Field order override</span>
+                                        <select id="cgenDeinterlaceParity">
+                                            <option value="auto" selected>Auto from stream metadata</option>
+                                            <option value="tff">Top field first</option>
+                                            <option value="bff">Bottom field first</option>
+                                        </select>
+                                    </label>
+                                    <p id="cgenDeinterlaceHint" class="cgen-stage-note cgen-conditional" data-cgen-input-option="uri_or_file stream device">YADIF software at field rate is the portable high-quality default. Unavailable hardware combinations are disabled by the runtime catalog.</p>
                                     <label class="daemon-field cgen-conditional" data-cgen-input-option="device" hidden>
                                         <span>Device backend</span>
                                         <select id="cgenDeviceBackend">
@@ -1425,11 +1463,12 @@
                             <section class="section-block cgen-tab-panel" id="cgenTabMapping" role="tabpanel" aria-labelledby="cgenTabButtonMapping" data-cgen-panel="mapping" hidden>
                                 <div class="section-hd"><span>Program Mapping</span></div>
                                 <div class="section-body cgen-editor-grid">
-                                    <p class="cgen-stage-note">Program maps apply only to MPEG-TS destinations. PAT remains on PID 0. Auto assignment is deterministic and skips reserved or manually assigned PIDs.</p>
+                                    <p class="cgen-stage-note">Program maps apply only to MPEG-TS destinations. Follow input reads PAT and PMT from the live source, then uses the detected program, PMT, video, primary audio, and SCTE-35 PIDs. Auto assignment is the safe fallback when no source map is available.</p>
                                     <label class="daemon-field">
-                                        <span>PID assignment</span>
+                                        <span>Program map source</span>
                                         <select id="cgenPidAssignment">
-                                            <option value="auto">Auto</option>
+                                            <option value="source">Follow input</option>
+                                            <option value="auto">Automatic output map</option>
                                             <option value="manual">Manual</option>
                                         </select>
                                     </label>

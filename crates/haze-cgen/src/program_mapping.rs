@@ -248,7 +248,7 @@ pub(crate) fn build_gstreamer_program_map(
     );
     for (program_number, program) in &programs {
         fields.push(format!(
-            "PMT_{program_number}=(int){}",
+            "PMT_{program_number}=(uint){}",
             program.pmt_pid.get()
         ));
         fields.push(format!(
@@ -565,7 +565,7 @@ mod tests {
             .expect("program map");
         assert_eq!(
             map.structure(),
-            "program_map,sink_256=(int)1,sink_257=(int)1,sink_258=(int)1,sink_288=(int)2,sink_289=(int)2,PMT_1=(int)4096,PCR_1=(int)256,PMT_2=(int)4097,PCR_2=(int)288"
+            "program_map,sink_256=(int)1,sink_257=(int)1,sink_258=(int)1,sink_288=(int)2,sink_289=(int)2,PMT_1=(uint)4096,PCR_1=(int)256,PMT_2=(uint)4097,PCR_2=(int)288"
         );
         let status = map.redacted_status_value();
         assert_eq!(status["redacted"], true);

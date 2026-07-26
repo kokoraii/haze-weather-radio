@@ -12,12 +12,14 @@ use serde_json::Value;
 use crate::architecture::{
     AncillaryPolicy, AudioCodec, AudioCodecPolicy, AudioEncoderSpec, AudioRoutingSpec,
     AudioStreamMap, AudioTopologyMode, AudioTrackId, ChannelLayout, CompositorSpec,
-    DecoderPreference, DemuxHint, DeviceBackend, DeviceInput, DummyInput, EncoderOutputSpec,
-    FeedId, FieldOrder, GainDb, MpegTsPid, MpegTsProgramSpec, OutputDestination, OutputId,
-    PassPolicy, PidAssignment, PipelineSpec, ProgramInput, ProgramMapSpec, RateControl, Rational,
-    Rgba8, ScanMode, SceneId, Scte35Map, ServiceMetadata, UriInput, VideoCodec, VideoEncoderSpec,
-    VideoFormat,
+    DecoderPreference, DeinterlaceAlgorithm, DeinterlaceBackend, DeinterlaceCadence,
+    DeinterlaceParity, DeinterlaceSpec, DemuxHint, DeviceBackend, DeviceInput, DummyInput,
+    EncoderOutputSpec, FeedId, FieldOrder, GainDb, MpegTsPid, MpegTsProgramSpec, OutputDestination,
+    OutputId, PassPolicy, PidAssignment, PipelineSpec, ProgramInput, ProgramMapSpec, RateControl,
+    Rational, Rgba8, ScanMode, SceneId, Scte35Map, ServiceMetadata, UriInput, VideoCodec,
+    VideoEncoderSpec, VideoFormat,
 };
+use crate::input_program_map::ProgramMappingMode;
 
 const MAX_CGEN_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_CGEN_ENCODERS_BYTES: u64 = 2 * 1024 * 1024;
@@ -111,6 +113,14 @@ pub(crate) struct EndpointConfig {
     pub(crate) hardware_decoder_enabled: String,
     #[serde(rename = "@hardware_decoder", default)]
     pub(crate) hardware_decoder: String,
+    #[serde(rename = "@deinterlace_algorithm", default)]
+    pub(crate) deinterlace_algorithm: String,
+    #[serde(rename = "@deinterlace_backend", default)]
+    pub(crate) deinterlace_backend: String,
+    #[serde(rename = "@deinterlace_cadence", default)]
+    pub(crate) deinterlace_cadence: String,
+    #[serde(rename = "@deinterlace_parity", default)]
+    pub(crate) deinterlace_parity: String,
     #[serde(rename = "@device_backend", default)]
     pub(crate) device_backend: String,
     #[serde(rename = "@device_id", default)]
@@ -148,6 +158,10 @@ impl EndpointConfig {
             || self.audio_bitrate_kbps.is_some()
             || !self.hardware_decoder_enabled.trim().is_empty()
             || !self.hardware_decoder.trim().is_empty()
+            || !self.deinterlace_algorithm.trim().is_empty()
+            || !self.deinterlace_backend.trim().is_empty()
+            || !self.deinterlace_cadence.trim().is_empty()
+            || !self.deinterlace_parity.trim().is_empty()
             || !self.device_backend.trim().is_empty()
             || !self.device_id.trim().is_empty()
             || self.width > 0
@@ -274,6 +288,8 @@ pub(crate) struct CompositorConfig {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct ProgramMappingConfig {
+    #[serde(rename = "@mode", default)]
+    pub(crate) mode: String,
     #[serde(rename = "@transport_stream_id", default)]
     pub(crate) transport_stream_id: u16,
     #[serde(rename = "program", default)]
@@ -1033,9 +1049,14 @@ impl FeedConfig {
         Ok(spec)
     }
 
+    pub(crate) fn deinterlace_spec(&self) -> Result<DeinterlaceSpec> {
+        deinterlace_spec(&self.program_input)
+    }
+
     fn program_input_spec(&self) -> Result<ProgramInput> {
         let input_type = self.program_input.input_type.trim().to_ascii_lowercase();
         let decoder = decoder_preference(&self.program_input)?;
+        let deinterlace = deinterlace_spec(&self.program_input)?;
         match input_type.as_str() {
             "device" | "v4l2" | "directshow" | "dshow" => {
                 let backend = match input_type.as_str() {
@@ -1057,6 +1078,7 @@ impl FeedConfig {
                     backend,
                     persistent_id: self.program_input.device_id.trim().to_string(),
                     decoder,
+                    deinterlace,
                 }))
             }
             "dummy" | "none" | "no_input" => {
@@ -1088,6 +1110,7 @@ impl FeedConfig {
                     location: self.program_input.url.trim().to_string(),
                     demux_hint: demux_hint(&self.program_input.format)?,
                     decoder,
+                    deinterlace,
                 }))
             }
             other => bail!("unsupported program input type {other:?}"),
@@ -1113,8 +1136,26 @@ impl FeedConfig {
         })
     }
 
+    pub(crate) fn program_mapping_mode(&self) -> Result<ProgramMappingMode> {
+        match self
+            .program_mapping
+            .mode
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "source" | "input" | "input_derived" | "follow_input" => Ok(ProgramMappingMode::Source),
+            "auto" | "automatic" => Ok(ProgramMappingMode::Auto),
+            "manual" | "configured" => Ok(ProgramMappingMode::Manual),
+            "" if self.program_mapping.programs.is_empty() => Ok(ProgramMappingMode::Source),
+            "" => Ok(ProgramMappingMode::Manual),
+            other => bail!("unsupported program mapping mode {other:?}"),
+        }
+    }
+
     fn program_map_spec(&self) -> Result<ProgramMapSpec> {
-        if !self.program_mapping.programs.is_empty() {
+        let mapping_mode = self.program_mapping_mode()?;
+        if mapping_mode == ProgramMappingMode::Manual && !self.program_mapping.programs.is_empty() {
             let programs = self
                 .program_mapping
                 .programs
@@ -1135,6 +1176,7 @@ impl FeedConfig {
             bail!("MPEG-TS CGEN output requires at least one enabled video rendition");
         }
         let enabled_audio = self.enabled_audio_renditions();
+        let default_service_name = non_empty(&self.name).unwrap_or(self.id.as_str());
         let mut programs = Vec::with_capacity(enabled_videos.len());
         for (video_index, video) in enabled_videos.iter().enumerate() {
             let fallback_program = u16::try_from(video_index + 1).unwrap_or(u16::MAX);
@@ -1162,13 +1204,11 @@ impl FeedConfig {
             let audio = audio_for_program
                 .into_iter()
                 .map(|stream| {
-                    let explicitly_routed = stream.program == Some(i32::from(program_number));
                     Ok(AudioStreamMap {
                         track_id: AudioTrackId::parse(&stream.id)?,
-                        // A legacy audio PID belongs to the program declared by
-                        // that rendition. Replicated compatibility tracks use
-                        // deterministic auto allocation so PIDs cannot collide.
-                        pid: if explicitly_routed {
+                        pid: if mapping_mode == ProgramMappingMode::Manual
+                            && stream.program == Some(i32::from(program_number))
+                        {
                             stream
                                 .audio_pid
                                 .map(pid_assignment_i32)
@@ -1184,21 +1224,30 @@ impl FeedConfig {
                 program_number: NonZeroU16::new(program_number)
                     .ok_or_else(|| anyhow::anyhow!("program number must be non-zero"))?,
                 service: ServiceMetadata {
-                    service_name: fallback_text(&self.program_output.service_name, &self.name),
+                    service_name: fallback_text(
+                        &self.program_output.service_name,
+                        default_service_name,
+                    ),
                     provider_name: fallback_text(&self.program_output.provider_name, "Haze"),
                 },
-                pmt_pid: video
-                    .pmt_pid
-                    .map(pid_assignment_i32)
-                    .transpose()?
-                    .unwrap_or(PidAssignment::Auto),
-                video_pid: Some(
+                pmt_pid: if mapping_mode == ProgramMappingMode::Manual {
+                    video
+                        .pmt_pid
+                        .map(pid_assignment_i32)
+                        .transpose()?
+                        .unwrap_or(PidAssignment::Auto)
+                } else {
+                    PidAssignment::Auto
+                },
+                video_pid: Some(if mapping_mode == ProgramMappingMode::Manual {
                     video
                         .video_pid
                         .map(pid_assignment_i32)
                         .transpose()?
-                        .unwrap_or(PidAssignment::Auto),
-                ),
+                        .unwrap_or(PidAssignment::Auto)
+                } else {
+                    PidAssignment::Auto
+                }),
                 audio,
                 scte35: (video_index == 0
                     && pass_policy(&self.ancillary.scte35)? == PassPolicy::Pass)
@@ -1210,7 +1259,11 @@ impl FeedConfig {
             });
         }
         Ok(ProgramMapSpec {
-            transport_stream_id: self.program_output.transport_stream_id.max(1),
+            transport_stream_id: self
+                .program_mapping
+                .transport_stream_id
+                .max(self.program_output.transport_stream_id)
+                .max(1),
             programs,
         })
     }
@@ -1327,6 +1380,63 @@ fn decoder_preference(endpoint: &EndpointConfig) -> Result<DecoderPreference> {
     Ok(preference)
 }
 
+fn deinterlace_spec(endpoint: &EndpointConfig) -> Result<DeinterlaceSpec> {
+    let algorithm = match endpoint
+        .deinterlace_algorithm
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "yadif" => DeinterlaceAlgorithm::Yadif,
+        "bwdif" => DeinterlaceAlgorithm::Bwdif,
+        "motion_adaptive" | "motion-adaptive" | "adaptive" => DeinterlaceAlgorithm::MotionAdaptive,
+        other => bail!("unsupported deinterlace algorithm {other:?}"),
+    };
+    let backend = match endpoint
+        .deinterlace_backend
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "auto" => DeinterlaceBackend::Auto,
+        "" | "software" | "cpu" => DeinterlaceBackend::Software,
+        "vaapi" | "va" => DeinterlaceBackend::Vaapi,
+        "qsv" | "quicksync" | "quick_sync" => DeinterlaceBackend::QuickSync,
+        "d3d11" | "direct3d11" => DeinterlaceBackend::D3d11,
+        "cuda" | "nvidia" => DeinterlaceBackend::Cuda,
+        "vulkan" => DeinterlaceBackend::Vulkan,
+        "gl" | "opengl" => DeinterlaceBackend::OpenGl,
+        other => bail!("unsupported deinterlace backend {other:?}"),
+    };
+    let cadence = match endpoint
+        .deinterlace_cadence
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "field" | "field_rate" | "bob" => DeinterlaceCadence::Field,
+        "frame" | "frame_rate" | "single" => DeinterlaceCadence::Frame,
+        other => bail!("unsupported deinterlace cadence {other:?}"),
+    };
+    let parity = match endpoint
+        .deinterlace_parity
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "auto" => DeinterlaceParity::Auto,
+        "tff" | "top" | "top_first" => DeinterlaceParity::TopFirst,
+        "bff" | "bottom" | "bottom_first" => DeinterlaceParity::BottomFirst,
+        other => bail!("unsupported deinterlace parity {other:?}"),
+    };
+    Ok(DeinterlaceSpec {
+        algorithm,
+        backend,
+        cadence,
+        parity,
+    })
+}
+
 fn demux_hint(raw: &str) -> Result<DemuxHint> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "" | "auto" => Ok(DemuxHint::Auto),
@@ -1374,7 +1484,9 @@ fn channel_layout(raw: &str) -> Result<ChannelLayout> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "mono" | "1" | "1.0" => Ok(ChannelLayout::Mono),
         "" | "stereo" | "2" | "2.0" => Ok(ChannelLayout::Stereo),
-        "5.1" | "surround51" | "surround_51" | "6" => Ok(ChannelLayout::Surround51),
+        "5.1" | "surround51" | "surround_51" | "surround_5_1" | "6" => {
+            Ok(ChannelLayout::Surround51)
+        }
         other => bail!("unsupported forced audio channel layout {other:?}"),
     }
 }
@@ -2072,7 +2184,7 @@ pub(crate) fn resolve_path(base: &Path, path: &Path) -> PathBuf {
 pub(crate) fn allowed_video_size(width: u32, height: u32) -> bool {
     matches!(
         (width, height),
-        (720, 480) | (720, 576) | (1280, 720) | (1920, 1080)
+        (720, 480) | (720, 540) | (720, 576) | (1280, 720) | (1920, 1080)
     )
 }
 
@@ -2493,7 +2605,7 @@ mod tests {
   <feed id="CAP-IT-ALL" enabled="true">
     <programInput url="udp://127.0.0.1:5000" format="mpegts"/>
     <priorityInput feed_id="CAP-IT-ALL" audio_source="priority"/>
-    <programOutput url="${HAZE_CGEN_TEST_OUTPUT}" format="rtmp" vcodec="h264" acodec="ac3"/>
+    <programOutput url="${HAZE_CGEN_TEST_OUTPUT}" format="rtmp" vcodec="h264" acodec="aac"/>
     <video width="1920" height="1080" fps="30000/1001"/>
     <audio idle="source" alert_mode="replace"/>
     <ladder>
@@ -2576,6 +2688,7 @@ mod tests {
     #[test]
     fn validates_supported_sizes() {
         assert!(allowed_video_size(720, 480));
+        assert!(allowed_video_size(720, 540));
         assert!(allowed_video_size(720, 576));
         assert!(allowed_video_size(1280, 720));
         assert!(allowed_video_size(1920, 1080));
@@ -2719,6 +2832,7 @@ mod tests {
             program_mapping: Default::default(),
             outputs: Default::default(),
             encoder: Default::default(),
+            output_encoders: Default::default(),
         };
         assert!(feed.matches_feed("sk-0001"));
         assert!(feed.matches_feed("CAP-IT-ALL"));
@@ -2754,6 +2868,44 @@ mod tests {
         assert_eq!(audios.len(), 2);
         assert_eq!(audios[0].channels(), 6);
         assert_eq!(audios[1].channels(), 2);
+    }
+
+    #[test]
+    fn source_program_mapping_uses_automatic_ids_until_input_is_detected() {
+        let xml = r#"
+<cgen enabled="true">
+  <feed id="SOURCE-MAP" enabled="true">
+    <programInput url="udp://239.0.0.1:9000" format="mpegts"/>
+    <priorityInput feed_id="SOURCE-MAP" format="priority-audio"/>
+    <programOutput url="udp://239.0.0.2:9001" format="mpegts" vcodec="mpeg2video" acodec="ac3"/>
+    <video width="720" height="480" fps="30000/1001" interlaced="true" field_order="tff" standard="atsc"/>
+    <audio idle="source" alert_mode="replace"/>
+    <ladder>
+      <video id="hd" enabled="true" width="720" height="480" fps="30000/1001" interlaced="true" field_order="tff" standard="atsc" program="1" video_pid="512" pmt_pid="4097"/>
+      <audio id="stereo" enabled="true" channels="2" acodec="ac3" language="eng" program="1" audio_pid="513" pmt_pid="4097"/>
+    </ladder>
+    <programMapping mode="source" transport_stream_id="9">
+      <program number="4" service_name="Ignored IDs" provider_name="Haze" pmt_pid="5000" video_pid="5001">
+        <audio track_id="stereo" pid="5002"/>
+      </program>
+    </programMapping>
+  </feed>
+</cgen>"#;
+        let parsed: CgenConfig = quick_xml::de::from_str(xml).expect("parse");
+        let mut feeds = parsed.enabled_feeds().expect("feeds");
+        let feed = feeds.remove(0);
+        assert_eq!(
+            feed.program_mapping_mode().expect("mapping mode"),
+            ProgramMappingMode::Source
+        );
+
+        let pipeline = feed.pipeline_spec().expect("pipeline");
+        let map = pipeline.program_map.expect("program map");
+        assert_eq!(map.transport_stream_id, 9);
+        assert_eq!(map.programs[0].program_number.get(), 1);
+        assert_eq!(map.programs[0].pmt_pid, PidAssignment::Auto);
+        assert_eq!(map.programs[0].video_pid, Some(PidAssignment::Auto));
+        assert_eq!(map.programs[0].audio[0].pid, PidAssignment::Auto);
     }
 
     #[test]
@@ -2841,6 +2993,36 @@ mod tests {
         assert!(demux_hint("dash").is_err());
         assert!(scan_mode(true, "sideways").is_err());
         assert!(channel_layout("7.1").is_err());
+        let invalid = EndpointConfig {
+            deinterlace_algorithm: "blur-o-matic".to_string(),
+            ..Default::default()
+        };
+        assert!(deinterlace_spec(&invalid).is_err());
+    }
+
+    #[test]
+    fn deinterlace_defaults_and_explicit_tokens_are_typed() {
+        assert_eq!(
+            deinterlace_spec(&EndpointConfig::default()).expect("defaults"),
+            DeinterlaceSpec::default()
+        );
+        let endpoint = EndpointConfig {
+            deinterlace_algorithm: "motion_adaptive".to_string(),
+            deinterlace_backend: "vaapi".to_string(),
+            deinterlace_cadence: "frame".to_string(),
+            deinterlace_parity: "auto".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            deinterlace_spec(&endpoint).expect("explicit deinterlace spec"),
+            DeinterlaceSpec {
+                algorithm: DeinterlaceAlgorithm::MotionAdaptive,
+                backend: DeinterlaceBackend::Vaapi,
+                cadence: DeinterlaceCadence::Frame,
+                parity: DeinterlaceParity::Auto,
+            }
+        );
     }
 
     #[test]

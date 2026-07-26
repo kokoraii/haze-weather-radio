@@ -6,6 +6,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn write(path: &Path, raw: &[u8]) -> io::Result<()> {
+    write_impl(path, raw, true)
+}
+
+pub(crate) fn write_ephemeral(path: &Path, raw: &[u8]) -> io::Result<()> {
+    write_impl(path, raw, false)
+}
+
+fn write_impl(path: &Path, raw: &[u8], durable: bool) -> io::Result<()> {
     let destination = path.to_path_buf();
     let directory = destination.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(directory)?;
@@ -22,12 +30,17 @@ pub(crate) fn write(path: &Path, raw: &[u8]) -> io::Result<()> {
     }
 
     let (temporary_path, mut temporary) = create_temporary_file(directory, &destination)?;
-    let result = (|| {
+    let result: io::Result<()> = (|| {
         temporary.write_all(raw)?;
-        temporary.sync_all()?;
+        if durable {
+            temporary.sync_all()?;
+        }
         drop(temporary);
-        atomic_replace(&temporary_path, &destination)?;
-        sync_parent_directory(&destination)
+        atomic_replace(&temporary_path, &destination, durable)?;
+        if durable {
+            sync_parent_directory(&destination)?;
+        }
+        Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary_path);
@@ -60,12 +73,12 @@ fn create_temporary_file(directory: &Path, destination: &Path) -> io::Result<(Pa
 }
 
 #[cfg(not(windows))]
-fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()> {
+fn atomic_replace(source: &Path, destination: &Path, _durable: bool) -> io::Result<()> {
     fs::rename(source, destination)
 }
 
 #[cfg(windows)]
-fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()> {
+fn atomic_replace(source: &Path, destination: &Path, durable: bool) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
 
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
@@ -91,7 +104,7 @@ fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()> {
         MoveFileExW(
             source.as_ptr(),
             destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            MOVEFILE_REPLACE_EXISTING | if durable { MOVEFILE_WRITE_THROUGH } else { 0 },
         )
     };
     if replaced == 0 {
@@ -116,7 +129,7 @@ fn sync_parent_directory(_path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::write;
+    use super::{write, write_ephemeral};
 
     #[test]
     fn repeated_writes_replace_the_existing_file() {
@@ -132,5 +145,14 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let error = write(directory.path(), b"data").expect_err("directory destination rejected");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn ephemeral_writes_still_replace_atomically() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("preview.jpg");
+        write_ephemeral(&path, b"first").expect("first preview");
+        write_ephemeral(&path, b"second").expect("replacement preview");
+        assert_eq!(std::fs::read(path).expect("preview file"), b"second");
     }
 }

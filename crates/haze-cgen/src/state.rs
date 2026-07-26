@@ -827,7 +827,7 @@ mod tests {
 
         let banner = state.banner_for("*").expect("wildcard banner");
         assert_eq!(banner.signature, "wildcard-visual");
-        assert!(state.banner_for("CAP-IT-ALL").is_none());
+        assert!(state.banner_for("CAP-IT-ALL").is_some());
     }
 
     #[test]
@@ -1012,20 +1012,21 @@ mod tests {
                 "duration_ms": 60000
             }
         })));
-        assert!(state.priority_audio_for("CAP-IT-ALL").is_some());
+        assert!(state.priority_audio_for("*").is_some());
+        assert!(state.priority_audio_for("CAP-IT-ALL").is_none());
         assert!(!state.apply_event(&json!({
             "type": "alert.playout.completed",
             "feed_ids": ["CAP-IT-ALL"],
             "queue_id": "specific-complete",
             "data": {"queue_id": "specific-complete"}
         })));
-        assert!(state.priority_audio_for("CAP-IT-ALL").is_some());
+        assert!(state.priority_audio_for("*").is_some());
         assert!(state.apply_event(&json!({
             "type": "alert.playout.completed",
-            "feed_ids": ["CAP-IT-ALL"],
+            "feed_ids": ["*"],
             "queue_id": "wildcard-start",
             "data": {"queue_id": "wildcard-start"}
         })));
-        assert!(state.priority_audio_for("CAP-IT-ALL").is_none());
+        assert!(state.priority_audio_for("*").is_none());
     }
 }

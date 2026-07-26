@@ -466,10 +466,13 @@ impl ScrollMotion {
         } else {
             raw_distance.min(self.cycle_distance.max(1.0))
         };
-        [
-            self.velocity[0].signum() * distance,
-            self.velocity[1].signum() * distance,
-        ]
+        self.velocity.map(|velocity| {
+            if velocity == 0.0 {
+                0.0
+            } else {
+                velocity.signum() * distance
+            }
+        })
     }
 }
 

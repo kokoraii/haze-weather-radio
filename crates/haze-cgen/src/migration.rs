@@ -29,14 +29,16 @@ const ANCILLARY_DEFAULTS: [(&str, &str); 3] = [
 ];
 const COMPOSITOR_DEFAULTS: [(&str, &str); 2] =
     [("alert_scene_id", "Standard_Crawl"), ("engine", "legacy")];
-const AUDIO_DEFAULTS: [(&str, &str); 6] = [
-    ("topology", "force_layout"),
-    ("force_layout", "stereo"),
-    ("idle_program_gain_db", "0"),
-    ("alert_program_gain_db", "muted"),
-    ("alert_gain_db", "0"),
-    ("transition_ms", "20"),
-];
+fn audio_defaults(force_layout: &str) -> [(&str, &str); 6] {
+    [
+        ("topology", "force_layout"),
+        ("force_layout", force_layout),
+        ("idle_program_gain_db", "0"),
+        ("alert_program_gain_db", "muted"),
+        ("alert_gain_db", "0"),
+        ("transition_ms", "20"),
+    ]
+}
 
 /// Selects whether a migration is inspected or committed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,6 +272,7 @@ fn schema_version_from_root(root: &BytesStart<'_>) -> Result<u16, MigrationError
 struct FeedMigrationState {
     id: String,
     preferred_alert_feed: String,
+    inferred_force_layout: &'static str,
     has_alert: bool,
     has_ancillary: bool,
     has_compositor: bool,
@@ -278,10 +281,11 @@ struct FeedMigrationState {
 }
 
 impl FeedMigrationState {
-    fn new(id: String) -> Self {
+    fn new(id: String, inferred_force_layout: &'static str) -> Self {
         Self {
             preferred_alert_feed: id.clone(),
             id,
+            inferred_force_layout,
             has_alert: false,
             has_ancillary: false,
             has_compositor: false,
@@ -292,6 +296,7 @@ impl FeedMigrationState {
 }
 
 fn migrate_legacy_xml(xml: &[u8], report: &mut MigrationReport) -> Result<Vec<u8>, MigrationError> {
+    let inferred_force_layouts = infer_legacy_force_layouts(xml)?;
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(false);
     let mut writer = Writer::new(Vec::with_capacity(xml.len().saturating_add(1024)));
@@ -317,7 +322,11 @@ fn migrate_legacy_xml(xml: &[u8], report: &mut MigrationReport) -> Result<Vec<u8
                     }
                     report.feeds_examined += 1;
                     let id = concrete_feed_id(&start, report.feeds_examined)?;
-                    active_feed = Some(FeedMigrationState::new(id));
+                    let force_layout = inferred_force_layouts
+                        .get(report.feeds_examined - 1)
+                        .copied()
+                        .ok_or(MigrationError::InvalidXml)?;
+                    active_feed = Some(FeedMigrationState::new(id, force_layout));
                     write_event(&mut writer, Event::Start(start.into_owned()))?;
                 } else {
                     let migrated =
@@ -337,7 +346,11 @@ fn migrate_legacy_xml(xml: &[u8], report: &mut MigrationReport) -> Result<Vec<u8
                 } else if name == "feed" && stack.as_slice() == ["cgen"] {
                     report.feeds_examined += 1;
                     let id = concrete_feed_id(&start, report.feeds_examined)?;
-                    let mut state = FeedMigrationState::new(id);
+                    let force_layout = inferred_force_layouts
+                        .get(report.feeds_examined - 1)
+                        .copied()
+                        .ok_or(MigrationError::InvalidXml)?;
+                    let mut state = FeedMigrationState::new(id, force_layout);
                     write_event(&mut writer, Event::Start(start.into_owned()))?;
                     append_missing_feed_sections(&mut writer, &mut state, report)?;
                     write_event(&mut writer, Event::End(BytesEnd::new("feed")))?;
@@ -372,7 +385,117 @@ fn migrate_legacy_xml(xml: &[u8], report: &mut MigrationReport) -> Result<Vec<u8
     if active_feed.is_some() || !stack.is_empty() {
         return Err(MigrationError::InvalidXml);
     }
+    if report.feeds_examined != inferred_force_layouts.len() {
+        return Err(MigrationError::InvalidXml);
+    }
     Ok(writer.into_inner())
+}
+
+fn infer_legacy_force_layouts(xml: &[u8]) -> Result<Vec<&'static str>, MigrationError> {
+    let mut reader = Reader::from_reader(xml);
+    reader.config_mut().trim_text(false);
+    let mut stack = Vec::<String>::new();
+    let mut active_channels: Option<u16> = None;
+    let mut layouts = Vec::new();
+
+    loop {
+        let event = reader
+            .read_event()
+            .map_err(|_| MigrationError::InvalidXml)?;
+        match event {
+            Event::Start(start) => {
+                let name = element_name(&start)?;
+                if name == "feed" && stack.as_slice() == ["cgen"] {
+                    if active_channels.replace(0).is_some() {
+                        return Err(MigrationError::InvalidXml);
+                    }
+                } else if is_ladder_audio(&name, &stack) {
+                    observe_legacy_audio_rendition(&start, &mut active_channels)?;
+                }
+                stack.push(name);
+            }
+            Event::Empty(start) => {
+                let name = element_name(&start)?;
+                if name == "feed" && stack.as_slice() == ["cgen"] {
+                    layouts.push("stereo");
+                } else if is_ladder_audio(&name, &stack) {
+                    observe_legacy_audio_rendition(&start, &mut active_channels)?;
+                }
+            }
+            Event::End(end) => {
+                let closing_name = std::str::from_utf8(end.name().into_inner())
+                    .map_err(|_| MigrationError::InvalidXml)?;
+                if stack.last().map(String::as_str) != Some(closing_name) {
+                    return Err(MigrationError::InvalidXml);
+                }
+                if closing_name == "feed" && stack.len() == 2 && stack[0] == "cgen" {
+                    let channels = active_channels.take().ok_or(MigrationError::InvalidXml)?;
+                    layouts.push(force_layout_for_channels(channels));
+                }
+                stack.pop();
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+
+    if active_channels.is_some() || !stack.is_empty() {
+        return Err(MigrationError::InvalidXml);
+    }
+    Ok(layouts)
+}
+
+fn is_ladder_audio(name: &str, stack: &[String]) -> bool {
+    name == "audio"
+        && stack.len() >= 2
+        && stack[stack.len() - 1] == "ladder"
+        && stack[stack.len() - 2] == "feed"
+}
+
+fn observe_legacy_audio_rendition(
+    start: &BytesStart<'_>,
+    active_channels: &mut Option<u16>,
+) -> Result<(), MigrationError> {
+    let Some(maximum_channels) = active_channels.as_mut() else {
+        return Err(MigrationError::InvalidXml);
+    };
+    let enabled = attribute_value(start, b"enabled")?
+        .map(|value| migration_bool_text(&value, true))
+        .unwrap_or(true);
+    if !enabled {
+        return Ok(());
+    }
+    let channels = attribute_value(start, b"channels")?
+        .map(|value| {
+            value
+                .trim()
+                .parse::<u16>()
+                .map_err(|_| MigrationError::InvalidXml)
+        })
+        .transpose()?
+        .unwrap_or(2)
+        .clamp(1, 6);
+    *maximum_channels = (*maximum_channels).max(channels);
+    Ok(())
+}
+
+fn migration_bool_text(value: &str, default: bool) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return default;
+    }
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on" | "enabled"
+    )
+}
+
+fn force_layout_for_channels(channels: u16) -> &'static str {
+    match channels {
+        6 => "surround_51",
+        1 => "mono",
+        _ => "stereo",
+    }
 }
 
 fn concrete_feed_id(start: &BytesStart<'_>, feed_index: usize) -> Result<String, MigrationError> {
@@ -455,7 +578,8 @@ fn migrate_feed_element(
 
     if name == "audio" && (direct_feed_child || media_audio) {
         feed.has_audio = true;
-        let updates = default_attribute_updates(&AUDIO_DEFAULTS);
+        let defaults = audio_defaults(feed.inferred_force_layout);
+        let updates = default_attribute_updates(&defaults);
         let (updated, changed) = update_attributes(start, &updates)?;
         if changed > 0 {
             feed.changed = true;
@@ -492,7 +616,8 @@ fn append_missing_feed_sections(
         report.compositor_sections_added += 1;
     }
     if !feed.has_audio {
-        write_indented_empty(writer, "audio", &AUDIO_DEFAULTS)?;
+        let defaults = audio_defaults(feed.inferred_force_layout);
+        write_indented_empty(writer, "audio", &defaults)?;
         feed.changed = true;
         report.audio_sections_added += 1;
     }
@@ -943,6 +1068,47 @@ mod tests {
         assert_eq!(outcome.report.ancillary_sections_augmented, 1);
         assert_eq!(outcome.report.compositor_sections_augmented, 0);
         assert_eq!(outcome.report.audio_sections_augmented, 1);
+    }
+
+    #[test]
+    fn migration_infers_surround_master_for_mixed_enabled_legacy_renditions() {
+        let original = r#"<cgen schema_version="1">
+  <feed id="sd">
+    <media><audio idle="source"/></media>
+    <ladder>
+      <audio id="stereo" enabled="true" channels="2"/>
+      <audio id="surround_51" enabled="true" channels="6"/>
+    </ladder>
+  </feed>
+</cgen>"#;
+        let (runtime, cgen_path) = runtime_fixture(original);
+
+        let outcome = migrate_config(&cgen_path, runtime.path(), MigrationMode::DryRun)
+            .expect("migration succeeds");
+        let migrated = migrated_text(&outcome);
+
+        assert!(migrated.contains("force_layout=\"surround_51\""));
+    }
+
+    #[test]
+    fn migration_ignores_disabled_surround_rendition_when_inferring_master() {
+        let original = r#"<cgen schema_version="1">
+  <feed id="stereo_only">
+    <media><audio idle="source"/></media>
+    <ladder>
+      <audio id="stereo" enabled="true" channels="2"/>
+      <audio id="surround_51" enabled="false" channels="6"/>
+    </ladder>
+  </feed>
+</cgen>"#;
+        let (runtime, cgen_path) = runtime_fixture(original);
+
+        let outcome = migrate_config(&cgen_path, runtime.path(), MigrationMode::DryRun)
+            .expect("migration succeeds");
+        let migrated = migrated_text(&outcome);
+
+        assert!(migrated.contains("force_layout=\"stereo\""));
+        assert!(!migrated.contains("force_layout=\"surround_51\""));
     }
 
     #[test]

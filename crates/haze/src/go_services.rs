@@ -1903,6 +1903,14 @@ fn configure_managed_process(command: &mut Command, scheduler: ProcessScheduler)
 fn configure_managed_process(_command: &mut Command, _scheduler: ProcessScheduler) {}
 
 fn configure_managed_service_env(command: &mut Command, spec: &ServiceSpec) {
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    if spec.id == "svc:cgen" {
+        if let Some(value) =
+            cgen_system_library_path(std::env::var_os("LD_LIBRARY_PATH").as_deref())
+        {
+            command.env("LD_LIBRARY_PATH", value);
+        }
+    }
     if !is_go_service_binary(spec.binary) {
         return;
     }
@@ -1911,6 +1919,48 @@ fn configure_managed_service_env(command: &mut Command, spec: &ServiceSpec) {
     if let Some(limit) = go_memory_limit(spec.id) {
         env_if_unset(command, "GOMEMLIMIT", limit);
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn cgen_system_library_path(existing: Option<&std::ffi::OsStr>) -> Option<std::ffi::OsString> {
+    let mut paths = Vec::<PathBuf>::new();
+    for candidate in cgen_system_library_directories() {
+        let path = PathBuf::from(candidate);
+        if path.is_dir() && !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    if let Some(existing) = existing {
+        for path in std::env::split_paths(existing) {
+            if !path.as_os_str().is_empty() && !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+    (!paths.is_empty())
+        .then(|| std::env::join_paths(paths).ok())
+        .flatten()
+}
+
+#[cfg(target_os = "linux")]
+fn cgen_system_library_directories() -> &'static [&'static str] {
+    &[
+        "/lib64",
+        "/usr/lib64",
+        "/lib/x86_64-linux-gnu",
+        "/usr/lib/x86_64-linux-gnu",
+        "/lib/aarch64-linux-gnu",
+        "/usr/lib/aarch64-linux-gnu",
+        "/lib/arm-linux-gnueabihf",
+        "/usr/lib/arm-linux-gnueabihf",
+        "/lib",
+        "/usr/lib",
+    ]
+}
+
+#[cfg(target_os = "freebsd")]
+fn cgen_system_library_directories() -> &'static [&'static str] {
+    &["/lib", "/usr/lib", "/usr/local/lib"]
 }
 
 fn env_if_unset(command: &mut Command, key: &str, value: &str) {
@@ -2618,6 +2668,30 @@ services:
                 String::new(),
             ]
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn cgen_prefers_host_gpu_libraries_before_portable_runtime_libraries() {
+        let portable_bin = PathBuf::from("/portable/haze/bin");
+        let portable_plugins = portable_bin.join("gstreamer-1.0");
+        let existing = std::env::join_paths([portable_bin.clone(), portable_plugins.clone()])
+            .expect("portable library path");
+
+        let configured = cgen_system_library_path(Some(&existing))
+            .expect("CGEN library path contains system and portable entries");
+        let paths = std::env::split_paths(&configured).collect::<Vec<_>>();
+        let portable_index = paths
+            .iter()
+            .position(|path| path == &portable_bin)
+            .expect("portable bin retained");
+
+        assert!(paths[..portable_index]
+            .iter()
+            .any(|path| cgen_system_library_directories()
+                .iter()
+                .any(|candidate| path == Path::new(candidate))));
+        assert!(paths.contains(&portable_plugins));
     }
 
     #[test]

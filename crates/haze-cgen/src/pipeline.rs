@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 
@@ -102,7 +102,7 @@ impl PipelineWorker {
         .await
     }
 
-    fn spawn_status_publisher(&self) -> Option<mpsc::Sender<Value>> {
+    fn spawn_status_publisher(&self) -> Option<watch::Sender<Option<Value>>> {
         let bridge = self.bridge.clone()?;
         let feed_id = self.feed.id.clone();
         let alert_feed_id = configured_alert_feed_id(&self.feed);
@@ -116,7 +116,7 @@ impl PipelineWorker {
             .join("runtime")
             .join("cgen")
             .join(format!("{}.status.json", safe_file_id(&feed_id)));
-        let (tx, mut rx) = mpsc::channel::<Value>(8);
+        let (tx, mut rx) = watch::channel::<Option<Value>>(None);
         tokio::spawn(async move {
             let mut pending: Option<Value> = None;
             let mut last_sent: Option<Value> = None;
@@ -126,8 +126,8 @@ impl PipelineWorker {
 
             loop {
                 tokio::select! {
-                    data = rx.recv() => {
-                        let Some(mut data) = data else {
+                    changed = rx.changed() => {
+                        if changed.is_err() {
                             if pending.is_some() {
                                 let _ = flush_cgen_status(
                                     &feed_id,
@@ -139,6 +139,9 @@ impl PipelineWorker {
                                 ).await;
                             }
                             break;
+                        }
+                        let Some(mut data) = rx.borrow_and_update().clone() else {
+                            continue;
                         };
                         augment_scene_status(
                             &mut data,

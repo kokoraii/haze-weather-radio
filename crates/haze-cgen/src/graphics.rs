@@ -679,7 +679,7 @@ mod tests {
         let snapshot = presentation_snapshot(&feed, &state, true);
 
         assert_eq!(snapshot.visual_mode, "banner");
-        assert_eq!(snapshot.overlay_text, "EAS Details Channel");
+        assert_eq!(snapshot.overlay_text, "Emergency Alert Details Channel");
         assert_eq!(snapshot.ticker_y, 72);
     }
 
@@ -763,6 +763,7 @@ mod tests {
             program_mapping: Default::default(),
             outputs: Default::default(),
             encoder: Default::default(),
+            output_encoders: Default::default(),
         }
     }
 }

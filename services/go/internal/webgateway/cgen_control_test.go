@@ -25,6 +25,10 @@ func TestCgenSaveAndActionsRoundTripXML(t *testing.T) {
 				"mode":                            "release",
 				"program_input_url":               "udp://239.0.0.1:9000?overrun_nonfatal=1&reuse=1",
 				"program_input_format":            "mpegts",
+				"deinterlace_algorithm":           "yadif",
+				"deinterlace_backend":             "software",
+				"deinterlace_cadence":             "field",
+				"deinterlace_parity":              "tff",
 				"priority_feed_id":                "CAP-IT-ALL",
 				"audio_source":                    "both",
 				"audio_idle":                      "routine",
@@ -82,6 +86,12 @@ func TestCgenSaveAndActionsRoundTripXML(t *testing.T) {
 	if feeds[0]["program_input_url"] != "udp://239.0.0.1:9000?overrun_nonfatal=1&reuse=1" {
 		t.Fatalf("program input = %#v", feeds[0]["program_input_url"])
 	}
+	if feeds[0]["deinterlace_algorithm"] != "yadif" ||
+		feeds[0]["deinterlace_backend"] != "software" ||
+		feeds[0]["deinterlace_cadence"] != "field" ||
+		feeds[0]["deinterlace_parity"] != "tff" {
+		t.Fatalf("deinterlace controls = %#v", feeds[0])
+	}
 	if feeds[0]["audio_source"] != "both" {
 		t.Fatalf("audio source = %#v", feeds[0]["audio_source"])
 	}
@@ -127,7 +137,7 @@ func TestCgenSaveAndActionsRoundTripXML(t *testing.T) {
 	}
 	for _, want := range []string{
 		"<program>",
-		"<input url=\"udp://239.0.0.1:9000?overrun_nonfatal=1&amp;reuse=1\" format=\"mpegts\"></input>",
+		"<input url=\"udp://239.0.0.1:9000?overrun_nonfatal=1&amp;reuse=1\" format=\"mpegts\" deinterlace_algorithm=\"yadif\" deinterlace_backend=\"software\" deinterlace_cadence=\"field\" deinterlace_parity=\"tff\"></input>",
 		"<output url=\"udp://239.0.0.2:9001?pkt_size=1316\" format=\"mpegts\" vcodec=\"libx264\" acodec=\"aac\"",
 		"<priority>",
 		"<media>",
@@ -334,6 +344,7 @@ func TestCgenV2RoundTripRevisionAndActionPreserveSections(t *testing.T) {
 			"engine":         "scene_v2",
 		},
 		"program_mapping": map[string]any{
+			"mode":                "source",
 			"transport_stream_id": 1,
 			"programs": []any{
 				map[string]any{
@@ -419,7 +430,7 @@ func TestCgenV2RoundTripRevisionAndActionPreserveSections(t *testing.T) {
 		`<alert feed_id="CAP_MAIN"></alert>`,
 		`<ancillary captions="pass" scte35="pass" scte104="drop"></ancillary>`,
 		`<compositor alert_scene_id="Standard_Crawl" engine="scene_v2"></compositor>`,
-		`<programMapping transport_stream_id="1">`,
+		`<programMapping mode="source" transport_stream_id="1">`,
 		`<output id="primary_ts" enabled="true" destination="mpeg_ts_udp" url="${CGEN_PRIMARY_URL}"`,
 	} {
 		if !strings.Contains(string(rawXML), want) {
@@ -515,6 +526,32 @@ func TestCgenV2RejectsDuplicateIDsPIDsAndUnsupportedRTMP(t *testing.T) {
 				return feed
 			}(),
 			want: "feed id",
+		},
+		{
+			name: "unsupported deinterlace algorithm",
+			feed: func() map[string]any {
+				feed := baseFeed()
+				feed["program_input"] = map[string]any{
+					"type":                  "dummy",
+					"deinterlace_algorithm": "weave",
+				}
+				return feed
+			}(),
+			want: "deinterlace algorithm",
+		},
+		{
+			name: "hardware parity override",
+			feed: func() map[string]any {
+				feed := baseFeed()
+				feed["program_input"] = map[string]any{
+					"type":                  "dummy",
+					"deinterlace_algorithm": "motion_adaptive",
+					"deinterlace_backend":   "vaapi",
+					"deinterlace_parity":    "tff",
+				}
+				return feed
+			}(),
+			want: "algorithm, backend, and parity combination",
 		},
 		{
 			name: "duplicate output ids",

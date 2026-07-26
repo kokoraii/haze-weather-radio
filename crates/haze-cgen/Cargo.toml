@@ -41,7 +41,7 @@ glyphon = { version = "0.11", optional = true }
 msdfgen = { version = "0.2.1", default-features = false, features = ["ttf-parser"], optional = true }
 pollster = { version = "0.4", optional = true }
 ttf-parser = { version = "0.18.1", optional = true }
-wgpu = { version = "29.0.3", default-features = false, features = ["std", "parking_lot", "vulkan", "wgsl"], optional = true }
+wgpu = { version = "29.0.3", default-features = false, features = ["std", "parking_lot", "dx12", "gles", "vulkan", "wgsl"], optional = true }
 gstreamer = "0.25.3"
 gstreamer-app = "0.25.2"
 gstreamer-audio = "0.25.3"

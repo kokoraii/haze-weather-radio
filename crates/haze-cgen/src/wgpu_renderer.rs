@@ -9,6 +9,7 @@ mod msdf_text;
 use std::{
     fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 pub(crate) fn fatal_error_message() -> &'static str {
@@ -108,6 +109,10 @@ pub(crate) struct WgpuFrameRenderer {
 const MAX_TEXT_STRIP_CACHE_ENTRIES: usize = 4;
 #[cfg(feature = "gpu-wgpu")]
 const MAX_TEXT_STRIP_CACHE_BYTES: usize = 8 * 1024 * 1024;
+#[cfg(feature = "gpu-wgpu")]
+const GPU_READBACK_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(feature = "gpu-wgpu")]
+const GPU_READBACK_CALLBACK_TIMEOUT: Duration = Duration::from_millis(50);
 
 #[cfg(feature = "gpu-wgpu")]
 #[derive(Debug, Clone)]
@@ -721,16 +726,21 @@ impl WgpuFrameRenderer {
                 depth_or_array_layers: 1,
             },
         );
-        self.queue.submit(Some(encoder.finish()));
+        let submission_index = self.queue.submit(Some(encoder.finish()));
 
         let slice = readback.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = tx.send(result);
         });
-        self.device.poll(wgpu::PollType::wait_indefinitely())?;
-        rx.recv()
-            .context("glyphon readback channel closed")?
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission_index),
+                timeout: Some(GPU_READBACK_TIMEOUT),
+            })
+            .context("glyphon GPU readback did not complete before its deadline")?;
+        rx.recv_timeout(GPU_READBACK_CALLBACK_TIMEOUT)
+            .context("glyphon readback callback did not complete before its deadline")?
             .context("glyphon readback map failed")?;
         let mapped = slice.get_mapped_range();
         let mut bgra = vec![0u8; strip_width as usize * strip_height as usize * 4];
@@ -958,7 +968,7 @@ fn preferred_backends() -> wgpu::Backends {
         "dx12" | "d3d12" | "direct3d12" => wgpu::Backends::DX12,
         "gl" | "opengl" => wgpu::Backends::GL,
         "all" => wgpu::Backends::all(),
-        _ if cfg!(windows) => wgpu::Backends::VULKAN,
+        _ if cfg!(windows) => wgpu::Backends::DX12 | wgpu::Backends::VULKAN | wgpu::Backends::GL,
         _ => wgpu::Backends::all(),
     }
 }

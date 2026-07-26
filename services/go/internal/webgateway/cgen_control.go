@@ -58,27 +58,31 @@ type cgenFeedXML struct {
 }
 
 type cgenEndpointXML struct {
-	URL               string `xml:"url,attr,omitempty"`
-	Type              string `xml:"type,attr,omitempty"`
-	Format            string `xml:"format,attr,omitempty"`
-	VCodec            string `xml:"vcodec,attr,omitempty"`
-	ACodec            string `xml:"acodec,attr,omitempty"`
-	VideoBitrateKbps  string `xml:"video_bitrate_kbps,attr,omitempty"`
-	AudioBitrateKbps  string `xml:"audio_bitrate_kbps,attr,omitempty"`
-	HardwareDecoder   string `xml:"hardware_decoder,attr,omitempty"`
-	HardwareDecoderOn string `xml:"hardware_decoder_enabled,attr,omitempty"`
-	DeviceBackend     string `xml:"device_backend,attr,omitempty"`
-	DeviceID          string `xml:"device_id,attr,omitempty"`
-	Width             string `xml:"width,attr,omitempty"`
-	Height            string `xml:"height,attr,omitempty"`
-	FPS               string `xml:"fps,attr,omitempty"`
-	Interlaced        string `xml:"interlaced,attr,omitempty"`
-	FieldOrder        string `xml:"field_order,attr,omitempty"`
-	Background        string `xml:"background,attr,omitempty"`
-	ServiceName       string `xml:"service_name,attr,omitempty"`
-	ProviderName      string `xml:"provider_name,attr,omitempty"`
-	ServiceID         string `xml:"service_id,attr,omitempty"`
-	TransportStreamID string `xml:"transport_stream_id,attr,omitempty"`
+	URL                  string `xml:"url,attr,omitempty"`
+	Type                 string `xml:"type,attr,omitempty"`
+	Format               string `xml:"format,attr,omitempty"`
+	VCodec               string `xml:"vcodec,attr,omitempty"`
+	ACodec               string `xml:"acodec,attr,omitempty"`
+	VideoBitrateKbps     string `xml:"video_bitrate_kbps,attr,omitempty"`
+	AudioBitrateKbps     string `xml:"audio_bitrate_kbps,attr,omitempty"`
+	HardwareDecoder      string `xml:"hardware_decoder,attr,omitempty"`
+	HardwareDecoderOn    string `xml:"hardware_decoder_enabled,attr,omitempty"`
+	DeinterlaceAlgorithm string `xml:"deinterlace_algorithm,attr,omitempty"`
+	DeinterlaceBackend   string `xml:"deinterlace_backend,attr,omitempty"`
+	DeinterlaceCadence   string `xml:"deinterlace_cadence,attr,omitempty"`
+	DeinterlaceParity    string `xml:"deinterlace_parity,attr,omitempty"`
+	DeviceBackend        string `xml:"device_backend,attr,omitempty"`
+	DeviceID             string `xml:"device_id,attr,omitempty"`
+	Width                string `xml:"width,attr,omitempty"`
+	Height               string `xml:"height,attr,omitempty"`
+	FPS                  string `xml:"fps,attr,omitempty"`
+	Interlaced           string `xml:"interlaced,attr,omitempty"`
+	FieldOrder           string `xml:"field_order,attr,omitempty"`
+	Background           string `xml:"background,attr,omitempty"`
+	ServiceName          string `xml:"service_name,attr,omitempty"`
+	ProviderName         string `xml:"provider_name,attr,omitempty"`
+	ServiceID            string `xml:"service_id,attr,omitempty"`
+	TransportStreamID    string `xml:"transport_stream_id,attr,omitempty"`
 }
 
 type cgenLadderXML struct {
@@ -277,6 +281,7 @@ type cgenCompositorXML struct {
 }
 
 type cgenProgramMappingXML struct {
+	Mode              string                   `xml:"mode,attr,omitempty"`
 	TransportStreamID string                   `xml:"transport_stream_id,attr,omitempty"`
 	Programs          []cgenProgramMapEntryXML `xml:"program"`
 }
@@ -970,8 +975,30 @@ func normalizeCgen(config cgenXML) (cgenXML, error) {
 		if !validCgenInputTypeToken(rawInput.Type) {
 			return cgenXML{}, fmt.Errorf("cgen feed %q input type is unsupported", feed.ID)
 		}
+		if !validCgenDeinterlaceAlgorithm(rawInput.DeinterlaceAlgorithm) {
+			return cgenXML{}, fmt.Errorf("cgen feed %q deinterlace algorithm is unsupported", feed.ID)
+		}
+		if !validCgenDeinterlaceBackend(rawInput.DeinterlaceBackend) {
+			return cgenXML{}, fmt.Errorf("cgen feed %q deinterlace backend is unsupported", feed.ID)
+		}
+		if !validCgenDeinterlaceCadence(rawInput.DeinterlaceCadence) {
+			return cgenXML{}, fmt.Errorf("cgen feed %q deinterlace cadence is unsupported", feed.ID)
+		}
+		if !validCgenDeinterlaceParity(rawInput.DeinterlaceParity) {
+			return cgenXML{}, fmt.Errorf("cgen feed %q deinterlace parity is unsupported", feed.ID)
+		}
 		feed.ProgramInput = cleanCgenEndpoint(feed.ProgramInput)
 		feed.ProgramOutput = cleanCgenEndpoint(feed.ProgramOutput)
+		feed.ProgramInput.DeinterlaceAlgorithm = fallbackText(feed.ProgramInput.DeinterlaceAlgorithm, "yadif")
+		feed.ProgramInput.DeinterlaceBackend = fallbackText(feed.ProgramInput.DeinterlaceBackend, "software")
+		feed.ProgramInput.DeinterlaceCadence = fallbackText(feed.ProgramInput.DeinterlaceCadence, "field")
+		feed.ProgramInput.DeinterlaceParity = fallbackText(feed.ProgramInput.DeinterlaceParity, "auto")
+		if !validCgenDeinterlaceCombination(feed.ProgramInput) {
+			return cgenXML{}, fmt.Errorf(
+				"cgen feed %q deinterlace algorithm, backend, and parity combination is unsupported",
+				feed.ID,
+			)
+		}
 		if rawDecoder != "" && feed.ProgramInput.HardwareDecoder == "" {
 			return cgenXML{}, fmt.Errorf("cgen feed %q hardware decoder id is invalid", feed.ID)
 		}
@@ -1306,6 +1333,19 @@ func validCgenCompositorEngine(value string) bool {
 }
 
 func normalizeCgenProgramMapping(feed *cgenFeedXML) error {
+	feed.ProgramMap.Mode = strings.ToLower(strings.TrimSpace(feed.ProgramMap.Mode))
+	if feed.ProgramMap.Mode == "" {
+		if len(feed.ProgramMap.Programs) > 0 {
+			feed.ProgramMap.Mode = "manual"
+		} else {
+			feed.ProgramMap.Mode = "source"
+		}
+	}
+	switch feed.ProgramMap.Mode {
+	case "source", "auto", "manual":
+	default:
+		return errors.New("mode must be source, auto, or manual")
+	}
 	if len(feed.ProgramMap.Programs) == 0 {
 		feed.ProgramMap.TransportStreamID = cleanBoundedUint(feed.ProgramMap.TransportStreamID, "1", 1, 65535)
 		if feed.ProgramMap.TransportStreamID == "" {
@@ -1952,7 +1992,10 @@ func cgenProgramMappingFromAny(raw any) (cgenProgramMappingXML, error) {
 	if !ok {
 		return cgenProgramMappingXML{}, errors.New("program_mapping must be an object")
 	}
-	result := cgenProgramMappingXML{TransportStreamID: stringFromAny(source["transport_stream_id"])}
+	result := cgenProgramMappingXML{
+		Mode:              stringFromAny(source["mode"]),
+		TransportStreamID: stringFromAny(source["transport_stream_id"]),
+	}
 	items, err := cgenObjectSlice(source["programs"], "program_mapping programs")
 	if err != nil {
 		return cgenProgramMappingXML{}, err
@@ -2095,14 +2138,18 @@ func cgenFeedFromMap(raw any) (cgenFeedXML, error) {
 			HardwareDecoderOn: boolText(
 				firstNestedBool(source, input, "hardware_decoder_enabled", "hardware_decoder_enabled", false),
 			),
-			DeviceBackend: firstNestedString(source, input, "device_backend", "device_backend"),
-			DeviceID:      firstNestedString(source, input, "device_id", "device_id"),
-			Width:         firstNestedString(source, input, "dummy_width", "width"),
-			Height:        firstNestedString(source, input, "dummy_height", "height"),
-			FPS:           firstNestedString(source, input, "dummy_fps", "fps"),
-			Interlaced:    optionalNestedBoolText(source, input, "dummy_interlaced", "interlaced"),
-			FieldOrder:    firstNestedString(source, input, "dummy_field_order", "field_order"),
-			Background:    firstNestedString(source, input, "dummy_background", "background"),
+			DeinterlaceAlgorithm: firstNestedString(source, input, "deinterlace_algorithm", "deinterlace_algorithm"),
+			DeinterlaceBackend:   firstNestedString(source, input, "deinterlace_backend", "deinterlace_backend"),
+			DeinterlaceCadence:   firstNestedString(source, input, "deinterlace_cadence", "deinterlace_cadence"),
+			DeinterlaceParity:    firstNestedString(source, input, "deinterlace_parity", "deinterlace_parity"),
+			DeviceBackend:        firstNestedString(source, input, "device_backend", "device_backend"),
+			DeviceID:             firstNestedString(source, input, "device_id", "device_id"),
+			Width:                firstNestedString(source, input, "dummy_width", "width"),
+			Height:               firstNestedString(source, input, "dummy_height", "height"),
+			FPS:                  firstNestedString(source, input, "dummy_fps", "fps"),
+			Interlaced:           optionalNestedBoolText(source, input, "dummy_interlaced", "interlaced"),
+			FieldOrder:           firstNestedString(source, input, "dummy_field_order", "field_order"),
+			Background:           firstNestedString(source, input, "dummy_background", "background"),
 		},
 		PriorityInput: cgenPriorityInputXML{
 			FeedID:      stringFromAny(source["priority_feed_id"]),
@@ -2417,6 +2464,10 @@ func cgenPayload(configPath string, path string, config cgenXML, encoderPath str
 			"dummy_background":         feed.ProgramInput.Background,
 			"hardware_decoder_enabled": xmlBool(feed.ProgramInput.HardwareDecoderOn, false),
 			"hardware_decoder":         feed.ProgramInput.HardwareDecoder,
+			"deinterlace_algorithm":    feed.ProgramInput.DeinterlaceAlgorithm,
+			"deinterlace_backend":      feed.ProgramInput.DeinterlaceBackend,
+			"deinterlace_cadence":      feed.ProgramInput.DeinterlaceCadence,
+			"deinterlace_parity":       feed.ProgramInput.DeinterlaceParity,
 			"priority_feed_id":         feed.PriorityInput.FeedID,
 			"audio_source":             feed.PriorityInput.AudioSource,
 			"priority_input_format":    feed.PriorityInput.Format,
@@ -2576,6 +2627,10 @@ func cgenProgramInputPayload(input cgenEndpointXML) map[string]any {
 		"format":                   input.Format,
 		"hardware_decoder_enabled": xmlBool(input.HardwareDecoderOn, false),
 		"hardware_decoder":         input.HardwareDecoder,
+		"deinterlace_algorithm":    input.DeinterlaceAlgorithm,
+		"deinterlace_backend":      input.DeinterlaceBackend,
+		"deinterlace_cadence":      input.DeinterlaceCadence,
+		"deinterlace_parity":       input.DeinterlaceParity,
 		"device_backend":           input.DeviceBackend,
 		"device_id":                input.DeviceID,
 		"width":                    input.Width,
@@ -2615,6 +2670,7 @@ func cgenProgramMappingPayload(mapping cgenProgramMappingXML) map[string]any {
 		programs = append(programs, row)
 	}
 	return map[string]any{
+		"mode":                mapping.Mode,
 		"transport_stream_id": mapping.TransportStreamID,
 		"programs":            programs,
 	}
@@ -2738,6 +2794,10 @@ func cleanCgenEndpoint(value cgenEndpointXML) cgenEndpointXML {
 	value.AudioBitrateKbps = cleanOptionalPositive(value.AudioBitrateKbps)
 	value.HardwareDecoder = cleanGstElementName(value.HardwareDecoder)
 	value.HardwareDecoderOn = boolText(xmlBool(value.HardwareDecoderOn, false))
+	value.DeinterlaceAlgorithm = normalizeCgenDeinterlaceAlgorithm(value.DeinterlaceAlgorithm)
+	value.DeinterlaceBackend = normalizeCgenDeinterlaceBackend(value.DeinterlaceBackend)
+	value.DeinterlaceCadence = normalizeCgenDeinterlaceCadence(value.DeinterlaceCadence)
+	value.DeinterlaceParity = normalizeCgenDeinterlaceParity(value.DeinterlaceParity)
 	value.DeviceBackend = normalizeCgenDeviceBackend(value.DeviceBackend)
 	value.DeviceID = strings.TrimSpace(value.DeviceID)
 	value.Width = cleanOptionalBoundedUint(value.Width, 1, 16384)
@@ -2807,6 +2867,110 @@ func validCgenInputTypeToken(value string) bool {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "", "auto", "stream", "uri", "uri_or_file", "url", "file", "device", "v4l2", "directshow", "dshow", "dummy", "none", "no_input":
 		return true
+	default:
+		return false
+	}
+}
+
+func normalizeCgenDeinterlaceAlgorithm(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "":
+		return ""
+	case "yadif":
+		return "yadif"
+	case "bwdif":
+		return "bwdif"
+	case "motion_adaptive", "motion-adaptive", "adaptive":
+		return "motion_adaptive"
+	default:
+		return ""
+	}
+}
+
+func validCgenDeinterlaceAlgorithm(value string) bool {
+	return strings.TrimSpace(value) == "" || normalizeCgenDeinterlaceAlgorithm(value) != ""
+}
+
+func normalizeCgenDeinterlaceBackend(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "":
+		return ""
+	case "auto":
+		return "auto"
+	case "software", "cpu":
+		return "software"
+	case "vaapi", "va":
+		return "vaapi"
+	case "qsv", "quicksync", "quick_sync":
+		return "quicksync"
+	case "d3d11", "direct3d11":
+		return "d3d11"
+	case "cuda", "nvidia":
+		return "cuda"
+	case "vulkan":
+		return "vulkan"
+	case "gl", "opengl":
+		return "opengl"
+	default:
+		return ""
+	}
+}
+
+func validCgenDeinterlaceBackend(value string) bool {
+	return strings.TrimSpace(value) == "" || normalizeCgenDeinterlaceBackend(value) != ""
+}
+
+func normalizeCgenDeinterlaceCadence(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "":
+		return ""
+	case "field", "field_rate", "bob":
+		return "field"
+	case "frame", "frame_rate", "single":
+		return "frame"
+	default:
+		return ""
+	}
+}
+
+func validCgenDeinterlaceCadence(value string) bool {
+	return strings.TrimSpace(value) == "" || normalizeCgenDeinterlaceCadence(value) != ""
+}
+
+func normalizeCgenDeinterlaceParity(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "":
+		return ""
+	case "auto":
+		return "auto"
+	case "tff", "top", "top_first":
+		return "tff"
+	case "bff", "bottom", "bottom_first":
+		return "bff"
+	default:
+		return ""
+	}
+}
+
+func validCgenDeinterlaceParity(value string) bool {
+	return strings.TrimSpace(value) == "" || normalizeCgenDeinterlaceParity(value) != ""
+}
+
+func validCgenDeinterlaceCombination(input cgenEndpointXML) bool {
+	algorithm := input.DeinterlaceAlgorithm
+	backend := input.DeinterlaceBackend
+	parity := input.DeinterlaceParity
+	if backend != "auto" && backend != "software" && parity != "auto" {
+		return false
+	}
+	switch algorithm {
+	case "yadif":
+		return backend == "auto" || backend == "software" || backend == "cuda"
+	case "bwdif":
+		return backend == "auto" || backend == "software" || backend == "cuda" || backend == "vulkan"
+	case "motion_adaptive":
+		return backend == "auto" || backend == "software" || backend == "vaapi" ||
+			backend == "quicksync" || backend == "d3d11" || backend == "opengl"
 	default:
 		return false
 	}

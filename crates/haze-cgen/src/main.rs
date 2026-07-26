@@ -7,6 +7,7 @@ mod config;
 mod graphics;
 mod gst_backend;
 mod gst_output_sink;
+mod input_program_map;
 mod media_pcm;
 mod migration;
 mod output_workers;
@@ -23,19 +24,22 @@ mod sunny_cat;
 mod wgpu_renderer;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
 const SOURCE_ID: &str = "haze-cgen";
 const QUEUE_ACTIVE_GRACE_SECS: i64 = 120;
 const QUEUE_ACTIVE_MAX_SECS: i64 = 900;
+const MAX_QUEUE_MANIFEST_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "haze-cgen", about = "Haze managed character generator service")]
@@ -63,6 +67,12 @@ enum Command {
         #[arg(long, conflicts_with = "dry_run")]
         apply: bool,
     },
+    /// Validate managed CGEN configuration without connecting to the event bridge.
+    ValidateConfig {
+        /// Also initialize WGPU and preflight the installed GStreamer runtime.
+        #[arg(long)]
+        runtime: bool,
+    },
 }
 
 #[tokio::main]
@@ -87,21 +97,30 @@ async fn main() -> Result<()> {
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| PathBuf::from("."));
     let cgen_path = config::resolve_path(&base_dir, &args.cgen);
-    if let Some(Command::MigrateConfig { dry_run, apply }) = &args.command {
-        if !*dry_run && !*apply {
-            anyhow::bail!("migrate-config requires either --dry-run or --apply");
+    if let Some(command) = &args.command {
+        match command {
+            Command::MigrateConfig { dry_run, apply } => {
+                if !*dry_run && !*apply {
+                    anyhow::bail!("migrate-config requires either --dry-run or --apply");
+                }
+                let mode = if *apply {
+                    migration::MigrationMode::Apply
+                } else {
+                    migration::MigrationMode::DryRun
+                };
+                let outcome = migration::migrate_config(&cgen_path, &base_dir, mode)?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&migration_report_value(&outcome.report))?
+                );
+                return Ok(());
+            }
+            Command::ValidateConfig { runtime } => {
+                let report = validate_config_report(&cgen_path, &base_dir, *runtime)?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                return Ok(());
+            }
         }
-        let mode = if *apply {
-            migration::MigrationMode::Apply
-        } else {
-            migration::MigrationMode::DryRun
-        };
-        let outcome = migration::migrate_config(&cgen_path, &base_dir, mode)?;
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&migration_report_value(&outcome.report))?
-        );
-        return Ok(());
     }
 
     let bridge_addr = args
@@ -222,6 +241,62 @@ fn migration_report_value(report: &migration::MigrationReport) -> serde_json::Va
         "backup_created": report.backup_path.is_some(),
         "backup_file": report.backup_path.as_ref().and_then(|path| path.file_name()).and_then(|name| name.to_str()),
     })
+}
+
+fn validate_config_report(cgen_path: &Path, base_dir: &Path, runtime: bool) -> Result<Value> {
+    let scene_directory = base_dir.join("managed").join("cgen").join("scenes");
+    let scene_catalog = scene::load_scene_directory(&scene_directory);
+    let root = config::load_config(cgen_path)
+        .with_context(|| format!("failed to load cgen config {}", cgen_path.display()))?;
+    let feeds = root.enabled_feeds()?;
+    let mut feed_reports = Vec::with_capacity(feeds.len());
+    for feed in feeds {
+        let spec = feed.pipeline_spec()?;
+        let alert_scene = scene_catalog
+            .alert_scene(&spec.compositor.alert_scene_id)
+            .with_context(|| {
+                format!(
+                    "cgen feed {} selects unavailable alert scene {}",
+                    feed.id, spec.compositor.alert_scene_id
+                )
+            })?;
+        let runtime_report = runtime
+            .then(|| gst_backend::preflight_feed(&feed, base_dir))
+            .transpose()?;
+        feed_reports.push(json!({
+            "feed_id": spec.feed_id.as_str(),
+            "input_kind": spec.input.kind(),
+            "alert_feed_id": spec.alert_feed_id.as_str(),
+            "alert_scene_id": alert_scene.id.as_str(),
+            "outputs": spec.outputs.iter().filter(|output| output.enabled).map(|output| json!({
+                "output_id": output.id.as_str(),
+                "destination": output.destination.kind(),
+            })).collect::<Vec<_>>(),
+            "runtime": runtime_report,
+        }));
+    }
+    let warnings = scene_catalog
+        .warnings()
+        .iter()
+        .map(|warning| {
+            json!({
+                "scene_id": warning.scene_id.as_ref().map(ToString::to_string),
+                "message": warning.message,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "ok": true,
+        "schema_version": root.schema_version,
+        "enabled": root.enabled,
+        "enabled_feed_count": feed_reports.len(),
+        "runtime_checked": runtime,
+        "gpu_wgpu_compiled": cfg!(feature = "gpu-wgpu"),
+        "scene_count": scene_catalog.scenes().count(),
+        "scene_catalog_degraded": scene_catalog.is_degraded(),
+        "scene_warnings": warnings,
+        "feeds": feed_reports,
+    }))
 }
 
 async fn run_event_loop(
@@ -429,8 +504,12 @@ impl ActiveQueueSnapshotCache {
                     continue;
                 }
                 Err(err) => {
-                    return Err(err)
-                        .with_context(|| format!("failed to stat alert queue {}", path.display()))
+                    warn!(
+                        queue = %path.display(),
+                        "ignoring unsafe or unreadable cgen alert queue manifest: {err}"
+                    );
+                    self.entries.remove(&path);
+                    continue;
                 }
             };
             let item = if let Some(cached) = self
@@ -447,7 +526,19 @@ impl ActiveQueueSnapshotCache {
                 }
                 cached.item.clone()
             } else {
-                let parsed = parse_active_queue_manifest(&path, now)?;
+                let parsed = match parse_active_queue_manifest(&path, now) {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        warn!(
+                            queue = %path.display(),
+                            "ignoring unreadable cgen alert queue manifest: {err:#}"
+                        );
+                        ParsedQueueManifest {
+                            item: None,
+                            active_until: None,
+                        }
+                    }
+                };
                 self.entries.insert(
                     path.clone(),
                     CachedQueueManifest {
@@ -469,11 +560,54 @@ impl ActiveQueueSnapshotCache {
 }
 
 fn queue_manifest_fingerprint(path: &Path) -> std::io::Result<QueueManifestFingerprint> {
-    let metadata = std::fs::metadata(path)?;
+    let metadata = std::fs::symlink_metadata(path)?;
+    validate_queue_manifest_metadata(&metadata)?;
     Ok(QueueManifestFingerprint {
         len: metadata.len(),
         modified: metadata.modified().ok(),
     })
+}
+
+fn validate_queue_manifest_metadata(metadata: &std::fs::Metadata) -> io::Result<()> {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "queue manifest must be a regular file",
+        ));
+    }
+    if metadata.len() > MAX_QUEUE_MANIFEST_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("queue manifest exceeds the {MAX_QUEUE_MANIFEST_BYTES} byte limit"),
+        ));
+    }
+    Ok(())
+}
+
+fn read_queue_manifest(path: &Path) -> io::Result<Vec<u8>> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    validate_queue_manifest_metadata(&metadata)?;
+    let mut file = File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "queue manifest must remain a regular file while being read",
+        ));
+    }
+    let initial_capacity = usize::try_from(metadata.len())
+        .unwrap_or(0)
+        .min(MAX_QUEUE_MANIFEST_BYTES as usize);
+    let mut raw = Vec::with_capacity(initial_capacity);
+    Read::by_ref(&mut file)
+        .take(MAX_QUEUE_MANIFEST_BYTES + 1)
+        .read_to_end(&mut raw)?;
+    if raw.len() as u64 > MAX_QUEUE_MANIFEST_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("queue manifest exceeds the {MAX_QUEUE_MANIFEST_BYTES} byte limit"),
+        ));
+    }
+    Ok(raw)
 }
 
 #[derive(Debug, Clone)]
@@ -486,7 +620,7 @@ fn parse_active_queue_manifest(
     path: &Path,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<ParsedQueueManifest> {
-    let raw = match std::fs::read(path) {
+    let raw = match read_queue_manifest(path) {
         Ok(raw) => raw,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Ok(ParsedQueueManifest {
@@ -819,6 +953,71 @@ mod tests {
     }
 
     #[test]
+    fn active_queue_snapshot_isolates_an_oversized_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue_dir = dir.path().join("runtime").join("queues").join("alerts");
+        std::fs::create_dir_all(&queue_dir).expect("queue dir");
+        let oversized = File::create(queue_dir.join("oversized.json")).expect("oversized queue");
+        oversized
+            .set_len(MAX_QUEUE_MANIFEST_BYTES + 1)
+            .expect("oversized queue length");
+        std::fs::write(
+            queue_dir.join("good.json"),
+            serde_json::to_vec(&json!({
+                "id": "good",
+                "feed_ids": ["CAP-IT-ALL"],
+                "status": "playing",
+                "claimed_at": chrono::Utc::now().to_rfc3339()
+            }))
+            .expect("queue json"),
+        )
+        .expect("write good queue");
+
+        let snapshot = active_queue_snapshot(dir.path()).expect("snapshot");
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].queue_id, "good");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_queue_snapshot_isolates_a_symlinked_manifest() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let queue_dir = dir.path().join("runtime").join("queues").join("alerts");
+        std::fs::create_dir_all(&queue_dir).expect("queue dir");
+        let outside_manifest = outside.path().join("outside.json");
+        std::fs::write(
+            &outside_manifest,
+            serde_json::to_vec(&json!({
+                "id": "outside",
+                "feed_ids": ["CAP-IT-ALL"],
+                "status": "playing",
+                "claimed_at": chrono::Utc::now().to_rfc3339()
+            }))
+            .expect("outside queue json"),
+        )
+        .expect("outside queue");
+        symlink(&outside_manifest, queue_dir.join("linked.json")).expect("queue symlink");
+        std::fs::write(
+            queue_dir.join("good.json"),
+            serde_json::to_vec(&json!({
+                "id": "good",
+                "feed_ids": ["CAP-IT-ALL"],
+                "status": "playing",
+                "claimed_at": chrono::Utc::now().to_rfc3339()
+            }))
+            .expect("queue json"),
+        )
+        .expect("write good queue");
+
+        let snapshot = active_queue_snapshot(dir.path()).expect("snapshot");
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].queue_id, "good");
+    }
+
+    #[test]
     fn active_queue_snapshot_ignores_stale_claims() {
         let dir = tempfile::tempdir().expect("tempdir");
         let queue_dir = dir.path().join("runtime").join("queues").join("alerts");
@@ -926,6 +1125,60 @@ mod tests {
             .expect("queue poller stopped")
             .expect("queue poller task");
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn validate_config_command_parses_without_bridge_arguments() {
+        let args = Args::try_parse_from(["haze-cgen", "validate-config", "--runtime"])
+            .expect("validate-config arguments");
+        assert!(matches!(
+            args.command,
+            Some(Command::ValidateConfig { runtime: true })
+        ));
+        assert!(args.bridge.is_none());
+    }
+
+    #[test]
+    fn config_only_preflight_validates_managed_pipeline_and_protected_scene() {
+        let directory = tempfile::tempdir().expect("temporary managed directory");
+        let config_directory = directory.path().join("managed").join("configs");
+        std::fs::create_dir_all(&config_directory).expect("managed config directory");
+        let path = config_directory.join("cgen.xml");
+        std::fs::write(
+            &path,
+            r#"<cgen schema_version="2" enabled="true">
+  <feed id="CAP" name="CAP CGEN" enabled="true">
+    <programInput type="dummy" width="720" height="480" fps="30000/1001"/>
+    <priorityInput feed_id="CAP" audio_source="both"/>
+    <alert feed_id="CAP"/>
+    <compositor alert_scene_id="Standard_Crawl" engine="scene_v2"/>
+    <video width="720" height="480" fps="30000/1001"/>
+    <audio idle="source" alert_mode="replace" topology="force_layout" force_layout="stereo"/>
+    <ladder>
+      <video id="sd" enabled="true" width="720" height="480" fps="30000/1001"/>
+      <audio id="stereo" enabled="true" channels="2"/>
+    </ladder>
+    <outputs>
+      <output id="primary" enabled="true" destination="rtmp" url="rtmp://example.invalid/live/test" video_codec="h264" rate_control="cbr" video_bitrate_kbps="4000" video_max_bitrate_kbps="4000" gop_frames="60" audio_codec="aac" audio_bitrate_kbps="192" sample_rate="48000"/>
+    </outputs>
+  </feed>
+</cgen>"#,
+        )
+        .expect("managed cgen config");
+
+        let report =
+            validate_config_report(&path, directory.path(), false).expect("config preflight");
+        assert_eq!(report["ok"], true);
+        assert_eq!(report["enabled_feed_count"], 1);
+        assert_eq!(report["feeds"][0]["feed_id"], "CAP");
+        assert_eq!(
+            report["feeds"][0]["alert_scene_id"],
+            scene::STANDARD_CRAWL_ID
+        );
+        assert_eq!(report["feeds"][0]["runtime"], Value::Null);
+        assert!(!serde_json::to_string(&report)
+            .expect("serialize preflight report")
+            .contains("example.invalid"));
     }
 }
 

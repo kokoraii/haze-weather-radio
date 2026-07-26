@@ -32,6 +32,7 @@ const sceneSaveButton = document.getElementById('cgenSceneSaveButton');
 const sceneDeleteButton = document.getElementById('cgenSceneDeleteButton');
 const outputsBody = document.getElementById('cgenOutputsBody');
 const addOutputButton = document.getElementById('cgenAddOutputButton');
+const deinterlaceHint = document.getElementById('cgenDeinterlaceHint');
 const cgenTabs = Array.from(document.querySelectorAll('[data-cgen-tab]'));
 const cgenTabPanels = Array.from(document.querySelectorAll('[data-cgen-panel]'));
 
@@ -45,6 +46,10 @@ const fields = {
     programInputFormat: document.getElementById('cgenProgramInputFormat'),
     hardwareDecoderEnabled: document.getElementById('cgenHardwareDecoderEnabled'),
     hardwareDecoder: document.getElementById('cgenHardwareDecoder'),
+    deinterlaceAlgorithm: document.getElementById('cgenDeinterlaceAlgorithm'),
+    deinterlaceBackend: document.getElementById('cgenDeinterlaceBackend'),
+    deinterlaceCadence: document.getElementById('cgenDeinterlaceCadence'),
+    deinterlaceParity: document.getElementById('cgenDeinterlaceParity'),
     deviceBackend: document.getElementById('cgenDeviceBackend'),
     deviceID: document.getElementById('cgenDeviceID'),
     dummyWidth: document.getElementById('cgenDummyWidth'),
@@ -167,6 +172,7 @@ let cgenCatalog = {
     video_codecs: [],
     audio_codecs: [],
     video_decoders: [],
+    deinterlacers: [],
     devices: [],
     fonts: [],
 };
@@ -270,6 +276,91 @@ function updateProgramInputVisibility() {
     if (fields.hardwareDecoder) fields.hardwareDecoder.disabled = !hardwareDecoderEnabled;
 }
 
+const fallbackDeinterlacers = [
+    { algorithm: 'yadif', backend: 'software', label: 'YADIF, software', available: true, parity_control: true },
+    { algorithm: 'bwdif', backend: 'software', label: 'BWDIF, software', available: false, parity_control: true, reason: 'The runtime catalog did not report an in-process BWDIF filter.' },
+    { algorithm: 'yadif', backend: 'cuda', label: 'YADIF, NVIDIA CUDA', available: false, parity_control: false, reason: 'The runtime catalog did not report a YADIF CUDA filter.' },
+    { algorithm: 'bwdif', backend: 'cuda', label: 'BWDIF, NVIDIA CUDA', available: false, parity_control: false, reason: 'The runtime catalog did not report a BWDIF CUDA filter.' },
+    { algorithm: 'bwdif', backend: 'vulkan', label: 'BWDIF, Vulkan', available: false, parity_control: false, reason: 'The runtime catalog did not report a BWDIF Vulkan filter.' },
+    { algorithm: 'motion_adaptive', backend: 'software', label: 'Motion adaptive, software', available: true, parity_control: true },
+    { algorithm: 'motion_adaptive', backend: 'vaapi', label: 'Motion adaptive, VA-API', available: false, parity_control: false },
+    { algorithm: 'motion_adaptive', backend: 'quicksync', label: 'Motion adaptive, Intel Quick Sync', available: false, parity_control: false },
+    { algorithm: 'motion_adaptive', backend: 'd3d11', label: 'Motion compensated, Direct3D 11', available: false, parity_control: false },
+    { algorithm: 'motion_adaptive', backend: 'opengl', label: 'Motion adaptive, OpenGL', available: false, parity_control: false },
+];
+
+function deinterlacerVariants() {
+    return Array.isArray(cgenCatalog.deinterlacers) && cgenCatalog.deinterlacers.length
+        ? cgenCatalog.deinterlacers
+        : fallbackDeinterlacers;
+}
+
+function updateDeinterlaceControls({ selectFallback = false } = {}) {
+    if (!fields.deinterlaceAlgorithm || !fields.deinterlaceBackend) return;
+    const variants = deinterlacerVariants();
+    const algorithm = String(fields.deinterlaceAlgorithm.value || 'yadif');
+    for (const algorithmOption of fields.deinterlaceAlgorithm.options) {
+        const hasAvailableVariant = variants.some((entry) =>
+            entry.algorithm === algorithmOption.value && entry.available === true);
+        algorithmOption.disabled = !hasAvailableVariant;
+        const baseLabel = algorithmOption.value === 'motion_adaptive'
+            ? 'Motion adaptive'
+            : algorithmOption.value.toUpperCase();
+        algorithmOption.textContent = hasAvailableVariant ? baseLabel : `${baseLabel} (unavailable)`;
+    }
+
+    const backendDefinitions = [
+        ['auto', 'Best available'],
+        ['software', 'Software'],
+        ['vaapi', 'VA-API'],
+        ['quicksync', 'Intel Quick Sync'],
+        ['d3d11', 'Direct3D 11'],
+        ['cuda', 'NVIDIA CUDA'],
+        ['vulkan', 'Vulkan'],
+        ['opengl', 'OpenGL'],
+    ];
+    const previousBackend = String(fields.deinterlaceBackend.value || 'software');
+    fields.deinterlaceBackend.replaceChildren();
+    for (const [backend, label] of backendDefinitions) {
+        const candidates = variants.filter((entry) => entry.algorithm === algorithm &&
+            (backend === 'auto' || entry.backend === backend));
+        const available = candidates.some((entry) => entry.available === true);
+        const backendOption = option(backend, available ? label : `${label} (unavailable)`);
+        backendOption.disabled = !available;
+        fields.deinterlaceBackend.append(backendOption);
+    }
+    const previousOption = Array.from(fields.deinterlaceBackend.options)
+        .find((backendOption) => backendOption.value === previousBackend);
+    if (previousOption && (!selectFallback || !previousOption.disabled)) {
+        fields.deinterlaceBackend.value = previousBackend;
+    } else {
+        const availableOption = Array.from(fields.deinterlaceBackend.options)
+            .find((backendOption) => !backendOption.disabled);
+        if (availableOption) fields.deinterlaceBackend.value = availableOption.value;
+    }
+
+    const backend = String(fields.deinterlaceBackend.value || 'software');
+    const selectedVariants = variants.filter((entry) =>
+        entry.algorithm === algorithm && (backend === 'auto' || entry.backend === backend));
+    const availableVariants = selectedVariants.filter((entry) => entry.available === true);
+    const parityControl = availableVariants.length > 0 &&
+        availableVariants.every((entry) => entry.parity_control === true);
+    if (fields.deinterlaceParity) {
+        fields.deinterlaceParity.disabled = !parityControl;
+        if (!parityControl) fields.deinterlaceParity.value = 'auto';
+    }
+    const exactVariant = selectedVariants.find((entry) => entry.backend === backend);
+    if (deinterlaceHint) {
+        if (backend === 'auto' && availableVariants.length) {
+            deinterlaceHint.textContent = `Available choices: ${availableVariants.map((entry) => entry.label).join(', ')}. Field-rate output preserves full motion cadence.`;
+        } else if (exactVariant?.available) {
+            deinterlaceHint.textContent = `${exactVariant.label} is available. Field-rate output preserves full motion cadence.`;
+        } else {
+            deinterlaceHint.textContent = exactVariant?.reason || 'This deinterlacing combination is unavailable on the current runtime.';
+        }
+    }
+}
+
 function updateAudioTopologyVisibility() {
     const topology = String(fields.audioTopology?.value || 'force_layout').trim().toLowerCase();
     document.querySelectorAll('[data-cgen-audio-option]').forEach((element) => {
@@ -299,7 +390,9 @@ function updateAudioTopologyVisibility() {
 }
 
 function updatePidAssignmentVisibility() {
-    const manual = String(fields.pidAssignment?.value || 'auto') === 'manual';
+    const mode = String(fields.pidAssignment?.value || 'source');
+    const manual = mode === 'manual';
+    const source = mode === 'source';
     [
         fields.hdVideoPID, fields.hdPmtPID,
         fields.p720VideoPID, fields.p720PmtPID,
@@ -308,6 +401,16 @@ function updatePidAssignmentVisibility() {
         fields.surroundAudioPID, fields.surroundPmtPID,
     ].forEach((field) => {
         if (field) field.disabled = !manual;
+    });
+    [
+        fields.transportStreamID,
+        fields.hdProgram,
+        fields.p720Program,
+        fields.sdProgram,
+        fields.stereoProgram,
+        fields.surroundProgram,
+    ].forEach((field) => {
+        if (field) field.disabled = source;
     });
 }
 
@@ -521,6 +624,15 @@ function validatePipelineEditor(feed) {
     if (['uri_or_file', 'stream'].includes(feed.program_input_type) && !String(feed.program_input_url || '').trim()) {
         throw new Error('A program URL, file, or environment reference is required.');
     }
+    if (feed.program_input_type !== 'dummy') {
+        const variants = deinterlacerVariants().filter((entry) =>
+            entry.algorithm === feed.deinterlace_algorithm &&
+            (feed.deinterlace_backend === 'auto' || entry.backend === feed.deinterlace_backend));
+        if (!variants.some((entry) => entry.available === true)) {
+            const reason = variants.find((entry) => entry.reason)?.reason;
+            throw new Error(reason || 'The selected deinterlacing algorithm and backend are unavailable.');
+        }
+    }
     if (!protectedAlertScene(feed.alert_scene_id)) throw new Error('Program_Passthrough and Standby cannot be selected as alert scenes.');
     if (feed.audio_topology === 'preserve_native_tracks' && !preserveNativeAudioAvailable()) {
         throw new Error('Preserve-native audio is unavailable in the current media backend. Select Force layout.');
@@ -631,6 +743,7 @@ function readEditor() {
     if (value('stereoEnabled')) audioMappings.push({ track_id: 'stereo', pid: pidEditorValue('stereoAudioPID', '257') });
     if (value('surroundEnabled')) audioMappings.push({ track_id: 'surround_51', pid: pidEditorValue('surroundAudioPID', '258') });
     const programMapping = {
+        mode: value('pidAssignment', 'source'),
         transport_stream_id: value('transportStreamID', '1'),
         programs: [{
             number: value('hdProgram', '1'),
@@ -659,6 +772,10 @@ function readEditor() {
         hardware_decoder_enabled: value('hardwareDecoderEnabled'),
         hardware_decoder: value('hardwareDecoder'),
         decoder_preference: value('hardwareDecoderEnabled') ? value('hardwareDecoder', 'auto') : 'auto',
+        deinterlace_algorithm: value('deinterlaceAlgorithm', 'yadif'),
+        deinterlace_backend: value('deinterlaceBackend', 'software'),
+        deinterlace_cadence: value('deinterlaceCadence', 'field'),
+        deinterlace_parity: value('deinterlaceParity', 'auto'),
         device_backend: value('deviceBackend', 'v4l2'),
         device_id: value('deviceID'),
         dummy_width: value('dummyWidth', '720'),
@@ -694,6 +811,10 @@ function readEditor() {
             format: value('programInputFormat', 'mpegts'),
             hardware_decoder_enabled: value('hardwareDecoderEnabled'),
             hardware_decoder: value('hardwareDecoder'),
+            deinterlace_algorithm: value('deinterlaceAlgorithm', 'yadif'),
+            deinterlace_backend: value('deinterlaceBackend', 'software'),
+            deinterlace_cadence: value('deinterlaceCadence', 'field'),
+            deinterlace_parity: value('deinterlaceParity', 'auto'),
             device_backend: value('deviceBackend', 'v4l2'),
             device_id: value('deviceID'),
             width: value('dummyWidth', '720'),
@@ -822,6 +943,11 @@ function writeEditor(feed) {
     setValue('programInputFormat', feed.program_input_format || 'mpegts');
     setValue('hardwareDecoderEnabled', Boolean(feed.hardware_decoder_enabled));
     setValue('hardwareDecoder', feed.hardware_decoder || '');
+    setValue('deinterlaceAlgorithm', feed.deinterlace_algorithm || 'yadif');
+    setValue('deinterlaceBackend', feed.deinterlace_backend || 'software');
+    setValue('deinterlaceCadence', feed.deinterlace_cadence || 'field');
+    setValue('deinterlaceParity', feed.deinterlace_parity || 'auto');
+    updateDeinterlaceControls();
     setValue('deviceBackend', feed.device_backend || 'v4l2');
     setValue('deviceID', feed.device_id || '');
     setValue('dummyWidth', feed.dummy_width || '720');
@@ -850,7 +976,10 @@ function writeEditor(feed) {
     setValue('alertScene', feed.alert_scene_id || 'Standard_Crawl');
     const hasAutoPID = [mappedProgram?.video_pid, mappedProgram?.pmt_pid, ...mappedAudio.map((stream) => stream.pid)]
         .some((pid) => String(pid || '').toLowerCase() === 'auto');
-    setValue('pidAssignment', feed.pid_assignment || (hasAutoPID ? 'auto' : 'manual'));
+    setValue(
+        'pidAssignment',
+        feed.program_mapping?.mode || feed.pid_assignment || (hasAutoPID ? 'auto' : 'manual'),
+    );
     setValue('generatedAlertCues', Boolean(feed.generated_alert_cues ?? mappedProgram?.scte35?.generated_alert_cues));
     setValue('programOutput', feed.program_output_url || '');
     setValue('outputFormat', feed.program_output_format || 'mpegts');
@@ -1021,6 +1150,7 @@ function populateCgenCatalogSelectors() {
     renderFontPicker();
     updateFontPreview();
     updateProgramInputVisibility();
+    updateDeinterlaceControls();
     updateAudioTopologyVisibility();
     updateEncoderControlVisibility();
 }
@@ -1758,6 +1888,7 @@ async function loadCgenCatalog({ announce = false } = {}) {
         video_codecs: Array.isArray(payload.video_codecs) ? payload.video_codecs : [],
         audio_codecs: Array.isArray(payload.audio_codecs) ? payload.audio_codecs : [],
         video_decoders: Array.isArray(payload.video_decoders) ? payload.video_decoders : [],
+        deinterlacers: Array.isArray(payload.deinterlacers) ? payload.deinterlacers : [],
         capabilities: payload.capabilities && typeof payload.capabilities === 'object' ? payload.capabilities : {},
         devices: Array.isArray(payload.devices) ? payload.devices : (Array.isArray(payload.input_devices) ? payload.input_devices : []),
         fonts: Array.isArray(payload.fonts) ? payload.fonts : [],
@@ -1838,6 +1969,10 @@ function defaultFeed() {
         hardware_decoder_enabled: false,
         hardware_decoder: '',
         decoder_preference: 'auto',
+        deinterlace_algorithm: 'yadif',
+        deinterlace_backend: 'software',
+        deinterlace_cadence: 'field',
+        deinterlace_parity: 'auto',
         device_backend: 'v4l2',
         device_id: '',
         dummy_width: '720',
@@ -2033,6 +2168,8 @@ export function initCgenView() {
             if (field === fields.font) updateFontPreview();
             if (field === fields.vcodec || field === fields.acodec) updateEncoderControlVisibility();
             if (field === fields.programInputType || field === fields.hardwareDecoderEnabled) updateProgramInputVisibility();
+            if (field === fields.deinterlaceAlgorithm) updateDeinterlaceControls({ selectFallback: true });
+            if (field === fields.deinterlaceBackend) updateDeinterlaceControls();
             if (field === fields.audioTopology) updateAudioTopologyVisibility();
             if (field === fields.pidAssignment) updatePidAssignmentVisibility();
             if (field === fields.deviceBackend) populateDeviceSelector();
@@ -2051,6 +2188,8 @@ export function initCgenView() {
             if (field === fields.font) updateFontPreview();
             if (field === fields.vcodec || field === fields.acodec) updateEncoderControlVisibility();
             if (field === fields.programInputType || field === fields.hardwareDecoderEnabled) updateProgramInputVisibility();
+            if (field === fields.deinterlaceAlgorithm) updateDeinterlaceControls({ selectFallback: true });
+            if (field === fields.deinterlaceBackend) updateDeinterlaceControls();
             if (field === fields.audioTopology) updateAudioTopologyVisibility();
             if (field === fields.pidAssignment) updatePidAssignmentVisibility();
             if (field === fields.deviceBackend) populateDeviceSelector();

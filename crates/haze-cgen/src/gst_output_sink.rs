@@ -194,6 +194,13 @@ pub(crate) struct GstOutputSinkFactory {
     program_map: Option<Arc<ResolvedProgramMapSpec>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GstOutputPreflight {
+    pub(crate) output_id: String,
+    pub(crate) destination_kind: &'static str,
+    pub(crate) required_elements: Vec<&'static str>,
+}
+
 impl GstOutputSinkFactory {
     pub(crate) fn new(program_map: Option<ResolvedProgramMapSpec>) -> Self {
         Self {
@@ -209,6 +216,71 @@ impl GstOutputSinkFactory {
 
     pub(crate) const fn program_map_capabilities() -> GstProgramMapCapabilities {
         GST_PROGRAM_MAP_CAPABILITIES
+    }
+
+    pub(crate) fn preflight(
+        &self,
+        output: &EncoderOutputSpec,
+    ) -> anyhow::Result<GstOutputPreflight> {
+        StandardOutputCompatibility
+            .validate(output)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "output {} ({}) is incompatible: {error}",
+                    output.id,
+                    output.destination.kind()
+                )
+            })?;
+        gst::init().map_err(|_| anyhow::anyhow!("failed to initialize GStreamer"))?;
+        let activated = ActivatedOutputSpec::from_output(output).map_err(|error| {
+            anyhow::anyhow!(
+                "output {} ({}) failed activation preflight: {}",
+                output.id,
+                output.destination.kind(),
+                error.safe_reason()
+            )
+        })?;
+        let plan = OutputPipelinePlan::build(
+            &activated,
+            output
+                .destination
+                .is_mpeg_ts()
+                .then_some(self.program_map.as_deref())
+                .flatten(),
+            RtmpSinkElement::available(),
+        )
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "output {} ({}) failed pipeline preflight: {}",
+                output.id,
+                output.destination.kind(),
+                error.safe_reason()
+            )
+        })?;
+        let mut required_elements = plan
+            .required_elements
+            .iter()
+            .map(|element| element.name)
+            .collect::<Vec<_>>();
+        required_elements.sort_unstable();
+        let missing = required_elements
+            .iter()
+            .copied()
+            .filter(|element| gst::ElementFactory::find(*element).is_none())
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "output {} ({}) is missing required GStreamer element(s): {}",
+                output.id,
+                output.destination.kind(),
+                missing.join(", ")
+            );
+        }
+        Ok(GstOutputPreflight {
+            output_id: output.id.to_string(),
+            destination_kind: output.destination.kind(),
+            required_elements,
+        })
     }
 }
 

@@ -40,8 +40,22 @@ type cgenRuntimeCatalog struct {
 	VideoCodecs   []cgenCatalogEntry      `json:"video_codecs"`
 	AudioCodecs   []cgenCatalogEntry      `json:"audio_codecs"`
 	VideoDecoders []cgenCatalogEntry      `json:"video_decoders"`
+	Deinterlacers []cgenDeinterlacerEntry `json:"deinterlacers"`
 	InputDevices  []cgenInputDevice       `json:"input_devices"`
 	Capabilities  cgenRuntimeCapabilities `json:"capabilities"`
+}
+
+type cgenDeinterlacerEntry struct {
+	ID            string   `json:"id"`
+	Label         string   `json:"label"`
+	Algorithm     string   `json:"algorithm"`
+	Backend       string   `json:"backend"`
+	Hardware      bool     `json:"hardware"`
+	Available     bool     `json:"available"`
+	Elements      []string `json:"elements"`
+	Cadences      []string `json:"cadences"`
+	ParityControl bool     `json:"parity_control"`
+	Reason        string   `json:"reason,omitempty"`
 }
 
 type cgenRuntimeCapabilities struct {
@@ -93,6 +107,7 @@ func cgenCatalogPayload(configPath string) (map[string]any, error) {
 		"video_codecs":   builder.sorted(builder.video),
 		"audio_codecs":   builder.sorted(builder.audio),
 		"video_decoders": builder.sorted(builder.videoDecoders),
+		"deinterlacers":  runtimeCatalog.Deinterlacers,
 		"devices":        cgenInputDevicePayload(runtimeCatalog.InputDevices),
 		"fonts":          discoverFonts(configPath),
 		"capabilities": map[string]any{
@@ -143,7 +158,7 @@ func loadCgenRuntimeCatalog(configPath string) (cgenRuntimeCatalog, string) {
 	if err := json.Unmarshal(output, &payload); err != nil {
 		return cgenRuntimeCatalog{}, ""
 	}
-	if len(payload.Formats)+len(payload.VideoCodecs)+len(payload.AudioCodecs)+len(payload.VideoDecoders)+len(payload.InputDevices) == 0 {
+	if len(payload.Formats)+len(payload.VideoCodecs)+len(payload.AudioCodecs)+len(payload.VideoDecoders)+len(payload.Deinterlacers)+len(payload.InputDevices) == 0 {
 		return cgenRuntimeCatalog{}, ""
 	}
 	return payload, "haze-cgen-registry"
