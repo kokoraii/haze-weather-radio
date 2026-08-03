@@ -49,6 +49,26 @@ services:
 	}
 }
 
+func TestEquivalentSIPListenOverridePreservesAdditionalPorts(t *testing.T) {
+	cfg := sipConfig{
+		Listen: "0.0.0.0:5060",
+		ListenPorts: sipListenPorts{
+			{Port: 5060},
+			{Port: 5080, Domain: "teleweather.sip.rai.blue"},
+		},
+	}
+	applySIPListenOverride(&cfg, "0.0.0.0:5060")
+	if bindings := cfg.listenBindings(); len(bindings) != 2 {
+		t.Fatalf("equivalent daemon override removed configured listeners: %#v", bindings)
+	}
+
+	applySIPListenOverride(&cfg, "127.0.0.1:5099")
+	bindings := cfg.listenBindings()
+	if len(bindings) != 1 || bindings[0].Addr != "127.0.0.1:5099" {
+		t.Fatalf("explicit alternate override did not replace configured listeners: %#v", bindings)
+	}
+}
+
 func TestSIPDomainAllowedMatchesRequestURI(t *testing.T) {
 	service := &Service{}
 	request := sampleSIPInviteRequest()
@@ -74,6 +94,28 @@ func TestNormalizeIVRExtensionsAddsEnabledCanadaLine(t *testing.T) {
 	line := cfg.Extensions[0]
 	if line.Extension != "haze" || line.Province != "CA" || !line.enabled() {
 		t.Fatalf("default line = %#v", line)
+	}
+}
+
+func TestNormalizeIVRConfigBoundsSearchAndTwilioResources(t *testing.T) {
+	enabled := true
+	cfg := Config{
+		MaxConcurrentCalls: 10,
+		Search: searchConfig{
+			Enabled: &enabled, MaxAttempts: 9, VADPrerollMS: 9000, VADTrailingMS: 9000,
+			MinVoiceMS: 10, MaxVoiceMS: 500,
+		},
+		Twilio: twilioConfig{MaxMessageBytes: 1024 * 1024, MaxConcurrentStreams: 99},
+	}
+	normalizeIVRConfig(&cfg)
+	if cfg.Search.MaxAttempts != 2 || cfg.Search.VADPrerollMS != 1000 || cfg.Search.VADTrailingMS != 2000 {
+		t.Fatalf("search bounds = %#v", cfg.Search)
+	}
+	if cfg.Search.MinVoiceMS != 2000 || cfg.Search.MaxVoiceMS != 2000 {
+		t.Fatalf("voice duration bounds = %d..%d", cfg.Search.MinVoiceMS, cfg.Search.MaxVoiceMS)
+	}
+	if cfg.Twilio.MaxMessageBytes != 256*1024 || cfg.Twilio.MaxConcurrentStreams != 10 {
+		t.Fatalf("Twilio bounds = %#v", cfg.Twilio)
 	}
 }
 
@@ -120,6 +162,151 @@ func TestSIPProvinceLineSurvivesProxyRequestURIRewrite(t *testing.T) {
 	line, matched := service.sipRequestLine(request)
 	if !matched || line.Extension != "600" || line.directProvince() != "SK" {
 		t.Fatalf("selected line = %#v, matched=%v", line, matched)
+	}
+}
+
+func TestSIPRequestDirectFeedMatchesConfiguredRequestURI(t *testing.T) {
+	service := &Service{cfg: loadedConfig{Feeds: []feedXML{
+		{ID: "sk-0001", EnabledRaw: "true"},
+		{ID: "CFSP-CAP", EnabledRaw: "true"},
+		{ID: "off-0001", EnabledRaw: "false"},
+	}}}
+	tests := []struct {
+		name string
+		uri  string
+		to   string
+		want sipDirectFeedTarget
+	}{
+		{name: "enabled", uri: "sip:sk-0001@172.16.1.31:5060", want: sipDirectFeedTarget{ID: "sk-0001", Matched: true, Enabled: true}},
+		{name: "case insensitive canonical result", uri: "sip:cfsp-cap@172.16.1.31", want: sipDirectFeedTarget{ID: "CFSP-CAP", Matched: true, Enabled: true}},
+		{name: "disabled", uri: "sip:off-0001@172.16.1.31", want: sipDirectFeedTarget{ID: "off-0001", Matched: true, Enabled: false}},
+		{name: "unknown", uri: "sip:not-a-feed@172.16.1.31"},
+		{name: "request URI only", uri: "sip:haze@172.16.1.31", to: "<sip:sk-0001@172.16.1.31>"},
+		{name: "path syntax rejected", uri: "sip:..%2fsk-0001@172.16.1.31"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := sampleSIPInviteRequest()
+			request.URI = test.uri
+			if test.to != "" {
+				request.Headers["to"] = test.to
+			}
+			if got := service.sipRequestDirectFeed(request); got != test.want {
+				t.Fatalf("direct feed target = %#v, want %#v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestValidSIPDirectFeedIDRejectsUnsafeOrOversizedValues(t *testing.T) {
+	tests := []struct {
+		value string
+		want  bool
+	}{
+		{value: "sk-0001", want: true},
+		{value: "CFSP-CAP", want: true},
+		{value: "feed_name.2", want: true},
+		{value: ""},
+		{value: "../sk-0001"},
+		{value: "sk-0001%0d%0a"},
+		{value: "sk 0001"},
+		{value: strings.Repeat("a", 129)},
+	}
+	for _, test := range tests {
+		if got := validSIPDirectFeedID(test.value); got != test.want {
+			t.Errorf("validSIPDirectFeedID(%q) = %v, want %v", test.value, got, test.want)
+		}
+	}
+}
+
+func TestSIPInviteDirectFeedUsesCanonicalFeedWithoutCallDeadline(t *testing.T) {
+	service := &Service{cfg: loadedConfig{
+		IVR: Config{
+			Extensions:     []extensionConfig{{Extension: "haze", Province: "CA"}},
+			MaxCallSeconds: 7,
+			RTP:            rtpConfig{PortMin: 0, PortMax: 0},
+		},
+		Feeds: []feedXML{{ID: "CFSP-CAP", EnabledRaw: "true"}},
+	}}
+	service.broadcast = newBroadcastHub()
+	service.broadcast.SetHTTPSource("http://127.0.0.1:8097")
+	request := sampleSIPInviteRequest()
+	request.URI = "sip:cfsp-cap@172.16.1.31:5060"
+	request.Headers["to"] = "<sip:cfsp-cap@172.16.1.31:5060>"
+
+	call, response := acceptTestSIPInvite(service, context.Background(), request, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5062}, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5060})
+	if call == nil {
+		t.Fatalf("expected accepted direct feed call, response: %s", response)
+	}
+	defer call.close()
+	if call.directFeedID != "CFSP-CAP" {
+		t.Fatalf("direct feed ID = %q, want canonical feed ID", call.directFeedID)
+	}
+	if _, ok := call.ctx.Deadline(); ok {
+		t.Fatal("direct feed call received an IVR menu deadline")
+	}
+}
+
+func TestSIPInviteDirectFeedAvailability(t *testing.T) {
+	tests := []struct {
+		name       string
+		enabledRaw string
+		media      bool
+		warning    string
+	}{
+		{name: "disabled feed", enabledRaw: "false", media: true, warning: "live feed is disabled"},
+		{name: "media unavailable", enabledRaw: "true", warning: "live feed is unavailable"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service := &Service{cfg: loadedConfig{
+				IVR:   Config{Extensions: []extensionConfig{{Extension: "haze", Province: "CA"}}},
+				Feeds: []feedXML{{ID: "sk-0001", EnabledRaw: test.enabledRaw}},
+			}}
+			service.broadcast = newBroadcastHub()
+			if test.media {
+				service.broadcast.SetHTTPSource("http://127.0.0.1:8097")
+			}
+			request := sampleSIPInviteRequest()
+			request.URI = "sip:sk-0001@172.16.1.31:5060"
+			request.Headers["to"] = "<sip:sk-0001@172.16.1.31:5060>"
+
+			call, response := acceptTestSIPInvite(service, context.Background(), request, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5062}, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5060})
+			if call != nil {
+				call.close()
+				t.Fatal("unavailable direct feed accepted a call")
+			}
+			if !strings.Contains(response, "480 Temporarily Unavailable") || !strings.Contains(response, test.warning) {
+				t.Fatalf("direct feed response = %q", response)
+			}
+		})
+	}
+}
+
+func TestSIPInviteExtensionTakesPrecedenceOverCollidingFeedID(t *testing.T) {
+	service := &Service{cfg: loadedConfig{
+		IVR: Config{
+			Extensions:     []extensionConfig{{Extension: "600", Province: "SK"}},
+			MaxCallSeconds: 7,
+			RTP:            rtpConfig{PortMin: 0, PortMax: 0},
+		},
+		Feeds: []feedXML{{ID: "600", EnabledRaw: "true"}},
+	}}
+	service.broadcast = newBroadcastHub()
+	service.broadcast.SetHTTPSource("http://127.0.0.1:8097")
+	request := sampleSIPInviteRequest()
+	request.URI = "sip:600@172.16.1.31:5060"
+
+	call, response := acceptTestSIPInvite(service, context.Background(), request, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5062}, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5060})
+	if call == nil {
+		t.Fatalf("expected accepted extension call, response: %s", response)
+	}
+	defer call.close()
+	if call.directFeedID != "" || call.line.Extension != "600" {
+		t.Fatalf("colliding route selected feed=%q line=%#v", call.directFeedID, call.line)
+	}
+	if _, ok := call.ctx.Deadline(); !ok {
+		t.Fatal("ordinary IVR extension lost its configured call deadline")
 	}
 }
 
@@ -229,6 +416,19 @@ func TestSIPAdvertiseHostUsesLANForPrivateCallers(t *testing.T) {
 	got = service.sipAdvertiseHost(&net.UDPAddr{IP: net.ParseIP("208.100.60.166"), Port: 5060}, &net.UDPAddr{IP: net.ParseIP("172.16.1.30"), Port: 5060})
 	if got != "203.0.113.10" {
 		t.Fatalf("public caller should receive public advertise host, got %q", got)
+	}
+}
+
+func TestSIPAdvertiseHostUsesCallerRouteForWildcardListener(t *testing.T) {
+	service := &Service{cfg: loadedConfig{IVR: Config{
+		SIP: sipConfig{PublicHost: "203.0.113.10"},
+	}}}
+	got := service.sipAdvertiseHost(
+		&net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5060},
+		&net.UDPAddr{IP: net.IPv4zero, Port: 5060},
+	)
+	if got != "127.0.0.1" {
+		t.Fatalf("wildcard listener should advertise the route back to a local caller, got %q", got)
 	}
 }
 

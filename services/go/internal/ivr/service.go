@@ -44,22 +44,39 @@ type staticPromptFile struct {
 }
 
 type Service struct {
-	cfg         loadedConfig
-	resolver    *Resolver
-	cache       *ProductCache
-	bridge      *bridgeClient
-	mediaBridge *bridgeClient
-	broadcast   *broadcastHub
-	store       datastore.Store
-	metrics     metrics
+	ctx            context.Context
+	cfg            loadedConfig
+	resolver       *Resolver
+	searchIndex    *locationSearchIndex
+	cache          *ProductCache
+	bridge         *bridgeClient
+	mediaBridge    *bridgeClient
+	broadcast      *broadcastHub
+	store          datastore.Store
+	metrics        metrics
+	twilio         *twilioRuntime
+	twilioRequired bool
 }
 
 type metrics struct {
-	Lookups       atomic.Uint64 `json:"-"`
-	CacheRequests atomic.Uint64 `json:"-"`
-	CacheErrors   atomic.Uint64 `json:"-"`
-	SIPMessages   atomic.Uint64 `json:"-"`
-	HTTPRequests  atomic.Uint64 `json:"-"`
+	Lookups             atomic.Uint64 `json:"-"`
+	CacheRequests       atomic.Uint64 `json:"-"`
+	CacheErrors         atomic.Uint64 `json:"-"`
+	SIPMessages         atomic.Uint64 `json:"-"`
+	HTTPRequests        atomic.Uint64 `json:"-"`
+	SearchVoice         atomic.Uint64 `json:"-"`
+	SearchT9            atomic.Uint64 `json:"-"`
+	SearchMultitap      atomic.Uint64 `json:"-"`
+	SearchAccepted      atomic.Uint64 `json:"-"`
+	SearchConfirmations atomic.Uint64 `json:"-"`
+	SearchAmbiguities   atomic.Uint64 `json:"-"`
+	SearchNoMatch       atomic.Uint64 `json:"-"`
+	ASRFailures         atomic.Uint64 `json:"-"`
+	ASRBusy             atomic.Uint64 `json:"-"`
+	ASRTimeouts         atomic.Uint64 `json:"-"`
+	ASRUnavailable      atomic.Uint64 `json:"-"`
+	ASRLatencySamples   atomic.Uint64 `json:"-"`
+	ASRLatencyMS        atomic.Uint64 `json:"-"`
 }
 
 func Run(ctx context.Context, options Options) error {
@@ -105,12 +122,28 @@ func Run(ctx context.Context, options Options) error {
 		}
 		service := &Service{
 			cfg:         cfg,
-			resolver:    NewResolver(cfg),
 			bridge:      bridge,
 			mediaBridge: mediaBridge,
 			store:       store,
 		}
+		service.resolver = NewResolver(cfg)
+		if cfg.IVR.Search.enabled() {
+			searchIndex, searchErr := loadLocationSearchIndex(cfg, service.resolver)
+			if searchErr != nil {
+				log.Printf("IVR location search unavailable, numeric entry remains active: %v", searchErr)
+			} else {
+				service.searchIndex = searchIndex
+				log.Printf("IVR location search indexed %d canonical targets", len(searchIndex.targets))
+			}
+		}
 		service.cache = NewProductCache(cfg, bridge)
+		service.twilioRequired = cfg.IVR.Twilio.Enabled
+		if cfg.IVR.Twilio.Enabled {
+			service.twilio, err = newTwilioRuntime(cfg)
+			if err != nil {
+				log.Printf("IVR Twilio adapter unavailable, SIP remains active: %v", err)
+			}
+		}
 		err = service.runConnected(ctx)
 		_ = bridge.Close()
 		if mediaBridge != nil {
@@ -177,6 +210,7 @@ func drainBridgeEvents(ctx context.Context, events <-chan map[string]any) {
 }
 
 func (s *Service) runConnected(ctx context.Context) error {
+	s.ctx = ctx
 	if err := s.bridge.Publish(map[string]any{
 		"type":   "service.ready",
 		"source": serviceID,
@@ -188,6 +222,8 @@ func (s *Service) runConnected(ctx context.Context) error {
 			"sip_addrs":           s.cfg.IVR.SIP.listenAddrs(),
 			"cache_dir":           s.cfg.cacheDir(),
 			"max_render_inflight": s.cfg.IVR.MaxRenderInflight,
+			"search_enabled":      s.searchIndex != nil,
+			"search_targets":      locationSearchTargetCount(s.searchIndex),
 		},
 	}); err != nil {
 		return err
@@ -261,7 +297,17 @@ func (s *Service) routes() http.Handler {
 	mux.HandleFunc("/ivr/v1/prompt", s.handlePrompt)
 	mux.HandleFunc("/ivr/v1/audio", s.handleAudio)
 	mux.HandleFunc("/ivr/v1/alert_audio", s.handleAlertAudio)
-	mux.HandleFunc("/ivr/v1/twiml", s.handleTwiML)
+	twimlHandler := http.Handler(http.HandlerFunc(s.handleTwiML))
+	if s.twilioRequired {
+		twimlHandler = s.requireTwilioCallback(twimlHandler)
+	}
+	mux.Handle("/ivr/v1/twiml", twimlHandler)
+	mux.HandleFunc("/ivr/v1/twilio/media", s.handleTwilioMedia)
+	mux.Handle("/ivr/v1/twilio/recover/", s.requireTwilioCallback(http.HandlerFunc(s.handleTwilioRecovery)))
+	mux.Handle("/ivr/v1/twilio/result/", s.requireTwilioCallback(http.HandlerFunc(s.handleTwilioResult)))
+	mux.HandleFunc("/ivr/v1/twilio/prompt", s.requireTwilioMedia(s.handlePrompt))
+	mux.HandleFunc("/ivr/v1/twilio/audio", s.requireTwilioMedia(s.handleAudio))
+	mux.HandleFunc("/ivr/v1/twilio/alert_audio", s.requireTwilioMedia(s.handleAlertAudio))
 	mux.HandleFunc("/ivr/v1/metrics", s.handleMetrics)
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("X-Content-Type-Options", "nosniff")
@@ -600,6 +646,10 @@ func (s *Service) handleLocationNumberTwiML(writer http.ResponseWriter, request 
 		return
 	}
 	if number == "*" {
+		if s.twilio != nil && s.cfg.IVR.Search.enabled() && s.searchIndex != nil {
+			s.writeTwilioSearchConnect(writer, request, request.URL.Query().Get("lang"), province)
+			return
+		}
 		body := twimlPlay(promptURL(request, "location_number", "search_unavailable", nil)) +
 			twimlRedirect(twimlURL(request, "/ivr/v1/twiml", map[string]string{
 				"state": "location_code",
@@ -630,6 +680,7 @@ func (s *Service) writeLocationMenu(writer http.ResponseWriter, request *http.Re
 }
 
 func (s *Service) writeLocationMenuWithAlertAuto(writer http.ResponseWriter, request *http.Request, location ResolvedLocation, autoAlertMenu bool) {
+	request = s.twilioLocationRequest(request, location)
 	menu, _ := s.cfg.Prompts.Menu("location_menu")
 	alerts := s.activeIVRAlerts(request.Context(), location)
 	params := locationTwiMLParams(location)
@@ -1252,11 +1303,24 @@ func (s *Service) writeUnavailableTwiML(writer http.ResponseWriter, request *htt
 
 func (s *Service) handleMetrics(writer http.ResponseWriter, _ *http.Request) {
 	writeJSON(writer, map[string]any{
-		"lookups":        s.metrics.Lookups.Load(),
-		"cache_requests": s.metrics.CacheRequests.Load(),
-		"cache_errors":   s.metrics.CacheErrors.Load(),
-		"sip_messages":   s.metrics.SIPMessages.Load(),
-		"http_requests":  s.metrics.HTTPRequests.Load(),
+		"lookups":              s.metrics.Lookups.Load(),
+		"cache_requests":       s.metrics.CacheRequests.Load(),
+		"cache_errors":         s.metrics.CacheErrors.Load(),
+		"sip_messages":         s.metrics.SIPMessages.Load(),
+		"http_requests":        s.metrics.HTTPRequests.Load(),
+		"search_voice":         s.metrics.SearchVoice.Load(),
+		"search_t9":            s.metrics.SearchT9.Load(),
+		"search_multitap":      s.metrics.SearchMultitap.Load(),
+		"search_accepted":      s.metrics.SearchAccepted.Load(),
+		"search_confirmations": s.metrics.SearchConfirmations.Load(),
+		"search_ambiguities":   s.metrics.SearchAmbiguities.Load(),
+		"search_no_match":      s.metrics.SearchNoMatch.Load(),
+		"asr_failures":         s.metrics.ASRFailures.Load(),
+		"asr_busy":             s.metrics.ASRBusy.Load(),
+		"asr_timeouts":         s.metrics.ASRTimeouts.Load(),
+		"asr_unavailable":      s.metrics.ASRUnavailable.Load(),
+		"asr_latency_samples":  s.metrics.ASRLatencySamples.Load(),
+		"asr_latency_ms_total": s.metrics.ASRLatencyMS.Load(),
 	})
 }
 
@@ -1636,7 +1700,28 @@ func twimlURL(request *http.Request, path string, params map[string]string) stri
 			values.Set(key, value)
 		}
 	}
-	base := externalBaseURL(request) + path
+	mediaToken := strings.TrimSpace(request.URL.Query().Get("twilio_token"))
+	configuredBase := ""
+	if requestContext, ok := request.Context().Value(twilioRequestContextKey{}).(twilioRequestContext); ok && requestContext.MediaToken != "" {
+		mediaToken = requestContext.MediaToken
+		configuredBase = strings.TrimRight(requestContext.BaseURL, "/")
+	}
+	if mediaToken != "" {
+		values.Set("twilio_token", mediaToken)
+		switch path {
+		case "/ivr/v1/prompt":
+			path = "/ivr/v1/twilio/prompt"
+		case "/ivr/v1/audio":
+			path = "/ivr/v1/twilio/audio"
+		case "/ivr/v1/alert_audio":
+			path = "/ivr/v1/twilio/alert_audio"
+		}
+	}
+	base := externalBaseURL(request)
+	if configuredBase != "" {
+		base = configuredBase
+	}
+	base += path
 	if encoded := values.Encode(); encoded != "" {
 		base += "?" + encoded
 	}

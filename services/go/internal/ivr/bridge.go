@@ -19,6 +19,7 @@ type bridgeClient struct {
 	pendingProducts map[string]chan productResult
 	pendingWx       map[string]chan wxResult
 	pendingSynth    map[string]chan synthResult
+	pendingASR      map[string]chan asrResult
 	mu              sync.Mutex
 }
 
@@ -38,6 +39,14 @@ type synthResult struct {
 type wxResult struct {
 	Product renderedProduct
 	Err     error
+}
+
+type asrResult struct {
+	Text      string
+	Code      string
+	Retryable bool
+	LatencyMS int
+	Err       error
 }
 
 type renderedProduct struct {
@@ -81,6 +90,7 @@ func connectBridge(ctx context.Context, addr string) (*bridgeClient, error) {
 		pendingProducts: map[string]chan productResult{},
 		pendingWx:       map[string]chan wxResult{},
 		pendingSynth:    map[string]chan synthResult{},
+		pendingASR:      map[string]chan asrResult{},
 	}
 	go client.readLoop()
 	return client, nil
@@ -121,23 +131,26 @@ func (c *bridgeClient) WxOnDemand(ctx context.Context, requestID string, locatio
 		"source":  serviceID,
 		"subject": requestID,
 		"data": map[string]any{
-			"request_id":      requestID,
-			"feed_id":         location.FeedID,
-			"covered_by_feed": location.Covered,
-			"code":            location.Code,
-			"source":          location.Source,
-			"location_name":   location.Name,
-			"province":        location.Province,
-			"forecast_id":     location.Forecast,
-			"station_id":      location.StationID,
-			"latitude":        location.Latitude,
-			"longitude":       location.Longitude,
-			"timezone":        location.Timezone,
-			"language":        language,
-			"reader_id":       readerID,
-			"packages":        packages,
-			"audience":        "telephone",
-			"telephone":       true,
+			"request_id":        requestID,
+			"canonical_id":      location.CanonicalID,
+			"feed_id":           location.FeedID,
+			"covered_by_feed":   location.Covered,
+			"code":              location.Code,
+			"source":            location.Source,
+			"location_identity": location.Source + ":" + location.Code,
+			"location_name":     location.Name,
+			"province":          location.Province,
+			"country":           location.Country,
+			"forecast_id":       location.Forecast,
+			"station_id":        location.StationID,
+			"latitude":          location.Latitude,
+			"longitude":         location.Longitude,
+			"timezone":          location.Timezone,
+			"language":          language,
+			"reader_id":         readerID,
+			"packages":          packages,
+			"audience":          "telephone",
+			"telephone":         true,
 		},
 	}); err != nil {
 		return renderedProduct{}, err
@@ -147,6 +160,40 @@ func (c *bridgeClient) WxOnDemand(ctx context.Context, requestID string, locatio
 		return renderedProduct{}, ctx.Err()
 	case result := <-ch:
 		return result.Product, result.Err
+	}
+}
+
+func (c *bridgeClient) Transcribe(ctx context.Context, requestID string, audioFile string, language string, prompt string) (asrResult, error) {
+	ch := make(chan asrResult, 1)
+	c.mu.Lock()
+	c.pendingASR[requestID] = ch
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		delete(c.pendingASR, requestID)
+		c.mu.Unlock()
+	}()
+	if err := c.Publish(map[string]any{
+		"type":    "asr.transcribe",
+		"source":  serviceID,
+		"subject": requestID,
+		"data": map[string]any{
+			"request_id":  requestID,
+			"audio_file":  audioFile,
+			"language":    language,
+			"prompt":      prompt,
+			"sample_rate": 16000,
+			"channels":    1,
+			"audience":    "telephone",
+		},
+	}); err != nil {
+		return asrResult{}, err
+	}
+	select {
+	case <-ctx.Done():
+		return asrResult{}, ctx.Err()
+	case result := <-ch:
+		return result, result.Err
 	}
 }
 
@@ -237,7 +284,7 @@ func (c *bridgeClient) readLoop() {
 		if err := json.Unmarshal([]byte(line), &message); err != nil {
 			continue
 		}
-		if c.handleProductResult(message) || c.handleWxResult(message) || c.handleSynthResult(message) {
+		if c.handleProductResult(message) || c.handleWxResult(message) || c.handleSynthResult(message) || c.handleASRResult(message) {
 			continue
 		}
 		select {
@@ -263,6 +310,35 @@ func (c *bridgeClient) failPending(err error) {
 		ch <- synthResult{Err: fmt.Errorf("%w while waiting for %s", err, id)}
 		delete(c.pendingSynth, id)
 	}
+	for id, ch := range c.pendingASR {
+		ch <- asrResult{Err: fmt.Errorf("%w while waiting for %s", err, id)}
+		delete(c.pendingASR, id)
+	}
+}
+
+func (c *bridgeClient) handleASRResult(message map[string]any) bool {
+	msgType := stringAt(message, "type")
+	if msgType != "asr.transcribed" && msgType != "asr.failed" {
+		return false
+	}
+	data := mapAt(message, "data")
+	requestID := firstText(message, data, "request_id", "subject")
+	if requestID == "" {
+		return true
+	}
+	c.mu.Lock()
+	ch := c.pendingASR[requestID]
+	c.mu.Unlock()
+	if ch == nil {
+		return true
+	}
+	if msgType == "asr.failed" {
+		code := stringAt(data, "code")
+		ch <- asrResult{Code: code, Retryable: boolAt(data, "retryable", false), Err: fmt.Errorf("ASR failed: %s", code)}
+		return true
+	}
+	ch <- asrResult{Text: stringAt(data, "text"), LatencyMS: intAt(data, "latency_ms")}
+	return true
 }
 
 func (c *bridgeClient) handleProductResult(message map[string]any) bool {
@@ -385,6 +461,24 @@ func intAt(source map[string]any, key string) int {
 	default:
 		return 0
 	}
+}
+
+func boolAt(source map[string]any, key string, fallback bool) bool {
+	if source == nil {
+		return fallback
+	}
+	switch value := source[key].(type) {
+	case bool:
+		return value
+	case string:
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "1", "true", "yes", "on":
+			return true
+		case "0", "false", "no", "off":
+			return false
+		}
+	}
+	return fallback
 }
 
 func mapAt(source map[string]any, key string) map[string]any {

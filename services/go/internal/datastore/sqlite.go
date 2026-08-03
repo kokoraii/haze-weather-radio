@@ -104,6 +104,35 @@ func (s *SQLiteStore) Migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, sqliteSchemaSQL); err != nil {
 		return fmt.Errorf("migrate sqlite datastore: %w", err)
 	}
+	hasCanonicalID := false
+	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info(locations_locations)")
+	if err != nil {
+		return fmt.Errorf("inspect sqlite location schema: %w", err)
+	}
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull, primaryKey int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
+			return err
+		}
+		if name == "canonical_id" {
+			hasCanonicalID = true
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if !hasCanonicalID {
+		if _, err := s.db.ExecContext(ctx, "ALTER TABLE locations_locations ADD COLUMN canonical_id TEXT"); err != nil {
+			return fmt.Errorf("add canonical location ID column: %w", err)
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS idx_locations_canonical_id ON locations_locations(canonical_id) WHERE canonical_id IS NOT NULL AND canonical_id <> ''"); err != nil {
+		return fmt.Errorf("index canonical location IDs: %w", err)
+	}
 	return nil
 }
 
@@ -122,10 +151,11 @@ func (s *SQLiteStore) UpsertLocation(ctx context.Context, record LocationRecord)
 	}
 	_, err = s.db.ExecContext(ctx, `
 INSERT INTO locations_locations (
-    source, location_id, kind, name_en, name_fr, station_id, citypage_id, clc,
+    canonical_id, source, location_id, kind, name_en, name_fr, station_id, citypage_id, clc,
     latitude, longitude, metadata, last_seen
-) VALUES (?,?,?,?,?,?,?,?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+) VALUES (NULLIF(?,''),?,?,?,?,?,?,?,?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 ON CONFLICT(source, location_id) DO UPDATE SET
+    canonical_id = COALESCE(excluded.canonical_id, locations_locations.canonical_id),
     kind = COALESCE(NULLIF(excluded.kind, ''), locations_locations.kind),
     name_en = COALESCE(NULLIF(excluded.name_en, ''), locations_locations.name_en),
     name_fr = COALESCE(NULLIF(excluded.name_fr, ''), locations_locations.name_fr),
@@ -136,6 +166,7 @@ ON CONFLICT(source, location_id) DO UPDATE SET
     longitude = COALESCE(excluded.longitude, locations_locations.longitude),
     metadata = excluded.metadata,
     last_seen = strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
+		strings.TrimSpace(record.CanonicalID),
 		source,
 		locationID,
 		clean(record.Kind, "unknown"),

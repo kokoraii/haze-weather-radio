@@ -40,11 +40,21 @@ func TestLoadPathReadsPlacesAndLinks(t *testing.T) {
 			method TEXT NOT NULL,
 			components_json TEXT NOT NULL
 		);
+		CREATE TABLE station_links (
+			area_source TEXT NOT NULL,
+			area_code TEXT NOT NULL,
+			station_id TEXT NOT NULL,
+			station_name TEXT NOT NULL,
+			distance_km REAL NOT NULL,
+			PRIMARY KEY (area_source, area_code)
+		);
 		INSERT INTO places VALUES
 			('nws_marine_same', '073531', 'Chesapeake Bay from Pooles Island to Sandy Point MD', '', 'AN', 'US', 'NWS marine SAME zone', 39.1806, -76.3446, '{"zone_ugc":"ANZ531"}'),
 			('nws_marine_zone', 'ANZ531', 'Chesapeake Bay from Pooles Island to Sandy Point MD', '', 'AN', 'US', 'NWS marine forecast zone', 39.1806, -76.3446, '{"same":"073531"}');
 		INSERT INTO links VALUES
 			('nws_marine_same_to_zone', 'nws_marine_same', '073531', 'nws_marine_zone', 'ANZ531', 1.0, 'exact', 0.0, 'fixture', '{}');
+		INSERT INTO station_links VALUES
+			('nws_marine_zone', 'ANZ531', 'KNAK', 'Annapolis Naval Academy', 18.5);
 	`)
 	if err != nil {
 		t.Fatal(err)
@@ -66,6 +76,9 @@ func TestLoadPathReadsPlacesAndLinks(t *testing.T) {
 	}
 	if len(snap.Links) != 1 || snap.Links[0].FromCode != "073531" || snap.Links[0].ToCode != "ANZ531" {
 		t.Fatalf("links = %#v", snap.Links)
+	}
+	if len(snap.StationLinks) != 1 || snap.StationLinks[0].StationID != "KNAK" {
+		t.Fatalf("station links = %#v", snap.StationLinks)
 	}
 }
 
@@ -102,5 +115,8 @@ func TestBundledHelloWeatherDirectoryIsComplete(t *testing.T) {
 	aliases, ok := shared.Attrs["aliases"].([]any)
 	if !ok || len(aliases) == 0 || aliases[0] != "St. John’s" {
 		t.Fatalf("shared code aliases = %#v", shared.Attrs["aliases"])
+	}
+	if got := shared.Aliases(); len(got) == 0 || got[0] != "St. John’s" {
+		t.Fatalf("shared code aliases helper = %#v", got)
 	}
 }

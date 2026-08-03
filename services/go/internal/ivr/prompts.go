@@ -16,6 +16,7 @@ var requiredMenus = []string{
 	"language_select",
 	"location_code",
 	"location_number",
+	"location_search",
 	"location_menu",
 	"weather_product",
 	"broadcast_menu",
@@ -28,6 +29,7 @@ var requiredMenuLines = map[string][]string{
 	"entry":             {"main", "main_single_language"},
 	"location_code":     {"main"},
 	"location_number":   {"main", "search_unavailable"},
+	"location_search":   {"main", "voice_unavailable", "no_match", "more_detail", "fallback_numeric"},
 	"location_menu":     {"main"},
 	"weather_product":   {"unavailable"},
 	"broadcast_menu":    {"main"},
@@ -60,8 +62,9 @@ type promptMenu struct {
 }
 
 type promptLine struct {
-	Key  string `xml:"key,attr"`
-	Text string `xml:",chardata"`
+	Key      string `xml:"key,attr"`
+	Language string `xml:"language,attr"`
+	Text     string `xml:",chardata"`
 }
 
 type menuOption struct {
@@ -91,9 +94,10 @@ type TTSProfile struct {
 }
 
 type PromptConfig struct {
-	Defaults TTSProfile
-	Lines    map[string]string
-	Menus    map[string]promptMenu
+	Defaults       TTSProfile
+	Lines          map[string]string
+	LocalizedLines map[string][]promptLine
+	Menus          map[string]promptMenu
 }
 
 type staticPromptLine struct {
@@ -126,13 +130,20 @@ func normalizePromptConfig(parsed promptConfigXML) (PromptConfig, error) {
 		CacheTTL: 24 * time.Hour,
 	})
 	cfg := PromptConfig{
-		Defaults: defaults,
-		Lines:    map[string]string{},
-		Menus:    map[string]promptMenu{},
+		Defaults:       defaults,
+		Lines:          map[string]string{},
+		LocalizedLines: map[string][]promptLine{},
+		Menus:          map[string]promptMenu{},
 	}
 	for _, line := range parsed.Defaults.Lines {
 		if key := strings.ToLower(strings.TrimSpace(line.Key)); key != "" {
-			cfg.Lines[key] = cleanPromptText(line.Text)
+			line.Key = key
+			line.Language = normalizePromptLanguage(line.Language)
+			line.Text = cleanPromptText(line.Text)
+			cfg.LocalizedLines[key] = append(cfg.LocalizedLines[key], line)
+			if line.Language == "" {
+				cfg.Lines[key] = line.Text
+			}
 		}
 	}
 	for _, menu := range parsed.Menus {
@@ -145,6 +156,7 @@ func normalizePromptConfig(parsed promptConfigXML) (PromptConfig, error) {
 		menu.Retries = parseInt(menu.RetriesRaw, 2)
 		for index := range menu.Lines {
 			menu.Lines[index].Key = strings.ToLower(strings.TrimSpace(menu.Lines[index].Key))
+			menu.Lines[index].Language = normalizePromptLanguage(menu.Lines[index].Language)
 			menu.Lines[index].Text = cleanPromptText(menu.Lines[index].Text)
 		}
 		for index := range menu.Options {
@@ -212,6 +224,13 @@ func defaultPromptConfig() PromptConfig {
 				{Key: "main", Text: "Enter your location number. Press star to search for a location."},
 				{Key: "search_unavailable", Text: "Location search is not available yet."},
 			}},
+			{ID: "location_search", Lines: []promptLine{
+				{Key: "main", Text: "Say a location name, or spell it with the keypad. Press pound when finished."},
+				{Key: "voice_unavailable", Text: "Voice search is unavailable. Please use the keypad."},
+				{Key: "no_match", Text: "No matching location was found. Try again."},
+				{Key: "more_detail", Text: "Several locations match. Enter more of the name, or include a province or state."},
+				{Key: "fallback_numeric", Text: "Returning to numeric location entry."},
+			}},
 			{ID: "location_menu", Lines: []promptLine{
 				{Key: "main", Text: "You have reached {location}. 1 for regional observations, 2 for your 7 day outlook, 3 for air quality indices, 4 for the climate summary, 5 for the thunderstorm outlook, 6 for specialty products, or 0 to listen to a corresponding, 10 minute {radio_service_name} broadcast."},
 				{Key: "main_no_broadcast", Text: "You have reached {location}. 1 for regional observations, 2 for your 7 day outlook, 3 for air quality indices, 4 for the climate summary, 5 for the thunderstorm outlook, or 6 for specialty products."},
@@ -273,27 +292,71 @@ func (cfg PromptConfig) Menu(id string) (promptMenu, bool) {
 }
 
 func (cfg PromptConfig) MenuLine(menuID string, key string, values map[string]string) string {
-	if text, ok := cfg.Line(menuID, key); ok {
+	language := firstNonBlank(values["language"], values["lang"])
+	if language == "" {
+		language = cfg.TTSForMenu(menuID).Language
+	}
+	if text, ok := cfg.LineForLanguage(menuID, key, language); ok {
 		return renderPromptText(text, values)
 	}
-	if text := cfg.Lines[strings.ToLower(strings.TrimSpace(key))]; text != "" {
+	if text, ok := selectPromptLine(cfg.LocalizedLines[strings.ToLower(strings.TrimSpace(key))], language); ok {
 		return renderPromptText(text, values)
 	}
 	return ""
 }
 
 func (cfg PromptConfig) Line(menuID string, key string) (string, bool) {
+	return cfg.LineForLanguage(menuID, key, "")
+}
+
+func (cfg PromptConfig) LineForLanguage(menuID string, key string, language string) (string, bool) {
 	menu, ok := cfg.Menu(menuID)
 	if !ok {
 		return "", false
 	}
 	key = strings.ToLower(strings.TrimSpace(key))
+	lines := make([]promptLine, 0, len(menu.Lines))
 	for _, line := range menu.Lines {
-		if line.Key == key && line.Text != "" {
+		if line.Key == key {
+			lines = append(lines, line)
+		}
+	}
+	return selectPromptLine(lines, language)
+}
+
+func selectPromptLine(lines []promptLine, language string) (string, bool) {
+	want := normalizePromptLanguage(language)
+	if want != "" {
+		for _, line := range lines {
+			if line.Language == want && line.Text != "" {
+				return line.Text, true
+			}
+		}
+		primary := primaryPromptLanguage(want)
+		for _, line := range lines {
+			if primary != "" && primaryPromptLanguage(line.Language) == primary && line.Text != "" {
+				return line.Text, true
+			}
+		}
+	}
+	for _, line := range lines {
+		if line.Language == "" && line.Text != "" {
 			return line.Text, true
 		}
 	}
 	return "", false
+}
+
+func normalizePromptLanguage(language string) string {
+	return strings.ToLower(strings.ReplaceAll(strings.TrimSpace(language), "_", "-"))
+}
+
+func primaryPromptLanguage(language string) string {
+	language = normalizePromptLanguage(language)
+	if index := strings.IndexByte(language, '-'); index > 0 {
+		return language[:index]
+	}
+	return language
 }
 
 func (cfg PromptConfig) Option(menuID string, digit string) (menuOption, bool) {

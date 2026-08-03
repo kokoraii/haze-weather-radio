@@ -21,16 +21,17 @@ import (
 )
 
 type archiveCAPRecord struct {
-	ID                 string         `json:"id"`
-	FeedID             string         `json:"feed_id,omitempty"`
-	Status             string         `json:"status"`
-	Reason             string         `json:"reason,omitempty"`
-	UpdatedAt          time.Time      `json:"updated_at"`
-	Alert              capmodel.Alert `json:"alert"`
-	RawXML             string         `json:"raw_xml,omitempty"`
-	AlertText          string         `json:"alert_text,omitempty"`
-	BannerText         string         `json:"banner_text,omitempty"`
-	BroadcastImmediate bool           `json:"broadcast_immediate,omitempty"`
+	ID                 string                         `json:"id"`
+	FeedID             string                         `json:"feed_id,omitempty"`
+	Status             string                         `json:"status"`
+	Reason             string                         `json:"reason,omitempty"`
+	UpdatedAt          time.Time                      `json:"updated_at"`
+	Alert              capmodel.Alert                 `json:"alert"`
+	RawXML             string                         `json:"raw_xml,omitempty"`
+	AlertText          string                         `json:"alert_text,omitempty"`
+	BannerText         string                         `json:"banner_text,omitempty"`
+	BroadcastImmediate bool                           `json:"broadcast_immediate,omitempty"`
+	CanonicalLocations []alertmodel.LocationReference `json:"canonical_locations,omitempty"`
 }
 
 func alertsArchivePayload(configPath string) (map[string]any, error) {
@@ -111,16 +112,32 @@ func listArchiveStoreRecords(ctx context.Context, store datastore.Store, bucket 
 			updated = row.StoredAt
 		}
 		records = append(records, archiveCAPRecord{
-			ID:        fallbackString(row.AlertID, alert.Identifier),
-			FeedID:    row.FeedID,
-			Status:    fallbackString(row.Status, bucket),
-			Reason:    row.Reason,
-			UpdatedAt: updated,
-			Alert:     alert,
-			RawXML:    row.RawXML,
+			ID:                 fallbackString(row.AlertID, alert.Identifier),
+			FeedID:             row.FeedID,
+			Status:             fallbackString(row.Status, bucket),
+			Reason:             row.Reason,
+			UpdatedAt:          updated,
+			Alert:              alert,
+			RawXML:             row.RawXML,
+			CanonicalLocations: archiveCanonicalLocations(row.Metadata),
 		})
 	}
 	return records
+}
+
+func archiveCanonicalLocations(metadata map[string]any) []alertmodel.LocationReference {
+	if metadata == nil || metadata["canonical_locations"] == nil {
+		return nil
+	}
+	raw, err := json.Marshal(metadata["canonical_locations"])
+	if err != nil {
+		return nil
+	}
+	var locations []alertmodel.LocationReference
+	if err := json.Unmarshal(raw, &locations); err != nil {
+		return nil
+	}
+	return locations
 }
 
 func uniqueArchiveRecords(records []archiveCAPRecord) []archiveCAPRecord {

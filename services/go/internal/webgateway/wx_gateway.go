@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -20,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/meowraii/haze-weather-radio/services/go/internal/locationclient"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/tts"
 )
 
@@ -31,11 +33,13 @@ var wxOnDemandExcludedPackages = map[string]bool{
 }
 
 type wxGeneratePayload struct {
+	CanonicalID  string
 	FeedID       string
 	Code         string
 	Source       string
 	LocationName string
 	Province     string
+	Country      string
 	ForecastID   string
 	StationID    string
 	Latitude     string
@@ -197,6 +201,9 @@ func generateWxOnDemand(configPath string, raw map[string]any) (map[string]any, 
 		return nil, fmt.Errorf("event bridge connect failed: %w", err)
 	}
 	defer bridge.Close()
+	if err := applyWxCanonicalLocation(ctx, configPath, bridgeAddr, &request); err != nil {
+		return nil, err
+	}
 
 	requestID := safeID(fmt.Sprintf("wx-web-%d", time.Now().UnixNano()))
 	product, err := bridge.WxOnDemand(ctx, requestID, request)
@@ -491,11 +498,13 @@ func (c *wxBridgeClient) WxOnDemand(ctx context.Context, requestID string, reque
 		"subject": requestID,
 		"data": map[string]any{
 			"request_id":    requestID,
+			"canonical_id":  request.CanonicalID,
 			"feed_id":       request.FeedID,
 			"code":          request.Code,
 			"source":        request.Source,
 			"location_name": request.LocationName,
 			"province":      request.Province,
+			"country":       request.Country,
 			"forecast_id":   request.ForecastID,
 			"station_id":    request.StationID,
 			"latitude":      request.Latitude,
@@ -516,6 +525,98 @@ func (c *wxBridgeClient) WxOnDemand(ctx context.Context, requestID string, reque
 	case result := <-ch:
 		return result.Product, result.Err
 	}
+}
+
+func applyWxCanonicalLocation(ctx context.Context, configPath string, bridgeAddr string, request *wxGeneratePayload) error {
+	mode := locationclient.RolloutMode()
+	if root, err := loadYAMLMap(configPath); err == nil {
+		mode = locationclient.ParseMode(textAt(root, []string{"services", "rust", "location", "mode"}, "legacy", 32))
+	}
+	if mode == locationclient.ModeLegacy || request == nil || strings.TrimSpace(request.Code) == "" {
+		return nil
+	}
+	started := time.Now()
+	client := locationclient.New(bridgeAddr, "haze-web-location")
+	client.Timeout = 4 * time.Second
+	response, err := client.Query(ctx, locationclient.Request{
+		Operation: "resolve",
+		Input:     &locationclient.Input{Kind: "auto", Text: request.Code},
+		Filters: locationclient.Filters{
+			Region: request.Province,
+		},
+		Options: locationclient.Options{
+			Limit:                  4,
+			MinimumConfidence:      "medium",
+			StationModeRequirement: "any",
+		},
+	})
+	if mode == locationclient.ModeShadow {
+		canonicalID := ""
+		ambiguous := false
+		if err == nil {
+			ambiguous = response.Ambiguous
+			if len(response.Results) > 0 {
+				canonicalID = response.Results[0].Entity.ID
+			}
+		}
+		log.Printf(
+			"location shadow web resolve input=%q legacy=%s:%s canonical_id=%s ambiguous=%t latency_ms=%d error=%v",
+			request.Code,
+			request.Source,
+			firstNonBlank(request.ForecastID, request.StationID, request.Code),
+			canonicalID,
+			ambiguous,
+			time.Since(started).Milliseconds(),
+			err,
+		)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("location resolution failed: %w", err)
+	}
+	if response.Ambiguous {
+		return fmt.Errorf("location %q is ambiguous and requires a qualified identifier", request.Code)
+	}
+	if len(response.Results) == 0 {
+		return fmt.Errorf("location %q was not found", request.Code)
+	}
+	entity := response.Results[0].Entity
+	request.CanonicalID = entity.ID
+	request.LocationName = firstNonBlank(entity.DisplayName(), request.LocationName)
+	request.Province = firstNonBlank(entity.Region, request.Province)
+	request.Country = entity.Country
+	request.Source = firstNonBlank(wxCanonicalProvider(entity), request.Source)
+	request.ForecastID = firstNonBlank(
+		entity.Identifier("eccc_citypage", "nws_zone", "nws_marine_zone"),
+		request.ForecastID,
+	)
+	request.StationID = firstNonBlank(
+		entity.Identifier("eccc_station", "icao", "msc", "wmo", "ndbc"),
+		request.StationID,
+	)
+	if entity.Geometry != nil {
+		if entity.Geometry.Latitude != nil {
+			request.Latitude = fmt.Sprintf("%.7f", *entity.Geometry.Latitude)
+		}
+		if entity.Geometry.Longitude != nil {
+			request.Longitude = fmt.Sprintf("%.7f", *entity.Geometry.Longitude)
+		}
+	}
+	return nil
+}
+
+func wxCanonicalProvider(entity locationclient.Entity) string {
+	for _, identifier := range entity.Identifiers {
+		switch strings.ToLower(identifier.Scheme) {
+		case "nws_zone", "nws_marine_zone", "nws_ugc_county", "fips", "same":
+			return "nws"
+		case "eccc_citypage", "clc", "eccc_station", "msc", "wmo", "icao":
+			return "eccc"
+		case "ndbc":
+			return "ndbc"
+		}
+	}
+	return ""
 }
 
 func (c *wxBridgeClient) Synthesize(ctx context.Context, jobID string, product wxRenderedProduct, outputPath string, outputFormat string) (wxSynthResult, error) {

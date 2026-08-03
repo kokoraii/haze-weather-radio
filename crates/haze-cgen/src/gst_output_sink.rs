@@ -20,8 +20,8 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::architecture::{
-    AudioCodec, AudioCodecPolicy, EncoderOutputSpec, OutputDestination, RateControl,
-    ResolvedProgramMapSpec, VideoCodec,
+    AudioCodec, AudioCodecPolicy, EncoderOutputSpec, FieldOrder, OutputDestination, RateControl,
+    ResolvedProgramMapSpec, ScanMode, VideoCodec,
 };
 use crate::output_workers::{
     AudioPacket, AudioPayload, OutputCompatibilityValidator, OutputFailure, OutputFailureCode,
@@ -338,6 +338,7 @@ struct ActivatedOutputSpec {
     video_codec: VideoCodec,
     rate_control: RateControl,
     gop_frames: NonZeroU32,
+    scan: ScanMode,
     audio_codec: AudioCodec,
     audio_bitrate_kbps: NonZeroU32,
     audio_sample_rate: NonZeroU32,
@@ -444,6 +445,7 @@ impl ActivatedOutputSpec {
             video_codec: output.video.codec,
             rate_control: output.video.rate_control,
             gop_frames: output.video.gop_frames,
+            scan: output.video.scan,
             audio_codec,
             audio_bitrate_kbps: output.audio.bitrate_kbps,
             audio_sample_rate: output.audio.sample_rate,
@@ -868,6 +870,12 @@ impl OutputPipelinePlan {
     ) -> Result<Self, PlanError> {
         let mut required = RequiredElements::default();
         required.add_common();
+        if matches!(output.scan, ScanMode::Interlaced { .. }) {
+            required.add(
+                "interlace",
+                OutputFailure::terminal(OutputFailureCode::Encoder),
+            );
+        }
         let video = VideoEncodingChain::new(output);
         let audio = AudioEncodingChain::new(output);
         required.add(
@@ -1100,25 +1108,94 @@ struct VideoEncodingChain {
     parser_element: &'static str,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum H264Encoder {
+    VaApi,
+    X264,
+}
+
+impl H264Encoder {
+    fn select(scan: ScanMode) -> Self {
+        // SAFETY: gst_is_initialized only reads GStreamer's process-wide initialization state.
+        let initialized = unsafe { gst::ffi::gst_is_initialized() } == gst::glib::ffi::GTRUE;
+        let va_api_available = initialized && gst::ElementFactory::find("vah264enc").is_some();
+        Self::select_with_availability(scan, va_api_available)
+    }
+
+    fn select_with_availability(scan: ScanMode, va_api_available: bool) -> Self {
+        if va_api_available && matches!(scan, ScanMode::Progressive) {
+            Self::VaApi
+        } else {
+            Self::X264
+        }
+    }
+
+    const fn element(self) -> &'static str {
+        match self {
+            Self::VaApi => "vah264enc",
+            Self::X264 => "x264enc",
+        }
+    }
+
+    const fn raw_format(self) -> &'static str {
+        match self {
+            Self::VaApi => "NV12",
+            Self::X264 => "I420",
+        }
+    }
+
+    fn description(self, target_kbps: u32, max_kbps: u32, constant: bool, gop: u32) -> String {
+        match self {
+            Self::VaApi => {
+                let rate_control = if constant { "cbr" } else { "vbr" };
+                let bitrate_kbps = if constant { target_kbps } else { max_kbps };
+                let target_percentage = u64::from(target_kbps)
+                    .saturating_mul(100)
+                    .checked_div(u64::from(max_kbps).max(1))
+                    .unwrap_or(100)
+                    .clamp(50, 100);
+                format!(
+                    "vah264enc name=video_encoder rate-control={rate_control} bitrate={bitrate_kbps} cpb-size={max_kbps} target-percentage={target_percentage} key-int-max={gop} b-frames=0 target-usage=7 aud=true"
+                )
+            }
+            Self::X264 => format!(
+                "x264enc name=video_encoder tune=zerolatency speed-preset=ultrafast bframes=0 bitrate={target_kbps} key-int-max={gop} option-string={}",
+                gst_quote(&format!(
+                    "vbv-maxrate={max_kbps}:vbv-bufsize={max_kbps}:nal-hrd={}",
+                    if constant { "cbr" } else { "vbr" }
+                ))
+            ),
+        }
+    }
+}
+
 impl VideoEncodingChain {
     fn new(output: &ActivatedOutputSpec) -> Self {
         let (target_kbps, max_kbps, constant) = rate_control_values(output.rate_control);
         let gop = output.gop_frames.get();
-        let (encoder_element, parser_element, encoder) = match output.video_codec {
-            VideoCodec::H264 => (
-                "x264enc",
-                "h264parse",
-                format!(
-                    "x264enc name=video_encoder tune=zerolatency speed-preset=veryfast bframes=0 bitrate={target_kbps} key-int-max={gop} option-string={}",
-                    gst_quote(&format!(
-                        "vbv-maxrate={max_kbps}:vbv-bufsize={max_kbps}:nal-hrd={}",
-                        if constant { "cbr" } else { "vbr" }
-                    ))
-                ),
-            ),
+        let interlace = match output.scan {
+            ScanMode::Progressive => "",
+            ScanMode::Interlaced {
+                field_order: FieldOrder::TopFirst,
+            } => " ! interlace field-pattern=1:1 top-field-first=true",
+            ScanMode::Interlaced {
+                field_order: FieldOrder::BottomFirst,
+            } => " ! interlace field-pattern=1:1 top-field-first=false",
+        };
+        let (encoder_element, parser_element, raw_format, encoder) = match output.video_codec {
+            VideoCodec::H264 => {
+                let encoder = H264Encoder::select(output.scan);
+                (
+                    encoder.element(),
+                    "h264parse",
+                    encoder.raw_format(),
+                    encoder.description(target_kbps, max_kbps, constant, gop),
+                )
+            }
             VideoCodec::H265 => (
                 "x265enc",
                 "h265parse",
+                "I420",
                 format!(
                     "x265enc name=video_encoder tune=zerolatency speed-preset=veryfast bitrate={target_kbps} key-int-max={gop} option-string={}",
                     gst_quote(&format!(
@@ -1128,11 +1205,23 @@ impl VideoEncodingChain {
             ),
             VideoCodec::Mpeg2 => {
                 let minimum = if constant { target_kbps } else { 0 };
+                let interlace_flags = match output.scan {
+                    ScanMode::Progressive => " field-order=progressive".to_string(),
+                    ScanMode::Interlaced { field_order } => format!(
+                        " flags=+ildct+ilme alternate-scan=true field-order={} seq-disp-ext=always",
+                        if field_order == FieldOrder::TopFirst {
+                            "tt"
+                        } else {
+                            "bb"
+                        }
+                    ),
+                };
                 (
                     "avenc_mpeg2video",
                     "mpegvideoparse",
+                    "I420",
                     format!(
-                        "avenc_mpeg2video name=video_encoder bitrate={} minrate={} maxrate={} gop-size={gop}",
+                        "avenc_mpeg2video name=video_encoder bitrate={} minrate={} maxrate={} gop-size={gop}{interlace_flags}",
                         u64::from(target_kbps) * 1_000,
                         u64::from(minimum) * 1_000,
                         u64::from(max_kbps) * 1_000
@@ -1143,9 +1232,9 @@ impl VideoEncodingChain {
         Self {
             codec: output.video_codec,
             description: format!(
-                "{} ! {} ! videoconvert ! video/x-raw,format=I420 ! {encoder} ! {parser_element}",
+                "{} ! {} ! videoconvert ! video/x-raw,format={raw_format}{interlace} ! {encoder} ! {parser_element}",
                 video_appsrc_fragment(),
-                queue_fragment("video_input_queue", 2)
+                queue_fragment("video_input_queue", 16)
             ),
             encoder_element,
             parser_element,
@@ -1191,6 +1280,14 @@ struct AudioEncodingChain {
 impl AudioEncodingChain {
     fn new(output: &ActivatedOutputSpec) -> Self {
         let bitrate = u64::from(output.audio_bitrate_kbps.get()) * 1_000;
+        let channel_caps = match &output.destination {
+            ActivatedDestination::Rtmp { .. }
+            | ActivatedDestination::File {
+                container: FileMux::Flv,
+                ..
+            } => ",channels=2",
+            _ => "",
+        };
         let (encoder_element, parser_element, encoder) = match output.audio_codec {
             AudioCodec::Aac => (
                 "avenc_aac",
@@ -1211,7 +1308,7 @@ impl AudioEncodingChain {
         Self {
             codec: output.audio_codec,
             description: format!(
-                "{} ! {} ! audioconvert ! audioresample ! audio/x-raw,rate={},layout=interleaved ! {encoder} ! {parser_element}",
+                "{} ! {} ! audioconvert ! audioresample ! audio/x-raw,rate={}{channel_caps},layout=interleaved ! {encoder} ! {parser_element}",
                 audio_appsrc_fragment(),
                 queue_fragment("audio_input_queue", 32),
                 output.audio_sample_rate
@@ -1364,7 +1461,7 @@ fn optional_caps_fragment(caps: &str) -> String {
 }
 
 fn video_appsrc_fragment() -> &'static str {
-    "appsrc name=video_src is-live=true block=false format=time do-timestamp=false stream-type=stream max-buffers=2 leaky-type=downstream"
+    "appsrc name=video_src is-live=true block=false format=time do-timestamp=false stream-type=stream max-buffers=16 leaky-type=downstream"
 }
 
 fn audio_appsrc_fragment() -> &'static str {
@@ -1488,13 +1585,29 @@ impl GstOutputSink {
             .map_err(|_| OutputFailure::terminal(OutputFailureCode::Sink))?;
         let height = i32::try_from(frame.height.get())
             .map_err(|_| OutputFailure::terminal(OutputFailureCode::Sink))?;
-        let next_caps = (frame.width.get(), frame.height.get());
+        let (frame_rate_numerator, frame_rate_denominator) =
+            frame_rate_for_duration(frame.duration_ns);
+        let next_caps = (
+            frame.width.get(),
+            frame.height.get(),
+            frame_rate_numerator,
+            frame_rate_denominator,
+        );
         let caps_changed = runtime.video_caps != Some(next_caps);
         if caps_changed {
             let caps = gst::Caps::builder("video/x-raw")
                 .field("format", "BGRx")
                 .field("width", width)
                 .field("height", height)
+                .field(
+                    "framerate",
+                    gst::Fraction::new(
+                        i32::try_from(frame_rate_numerator)
+                            .map_err(|_| OutputFailure::terminal(OutputFailureCode::Sink))?,
+                        i32::try_from(frame_rate_denominator)
+                            .map_err(|_| OutputFailure::terminal(OutputFailureCode::Sink))?,
+                    ),
+                )
                 .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
                 .build();
             runtime.video_source.set_caps(Some(&caps));
@@ -1546,12 +1659,14 @@ impl GstOutputSink {
         let next_caps = (packet.sample_rate.get(), packet.channels.get());
         let caps_changed = runtime.audio_caps != Some(next_caps);
         if caps_changed {
-            let caps = gst::Caps::builder("audio/x-raw")
+            let mut caps = gst::Caps::builder("audio/x-raw")
                 .field("format", "F32LE")
                 .field("rate", rate)
-                .field("channels", channels_i32)
-                .field("layout", "interleaved")
-                .build();
+                .field("channels", channels_i32);
+            if let Some(channel_mask) = canonical_channel_mask(packet.channels.get()) {
+                caps = caps.field("channel-mask", gst::Bitmask::new(channel_mask));
+            }
+            let caps = caps.field("layout", "interleaved").build();
             runtime.audio_source.set_caps(Some(&caps));
             runtime.audio_caps = Some(next_caps);
         }
@@ -1586,6 +1701,63 @@ impl GstOutputSink {
         runtime.poll_bus(false)?;
         Ok(())
     }
+}
+
+fn canonical_channel_mask(channels: u16) -> Option<u64> {
+    match channels {
+        1 => Some(0x04),
+        2 => Some(0x03),
+        6 => Some(0x3f),
+        _ => None,
+    }
+}
+
+fn frame_rate_for_duration(duration_ns: u64) -> (u32, u32) {
+    const COMMON_RATES: [(u32, u32); 10] = [
+        (24_000, 1_001),
+        (24, 1),
+        (25, 1),
+        (30_000, 1_001),
+        (30, 1),
+        (50, 1),
+        (60_000, 1_001),
+        (60, 1),
+        (100, 1),
+        (120_000, 1_001),
+    ];
+    if duration_ns == 0 {
+        return (30, 1);
+    }
+    let duration = u128::from(duration_ns);
+    let nanoseconds = 1_000_000_000_u128;
+    let best = COMMON_RATES
+        .into_iter()
+        .min_by_key(|(numerator, denominator)| {
+            duration
+                .saturating_mul(u128::from(*numerator))
+                .abs_diff(nanoseconds.saturating_mul(u128::from(*denominator)))
+        });
+    if let Some((numerator, denominator)) = best {
+        let error = duration
+            .saturating_mul(u128::from(numerator))
+            .abs_diff(nanoseconds.saturating_mul(u128::from(denominator)));
+        if error <= u128::from(numerator).saturating_mul(100_000) {
+            return (numerator, denominator);
+        }
+    }
+
+    let duration = u32::try_from(duration_ns).unwrap_or(u32::MAX).max(1);
+    let divisor = greatest_common_divisor(1_000_000_000, duration);
+    (1_000_000_000 / divisor, duration / divisor)
+}
+
+fn greatest_common_divisor(mut left: u32, mut right: u32) -> u32 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left.max(1)
 }
 
 impl OutputSink for GstOutputSink {
@@ -1636,7 +1808,7 @@ struct GstOutputRuntime {
     video_source: gst_app::AppSrc,
     audio_source: gst_app::AppSrc,
     destination_class: DestinationClass,
-    video_caps: Option<(u32, u32)>,
+    video_caps: Option<(u32, u32, u32, u32)>,
     audio_caps: Option<(u32, u16)>,
     video_timeline: StreamTimeline,
     audio_timeline: StreamTimeline,
@@ -1789,6 +1961,7 @@ mod tests {
                     max_kbps: NonZeroU32::new(6_000).expect("non-zero bitrate"),
                 },
                 gop_frames: NonZeroU32::new(60).expect("non-zero GOP"),
+                scan: ScanMode::Progressive,
             },
             audio: AudioEncoderSpec {
                 codec: audio_codec,
@@ -1950,6 +2123,79 @@ mod tests {
     }
 
     #[test]
+    fn interlaced_output_pairs_frames_before_encoding() {
+        let mut spec = output_with_codecs(
+            OutputDestination::File {
+                location: "output.mkv".to_string(),
+                container: "matroska".to_string(),
+            },
+            VideoCodec::Mpeg2,
+            AudioCodecPolicy::Encode(AudioCodec::Aac),
+        );
+        spec.video.scan = ScanMode::Interlaced {
+            field_order: FieldOrder::BottomFirst,
+        };
+
+        let plan = plan(&spec, None);
+
+        assert!(plan.description.contains(
+            "video/x-raw,format=I420 ! interlace field-pattern=1:1 top-field-first=false"
+        ));
+        assert!(plan
+            .description
+            .contains("flags=+ildct+ilme alternate-scan=true field-order=bb seq-disp-ext=always"));
+        assert!(plan
+            .required_elements
+            .iter()
+            .any(|element| element.name == "interlace"));
+    }
+
+    #[test]
+    fn h264_encoder_prefers_va_api_only_for_progressive_output() {
+        assert_eq!(
+            H264Encoder::select_with_availability(ScanMode::Progressive, true),
+            H264Encoder::VaApi
+        );
+        assert_eq!(
+            H264Encoder::select_with_availability(
+                ScanMode::Interlaced {
+                    field_order: FieldOrder::TopFirst,
+                },
+                true,
+            ),
+            H264Encoder::X264
+        );
+        assert_eq!(
+            H264Encoder::select_with_availability(ScanMode::Progressive, false),
+            H264Encoder::X264
+        );
+
+        let va_api = H264Encoder::VaApi.description(4_000, 6_000, false, 60);
+        assert!(va_api.contains("vah264enc name=video_encoder"));
+        assert!(va_api.contains("rate-control=vbr"));
+        assert!(va_api.contains("bitrate=6000"));
+        assert!(va_api.contains("target-percentage=66"));
+        assert_eq!(H264Encoder::VaApi.raw_format(), "NV12");
+    }
+
+    #[test]
+    fn video_ingress_drops_stale_frames_from_bounded_queues() {
+        let spec = output(OutputDestination::File {
+            location: "output.flv".to_string(),
+            container: "flv".to_string(),
+        });
+
+        let plan = plan(&spec, None);
+
+        assert!(plan.description.contains(
+            "video_src is-live=true block=false format=time do-timestamp=false stream-type=stream max-buffers=16 leaky-type=downstream"
+        ));
+        assert!(plan.description.contains(
+            "video_input_queue max-size-time=500000000 max-size-buffers=16 max-size-bytes=0 leaky=downstream"
+        ));
+    }
+
+    #[test]
     fn rtp_plan_uses_explicit_video_and_all_audio_endpoints() {
         let spec = output(OutputDestination::Rtp {
             video_location: "udp://239.20.0.1:5000".to_string(),
@@ -2001,6 +2247,9 @@ mod tests {
         let rtmp_plan = plan(&rtmp, None);
         assert!(rtmp_plan.description.contains("flvmux name=mux"));
         assert!(rtmp_plan.description.contains("rtmp2sink name=output_sink"));
+        assert!(rtmp_plan
+            .description
+            .contains("audio/x-raw,rate=48000,channels=2,layout=interleaved"));
 
         for (container, muxer) in [
             ("mkv", "matroskamux"),
@@ -2031,6 +2280,23 @@ mod tests {
             container: "mpegts".to_string(),
         });
         assert!(plan(&mpeg_ts, Some(&map)).description.contains("mpegtsmux"));
+    }
+
+    #[test]
+    fn output_pcm_caps_keep_canonical_channel_positions() {
+        assert_eq!(canonical_channel_mask(1), Some(0x04));
+        assert_eq!(canonical_channel_mask(2), Some(0x03));
+        assert_eq!(canonical_channel_mask(6), Some(0x3f));
+        assert_eq!(canonical_channel_mask(8), None);
+    }
+
+    #[test]
+    fn video_duration_maps_to_stable_appsrc_frame_rate_caps() {
+        assert_eq!(frame_rate_for_duration(16_683_333), (60_000, 1_001));
+        assert_eq!(frame_rate_for_duration(33_366_667), (30_000, 1_001));
+        assert_eq!(frame_rate_for_duration(20_000_000), (50, 1));
+        assert_eq!(frame_rate_for_duration(40_000_000), (25, 1));
+        assert_eq!(frame_rate_for_duration(0), (30, 1));
     }
 
     #[test]

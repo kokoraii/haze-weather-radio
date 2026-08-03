@@ -157,6 +157,7 @@ func (s *wsSession) broadcastAlertData(payload map[string]any, targets []string,
 	if scheduleAt := parseOptionalTime(stringPayload(payload, "schedule_at", "")); !scheduleAt.IsZero() {
 		data["scheduled_for"] = scheduleAt.UTC().Format(time.RFC3339Nano)
 	}
+	data["canonical_locations"] = s.canonicalSAMELocationReferences(sameLocations)
 	packet, _ := alertmodel.FromMap(data)
 	packet.Meta = map[string]any{
 		"originated_by_user_id":    data["originated_by_user_id"],

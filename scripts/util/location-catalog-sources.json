@@ -1,0 +1,616 @@
+{
+  "schema_version": 1,
+  "packs": [
+    {
+      "id": "global-core",
+      "sources": [
+        {
+          "id": "natural-earth-populated-places",
+          "title": "Natural Earth populated places",
+          "adapter": "shapefile",
+          "identity_authority": "natural-earth",
+          "location": "https://naturalearth.s3.amazonaws.com/10m_cultural/ne_10m_populated_places.zip",
+          "kind": "place",
+          "id_fields": ["NE_ID", "WIKIDATAID", "NAME"],
+          "name_fields": ["NAME", "NAMEPAR", "NAMEASCII"],
+          "country_fields": ["ISO_A2", "ADM0_A3"],
+          "region_fields": ["ADM1NAME"],
+          "capabilities": ["locality"],
+          "identifiers": [
+            {"authority": "natural-earth", "scheme": "natural_earth", "field": "NE_ID", "primary": true},
+            {"authority": "wikidata", "scheme": "wikidata", "field": "WIKIDATAID", "primary": false}
+          ],
+          "expected_min": 7000,
+          "source_quality": 0.86,
+          "licence": "Natural Earth public domain"
+        },
+        {
+          "id": "natural-earth-admin1",
+          "title": "Natural Earth first-level administration",
+          "adapter": "shapefile",
+          "identity_authority": "natural-earth",
+          "location": "https://naturalearth.s3.amazonaws.com/10m_cultural/ne_10m_admin_1_states_provinces.zip",
+          "kind": "administrative_area",
+          "id_fields": ["adm1_code", "iso_3166_2", "name"],
+          "name_fields": ["name", "name_en"],
+          "country_fields": ["iso_a2", "adm0_a3"],
+          "region_fields": ["iso_3166_2"],
+          "capabilities": ["administration"],
+          "identifiers": [
+            {"authority": "natural-earth", "scheme": "natural_earth", "field": "adm1_code", "primary": true},
+            {"authority": "iso", "scheme": "iso_3166_2", "field": "iso_3166_2", "primary": false}
+          ],
+          "expected_min": 4000,
+          "source_quality": 0.86,
+          "licence": "Natural Earth public domain"
+        },
+        {
+          "id": "natural-earth-countries",
+          "title": "Natural Earth countries",
+          "adapter": "shapefile",
+          "identity_authority": "natural-earth",
+          "location": "https://naturalearth.s3.amazonaws.com/10m_cultural/ne_10m_admin_0_countries.zip",
+          "kind": "administrative_area",
+          "id_fields": ["ADM0_A3", "SOV_A3", "NAME"],
+          "name_fields": ["NAME", "NAME_LONG", "NAME_EN"],
+          "country_fields": ["ISO_A2", "ADM0_A3"],
+          "capabilities": ["administration"],
+          "identifiers": [
+            {"authority": "natural-earth", "scheme": "natural_earth", "field": "ADM0_A3", "primary": true},
+            {"authority": "iso", "scheme": "iso_3166_1_alpha2", "field": "ISO_A2", "primary": false}
+          ],
+          "expected_min": 240,
+          "source_quality": 0.86,
+          "licence": "Natural Earth public domain"
+        },
+        {
+          "id": "ourairports",
+          "title": "OurAirports aviation locations",
+          "adapter": "csv",
+          "identity_authority": "ourairports",
+          "location": "https://davidmegginson.github.io/ourairports-data/airports.csv",
+          "kind": "airport",
+          "id_fields": ["ident", "id"],
+          "name_fields": ["name"],
+          "country_fields": ["iso_country"],
+          "region_fields": ["iso_region"],
+          "latitude_field": "latitude_deg",
+          "longitude_field": "longitude_deg",
+          "capabilities": ["aviation"],
+          "identifiers": [
+            {"authority": "ourairports", "scheme": "ourairports", "field": "id", "primary": true},
+            {"authority": "icao", "scheme": "icao", "field": "gps_code", "primary": false},
+            {"authority": "iata", "scheme": "iata", "field": "iata_code", "primary": false},
+            {"authority": "faa", "scheme": "faa", "field": "local_code", "primary": false}
+          ],
+          "expected_min": 70000,
+          "source_quality": 0.76,
+          "licence": "Public domain",
+          "attribution": "OurAirports"
+        },
+        {
+          "id": "nga-gns-populated-places",
+          "title": "NGA GNS foreign populated place names",
+          "adapter": "delimited",
+          "identity_authority": "nga-gns",
+          "location": "https://geonames.nga.mil/geonames/GNSData/fc_files/Populated_Places.zip",
+          "archive_contains": "Populated_Places.txt",
+          "archive_suffix": ".txt",
+          "delimiter": "\t",
+          "kind": "place",
+          "id_fields": ["ufi"],
+          "name_fields": ["full_name"],
+          "locale_field": "lang_cd",
+          "primary_name_when": {"field": "nt", "values": ["N"]},
+          "include_when_present": ["name_rank"],
+          "attribute_fields": [
+            "desig_cd",
+            "fc",
+            "cc_ft",
+            "adm1",
+            "name_rank",
+            "nt",
+            "script_cd",
+            "generic",
+            "full_nm_nd",
+            "efctv_dt",
+            "term_dt_f",
+            "term_dt_n",
+            "mod_dt_ft",
+            "mod_dt_nm"
+          ],
+          "country_fields": ["cc_ft"],
+          "region_fields": ["adm1"],
+          "latitude_field": "lat_dd",
+          "longitude_field": "long_dd",
+          "capabilities": ["locality"],
+          "identifiers": [
+            {"authority": "nga", "scheme": "gns", "field": "ufi", "primary": true},
+            {"authority": "nga", "scheme": "gns_name", "field": "uni", "primary": false}
+          ],
+          "lifecycle": "active",
+          "inactive_when_field_present": "term_dt_f",
+          "valid_from_field": "efctv_dt",
+          "valid_to_field": "term_dt_f",
+          "expected_min": 4000000,
+          "source_quality": 0.96,
+          "licence": "United States government work",
+          "attribution": "National Geospatial-Intelligence Agency Geographic Names Server"
+        },
+        {
+          "id": "usgs-gnis-domestic",
+          "title": "USGS GNIS Domestic Names",
+          "adapter": "delimited",
+          "identity_authority": "usgs-gnis",
+          "location": "https://prd-tnm.s3.amazonaws.com/StagedProducts/GeographicNames/DomesticNames/DomesticNames_National_Text.zip",
+          "archive_contains": "DomesticNames_National.txt",
+          "archive_suffix": ".txt",
+          "delimiter": "|",
+          "kind_field": "feature_class",
+          "id_fields": ["feature_id"],
+          "name_fields": ["feature_name"],
+          "country": "US",
+          "region_fields": ["state_name"],
+          "latitude_field": "prim_lat_dec",
+          "longitude_field": "prim_long_dec",
+          "identifiers": [
+            {"authority": "usgs", "scheme": "gnis", "field": "feature_id", "primary": true}
+          ],
+          "expected_min": 2000000,
+          "source_quality": 0.96,
+          "licence": "United States public domain",
+          "attribution": "U.S. Geological Survey Geographic Names Information System"
+        }
+      ]
+    },
+    {
+      "id": "ca-weather",
+      "sources": [
+        {
+          "id": "statcan-fsa-2021",
+          "title": "Statistics Canada 2021 census forward sortation areas",
+          "adapter": "shapefile",
+          "identity_authority": "statcan",
+          "location": "https://www12.statcan.gc.ca/census-recensement/2021/geo/sip-pis/boundary-limites/files-fichiers/lfsa000b21a_e.zip",
+          "source_crs": "EPSG:3347",
+          "encoding": "latin1",
+          "kind": "postal_area",
+          "id_fields": ["CFSAUID"],
+          "name_fields": ["CFSAUID"],
+          "region_fields": ["PRUID"],
+          "region_map": {"10": "NL", "11": "PE", "12": "NS", "13": "NB", "24": "QC", "35": "ON", "46": "MB", "47": "SK", "48": "AB", "59": "BC", "60": "YT", "61": "NT", "62": "NU"},
+          "country": "CA",
+          "capabilities": ["postal"],
+          "identifiers": [
+            {"authority": "statcan", "scheme": "postal", "field": "CFSAUID", "primary": true},
+            {"authority": "statcan", "scheme": "sgc", "field": "DGUID", "primary": false}
+          ],
+          "valid_from": "2021-01-01",
+          "expected_min": 1600,
+          "source_quality": 0.96,
+          "licence": "Statistics Canada Open Licence",
+          "attribution": "Statistics Canada, 2021 Census Forward Sortation Area Boundary File"
+        },
+        {
+          "id": "statcan-sgc-csd-2021",
+          "title": "Statistics Canada 2021 census subdivisions",
+          "adapter": "shapefile",
+          "identity_authority": "statcan",
+          "location": "https://www12.statcan.gc.ca/census-recensement/2021/geo/sip-pis/boundary-limites/files-fichiers/lcsd000b21a_e.zip",
+          "source_crs": "EPSG:3347",
+          "encoding": "latin1",
+          "kind": "administrative_area",
+          "id_fields": ["CSDUID"],
+          "name_fields": ["CSDNAME"],
+          "region_fields": ["PRUID"],
+          "region_map": {"10": "NL", "11": "PE", "12": "NS", "13": "NB", "24": "QC", "35": "ON", "46": "MB", "47": "SK", "48": "AB", "59": "BC", "60": "YT", "61": "NT", "62": "NU"},
+          "country": "CA",
+          "capabilities": ["administration", "locality"],
+          "identifiers": [
+            {"authority": "statcan", "scheme": "sgc", "field": "CSDUID", "primary": true},
+            {"authority": "statcan", "scheme": "sgc_dguid", "field": "DGUID", "primary": false}
+          ],
+          "valid_from": "2021-01-01",
+          "expected_min": 5000,
+          "source_quality": 0.98,
+          "licence": "Statistics Canada Open Licence",
+          "attribution": "Statistics Canada, 2021 Census Boundary Files"
+        },
+        {
+          "id": "eccc-swob-land",
+          "title": "ECCC SWOB land stations",
+          "adapter": "eccc_swob",
+          "collection": "swob-stations",
+          "location": "https://api.weather.gc.ca/collections/swob-stations/items?f=json&lang=en&limit=10000",
+          "expected_min": 800,
+          "licence": "Environment and Climate Change Canada data server licence",
+          "attribution": "Data provided by Environment and Climate Change Canada."
+        },
+        {
+          "id": "eccc-swob-marine",
+          "title": "ECCC SWOB marine stations",
+          "adapter": "eccc_swob",
+          "collection": "swob-marine-stations",
+          "location": "https://api.weather.gc.ca/collections/swob-marine-stations/items?f=json&lang=en&limit=10000",
+          "expected_min": 30,
+          "licence": "Environment and Climate Change Canada data server licence",
+          "attribution": "Data provided by Environment and Climate Change Canada."
+        },
+        {
+          "id": "eccc-swob-partner",
+          "title": "ECCC SWOB partner stations",
+          "adapter": "eccc_swob",
+          "collection": "swob-partner-stations",
+          "location": "https://api.weather.gc.ca/collections/swob-partner-stations/items?f=json&lang=en&limit=10000",
+          "expected_min": 1800,
+          "licence": "Environment and Climate Change Canada data server licence",
+          "attribution": "Provider attribution is preserved on each entity."
+        },
+        {
+          "id": "eccc-climate-stations",
+          "title": "ECCC climate stations",
+          "adapter": "geojson",
+          "identity_authority": "eccc-climate",
+          "location": "https://api.weather.gc.ca/collections/climate-stations/items?f=json&lang=en&limit=10000",
+          "kind": "climate_station",
+          "id_fields": ["CLIMATE_IDENTIFIER", "STN_ID"],
+          "name_fields": ["STATION_NAME"],
+          "country": "CA",
+          "region_fields": ["PROV_STATE_TERR_CODE"],
+          "capabilities": ["climate"],
+          "identifiers": [
+            {"authority": "eccc", "scheme": "climate", "field": "CLIMATE_IDENTIFIER", "primary": true},
+            {"authority": "wmo", "scheme": "wmo", "field": "WMO_IDENTIFIER", "primary": false},
+            {"authority": "eccc", "scheme": "eccc_station", "field": "TC_IDENTIFIER", "primary": false}
+          ],
+          "expected_min": 8000,
+          "source_quality": 0.97,
+          "licence": "Environment and Climate Change Canada data server licence",
+          "attribution": "Data provided by Environment and Climate Change Canada."
+        },
+        {
+          "id": "eccc-hydrometric-stations",
+          "title": "ECCC hydrometric stations",
+          "adapter": "geojson",
+          "identity_authority": "water-survey-canada",
+          "location": "https://api.weather.gc.ca/collections/hydrometric-stations/items?f=json&lang=en&limit=10000",
+          "kind": "hydrometric_station",
+          "id_fields": ["STATION_NUMBER", "IDENTIFIER"],
+          "name_fields": ["STATION_NAME"],
+          "country": "CA",
+          "region_fields": ["PROV_TERR_STATE_LOC"],
+          "capabilities": ["hydrometric"],
+          "identifiers": [
+            {"authority": "eccc", "scheme": "hydrometric", "field": "STATION_NUMBER", "primary": true}
+          ],
+          "lifecycle_map": {
+            "field": "STATUS_EN",
+            "values": {"active": "active", "discontinued": "inactive"}
+          },
+          "expected_min": 7500,
+          "source_quality": 0.98,
+          "licence": "Environment and Climate Change Canada data server licence",
+          "attribution": "Water Survey of Canada"
+        },
+        {
+          "id": "eccc-aqhi-stations",
+          "title": "ECCC AQHI stations",
+          "adapter": "geojson",
+          "identity_authority": "eccc-aqhi",
+          "location": "https://api.weather.gc.ca/collections/aqhi-stations/items?f=json&lang=en&limit=10000",
+          "kind": "air_quality_station",
+          "id_fields": ["location_id"],
+          "name_fields": ["location_name_en", "location_name_fr"],
+          "country": "CA",
+          "region_fields": ["eccc_administrative-zone"],
+          "capabilities": ["air_quality", "aqhi"],
+          "identifiers": [
+            {"authority": "eccc", "scheme": "aqhi", "field": "location_id", "primary": true}
+          ],
+          "expected_min": 100,
+          "source_quality": 0.96,
+          "licence": "Environment and Climate Change Canada data server licence",
+          "attribution": "Data provided by Environment and Climate Change Canada."
+        },
+        {
+          "id": "eccc-naps-stations",
+          "title": "ECCC National Air Pollution Surveillance stations",
+          "adapter": "csv",
+          "identity_authority": "eccc-naps",
+          "location": "https://data-donnees.az.ec.gc.ca/api/file?path=air%2Fmonitor%2Fnational-air-pollution-surveillance-naps-program%2FProgramInformation-InformationProgramme%2FStationsNAPS-StationsSNPA.csv",
+          "skip_rows_after_header": 1,
+          "kind": "air_quality_station",
+          "id_fields": ["NAPS_ID"],
+          "name_fields": ["Station_Name", "City"],
+          "country": "CA",
+          "region_fields": ["Province/Territory_EN"],
+          "region_normalizer": "canada",
+          "latitude_field": "Latitude",
+          "longitude_field": "Longitude",
+          "capabilities": ["air_quality", "naps"],
+          "identifiers": [
+            {"authority": "eccc", "scheme": "naps", "field": "NAPS_ID", "primary": true}
+          ],
+          "lifecycle": "unknown",
+          "lifecycle_map": {
+            "field": "Status",
+            "values": {"1": "active", "0": "inactive"}
+          },
+          "valid_from_field": "Start_Date",
+          "valid_to_field": "End_Date",
+          "expected_min": 700,
+          "source_quality": 0.99,
+          "licence": "Environment and Climate Change Canada data server licence",
+          "attribution": "Environment and Climate Change Canada National Air Pollution Surveillance Program"
+        },
+        {
+          "id": "eccc-citypage-locations",
+          "title": "ECCC city page forecast locations",
+          "adapter": "eccc_citypage",
+          "collection": "citypageweather-realtime",
+          "location": "https://api.weather.gc.ca/collections/citypageweather-realtime/items?f=json&lang=en&limit=10000",
+          "expected_min": 800,
+          "licence": "Environment and Climate Change Canada data server licence",
+          "attribution": "Data provided by Environment and Climate Change Canada."
+        },
+        {
+          "id": "eccc-clc-base-zones-6.15.0",
+          "title": "ECCC Canadian Location Code base zones 6.15.0",
+          "adapter": "shapefile",
+          "identity_authority": "eccc",
+          "location": "https://dd.weather.gc.ca/20260803/WXO-DD/meteocode/geodata/version_6.15.0/MSC_Geography_Pkg_V6_15_0_Land_Unproj.zip",
+          "archive_contains": "land_CLCBaseZone_hybrid_unproj.shp",
+          "kind": "forecast_zone",
+          "id_fields": ["CLC"],
+          "name_fields": ["NAME", "NOM"],
+          "country_fields": ["COUNTRY_C"],
+          "region_fields": ["PROVINCE_C"],
+          "capabilities": ["forecast", "alert"],
+          "identifiers": [
+            {"authority": "eccc", "scheme": "clc", "field": "CLC", "primary": true},
+            {"authority": "eccc", "scheme": "eccc_feature", "field": "FEATURE_ID", "primary": false}
+          ],
+          "valid_from": "2026-07-22",
+          "expected_min": 1390,
+          "source_quality": 0.99,
+          "licence": "Environment and Climate Change Canada data server licence",
+          "attribution": "Data provided by Environment and Climate Change Canada."
+        },
+        {
+          "id": "eccc-public-forecast-zones",
+          "title": "ECCC standard public forecast zones",
+          "adapter": "eccc_zone",
+          "collection": "public-standard-forecast-zones",
+          "location": "https://api.weather.gc.ca/collections/public-standard-forecast-zones/items?f=json&lang=en&limit=10000",
+          "expected_min": 400,
+          "licence": "Environment and Climate Change Canada data server licence",
+          "attribution": "Data provided by Environment and Climate Change Canada."
+        },
+        {
+          "id": "eccc-marine-forecast-zones",
+          "title": "ECCC standard marine forecast zones",
+          "adapter": "eccc_zone",
+          "collection": "marine-standard-forecast-zones",
+          "location": "https://api.weather.gc.ca/collections/marine-standard-forecast-zones/items?f=json&lang=en&limit=10000",
+          "expected_min": 190,
+          "licence": "Environment and Climate Change Canada data server licence",
+          "attribution": "Data provided by Environment and Climate Change Canada."
+        }
+      ]
+    },
+    {
+      "id": "us-weather",
+      "sources": [
+        {
+          "id": "us-census-zcta-2020",
+          "title": "U.S. Census 2020 ZIP Code Tabulation Areas",
+          "adapter": "shapefile",
+          "identity_authority": "us-census",
+          "location": "https://www2.census.gov/geo/tiger/GENZ2020/shp/cb_2020_us_zcta520_500k.zip",
+          "kind": "postal_area",
+          "id_fields": ["ZCTA5CE20", "GEOID20"],
+          "name_fields": ["ZCTA5CE20", "NAME20"],
+          "country": "US",
+          "capabilities": ["postal"],
+          "identifiers": [
+            {"authority": "us-census", "scheme": "zcta", "field": "ZCTA5CE20", "primary": true},
+            {"authority": "us-census", "scheme": "postal", "field": "ZCTA5CE20", "primary": false}
+          ],
+          "valid_from": "2020-01-01",
+          "expected_min": 30000,
+          "source_quality": 0.97,
+          "licence": "United States public domain",
+          "attribution": "U.S. Census Bureau 2020 Cartographic Boundary Files"
+        },
+        {
+          "id": "faa-airports-2026-07-09",
+          "title": "FAA National Airspace System Resources airports",
+          "adapter": "csv",
+          "identity_authority": "faa",
+          "location": "https://nfdc.faa.gov/webContent/28DaySub/extra/09_Jul_2026_APT_CSV.zip",
+          "archive_contains": "APT_BASE.csv",
+          "kind": "airport",
+          "id_fields": ["SITE_NO"],
+          "name_fields": ["ARPT_NAME", "CITY"],
+          "country_fields": ["COUNTRY_CODE"],
+          "region_fields": ["STATE_CODE"],
+          "latitude_field": "LAT_DECIMAL",
+          "longitude_field": "LONG_DECIMAL",
+          "capabilities": ["aviation"],
+          "identifiers": [
+            {"authority": "faa", "scheme": "faa", "field": "ARPT_ID", "primary": true},
+            {"authority": "icao", "scheme": "icao", "field": "ICAO_ID", "primary": false}
+          ],
+          "lifecycle": "inactive",
+          "lifecycle_map": {
+            "field": "ARPT_STATUS",
+            "values": {"o": "active"}
+          },
+          "valid_from": "2026-07-09",
+          "expected_min": 19000,
+          "source_quality": 0.99,
+          "licence": "United States government work",
+          "attribution": "Federal Aviation Administration National Airspace System Resources"
+        },
+        {
+          "id": "nws-public-zones-2026-04-16",
+          "title": "NWS public forecast zones",
+          "adapter": "shapefile",
+          "identity_authority": "nws",
+          "location": "https://www.weather.gov/source/gis/Shapefiles/WSOM/z_16ap26.zip",
+          "kind": "nws_public_zone",
+          "id_fields": ["STATE_ZONE", "ID", "ZONE"],
+          "name_fields": ["NAME", "NAME_ZONE"],
+          "region_fields": ["STATE"],
+          "country": "US",
+          "capabilities": ["forecast", "alert"],
+          "identifiers": [{"authority": "nws", "scheme": "nws_zone", "field": "STATE_ZONE", "primary": true}],
+          "valid_from": "2026-04-16",
+          "expected_min": 3000,
+          "source_quality": 0.98
+        },
+        {
+          "id": "nws-fire-zones-2026-04-16",
+          "title": "NWS fire forecast zones",
+          "adapter": "shapefile",
+          "identity_authority": "nws",
+          "location": "https://www.weather.gov/source/gis/Shapefiles/WSOM/fz16ap26.zip",
+          "kind": "nws_fire_zone",
+          "id_fields": ["STATE_ZONE", "ID", "ZONE"],
+          "name_fields": ["NAME", "NAME_ZONE"],
+          "region_fields": ["STATE"],
+          "country": "US",
+          "capabilities": ["fire_forecast", "alert"],
+          "identifiers": [{"authority": "nws", "scheme": "nws_fire_zone", "field": "STATE_ZONE", "primary": true}],
+          "valid_from": "2026-04-16",
+          "expected_min": 400,
+          "source_quality": 0.98
+        },
+        {
+          "id": "nws-counties-2026-04-16",
+          "title": "NWS counties",
+          "adapter": "shapefile",
+          "identity_authority": "us-census",
+          "location": "https://www.weather.gov/source/gis/Shapefiles/County/c_16ap26.zip",
+          "kind": "county",
+          "id_fields": ["FIPS"],
+          "name_fields": ["NAME", "COUNTYNAME"],
+          "region_fields": ["STATE"],
+          "country": "US",
+          "capabilities": ["alert"],
+          "identifiers": [
+            {"authority": "us-census", "scheme": "fips", "field": "FIPS", "primary": true},
+            {"authority": "nws", "scheme": "same", "field": "FIPS", "prefix": "0", "primary": false},
+            {
+              "authority": "nws",
+              "scheme": "nws_ugc_county",
+              "parts": [
+                {"field": "STATE"},
+                {"literal": "C"},
+                {"field": "FIPS", "last": 3}
+              ],
+              "primary": false
+            }
+          ],
+          "valid_from": "2026-04-16",
+          "expected_min": 3000,
+          "source_quality": 0.98
+        },
+        {
+          "id": "nws-coastal-zones-2026-04-16",
+          "title": "NWS coastal marine zones",
+          "adapter": "shapefile",
+          "identity_authority": "nws",
+          "location": "https://www.weather.gov/source/gis/Shapefiles/WSOM/mz16ap26.zip",
+          "kind": "nws_marine_zone",
+          "id_fields": ["ID", "STATE_ZONE", "ZONE"],
+          "name_fields": ["NAME"],
+          "region_fields": ["STATE"],
+          "country": "US",
+          "capabilities": ["marine_forecast", "alert"],
+          "identifiers": [{"authority": "nws", "scheme": "nws_marine_zone", "field": "ID", "primary": true}],
+          "valid_from": "2026-04-16",
+          "expected_min": 300,
+          "source_quality": 0.98
+        },
+        {
+          "id": "nws-offshore-zones-2026-04-16",
+          "title": "NWS offshore marine zones",
+          "adapter": "shapefile",
+          "identity_authority": "nws",
+          "location": "https://www.weather.gov/source/gis/Shapefiles/WSOM/oz16ap26.zip",
+          "kind": "nws_marine_zone",
+          "id_fields": ["ID", "STATE_ZONE", "ZONE"],
+          "name_fields": ["NAME"],
+          "region_fields": ["STATE"],
+          "country": "US",
+          "capabilities": ["marine_forecast", "alert"],
+          "identifiers": [{"authority": "nws", "scheme": "nws_marine_zone", "field": "ID", "primary": true}],
+          "valid_from": "2026-04-16",
+          "expected_min": 80,
+          "source_quality": 0.98
+        },
+        {
+          "id": "nws-high-seas-zones-2026-02-17",
+          "title": "NWS high seas marine zones",
+          "adapter": "shapefile",
+          "identity_authority": "nws",
+          "location": "https://www.weather.gov/source/gis/Shapefiles/WSOM/hz17fe26.zip",
+          "kind": "nws_marine_zone",
+          "id_fields": ["ID", "URL", "NAME"],
+          "name_fields": ["NAME"],
+          "region_fields": ["STATE"],
+          "country": "US",
+          "capabilities": ["marine_forecast", "alert"],
+          "identifiers": [
+            {"authority": "nws", "scheme": "nws_marine_zone", "field": "ID", "primary": true},
+            {"authority": "nws", "scheme": "nws_high_seas_product", "field": "URL", "primary": true}
+          ],
+          "valid_from": "2026-02-17",
+          "expected_min": 5,
+          "source_quality": 0.98
+        },
+        {
+          "id": "ndbc-active",
+          "title": "NDBC active station deployments",
+          "adapter": "ndbc_active",
+          "location": "https://www.ndbc.noaa.gov/activestations.xml",
+          "expected_min": 900,
+          "attribution": "National Data Buoy Center"
+        },
+        {
+          "id": "epa-aqs-sites",
+          "title": "EPA Air Quality System monitoring sites",
+          "adapter": "epa_aqs_sites",
+          "location": "https://aqs.epa.gov/aqsweb/airdata/aqs_sites.zip",
+          "expected_min": 19000,
+          "source_quality": 0.99,
+          "licence": "United States government work",
+          "attribution": "U.S. Environmental Protection Agency Air Quality System"
+        },
+        {
+          "id": "airnow-sites",
+          "title": "AirNow monitoring sites",
+          "adapter": "airnow_sites",
+          "location": "https://files.airnowtech.org/airnow/today/monitoring_site_locations.dat",
+          "encoding": "latin1",
+          "expected_min": 2000,
+          "source_quality": 0.88,
+          "attribution": "AirNow and participating air quality agencies",
+          "licence": "AirNow Data Exchange Guidelines"
+        },
+        {
+          "id": "ndbc-deployment-history",
+          "title": "NDBC station deployment history",
+          "adapter": "ndbc_metadata",
+          "identity_authority": "ndbc",
+          "location": "https://www.ndbc.noaa.gov/metadata/stationmetadata.xml",
+          "expected_min": 1400,
+          "source_quality": 0.97,
+          "attribution": "National Data Buoy Center",
+          "licence": "United States government work"
+        }
+      ]
+    }
+  ]
+}

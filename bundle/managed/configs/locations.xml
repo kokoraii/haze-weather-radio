@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<locations version="1">
+  <catalogs>
+    <pack id="global-core" path="managed/locations/global-core.sqlite" priority="300" enabled="true" required="false" />
+    <pack id="ca-weather" path="managed/locations/ca-weather.sqlite" priority="250" enabled="true" required="false" />
+    <pack id="us-weather" path="managed/locations/us-weather.sqlite" priority="250" enabled="true" required="false" />
+    <legacy id="legacy-alert-locations" path="managed/alert_location_map.sqlite" priority="10" enabled="true" required="false" format="legacy" />
+  </catalogs>
+  <overlay path="runtime/state/location-overlay.sqlite">
+    <source id="haze-data-ingest" />
+    <source id="haze-product-render" />
+    <source id="haze-web-gateway" />
+    <source id="haze-ivr" />
+  </overlay>
+  <query defaultLimit="10" maximumLimit="100" />
+  <feedBindings path="managed/configs/feeds.xml" />
+  <grouping>
+    <!-- Overrides use stable canonical IDs: <force members="urn:...,urn:..." /> -->
+    <!-- Overrides use stable canonical IDs: <never members="urn:...,urn:..." /> -->
+  </grouping>
+</locations>

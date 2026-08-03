@@ -53,6 +53,7 @@ func Run(ctx context.Context, options Options) error {
 			sleepOrDone(ctx, time.Second)
 			continue
 		}
+		cfg = hydrateRenderFeedLocations(ctx, cfg, options.BridgeAddr)
 		service := &Service{
 			cfg:        cfg,
 			bridge:     bridge,
@@ -182,11 +183,12 @@ func (s *Service) handleWxOnDemand(event map[string]any) {
 		"source":  serviceID,
 		"subject": request.RequestID,
 		"data": map[string]any{
-			"request_id": request.RequestID,
-			"feed_id":    request.FeedID,
-			"code":       request.Code,
-			"packages":   request.Packages,
-			"product":    product,
+			"request_id":   request.RequestID,
+			"canonical_id": request.CanonicalID,
+			"feed_id":      request.FeedID,
+			"code":         request.Code,
+			"packages":     request.Packages,
+			"product":      product,
 		},
 	})
 }
@@ -195,11 +197,14 @@ func wxOnDemandRequestFromEvent(event map[string]any) wxOnDemandRequest {
 	data := mapAt(event, "data")
 	return wxOnDemandRequest{
 		RequestID:    firstText(event, data, "request_id", "subject", "id"),
+		CanonicalID:  firstText(event, data, "canonical_id"),
 		FeedID:       firstText(event, data, "feed_id"),
 		Code:         firstText(event, data, "code", "location_code"),
 		Source:       firstNonBlank(stringAt(data, "source"), stringAt(data, "weather_source")),
+		Identity:     firstText(event, data, "location_identity"),
 		LocationName: firstText(event, data, "location_name", "name"),
 		Province:     firstText(event, data, "province"),
+		Country:      firstText(event, data, "country"),
 		ForecastID:   firstText(event, data, "forecast_id", "forecast"),
 		StationID:    firstText(event, data, "station_id", "station"),
 		Latitude:     firstText(event, data, "latitude", "lat"),
@@ -224,6 +229,7 @@ func (s *Service) refreshConfigIfNeeded() {
 		return
 	}
 	cfg.Store = s.cfg.Store
+	cfg = inheritRenderFeedCanonicalIDs(cfg, s.cfg)
 	s.cfg = cfg
 	s.lastLoaded = time.Now()
 }
@@ -295,10 +301,11 @@ func (s *Service) publishWxFailed(request wxOnDemandRequest, detail string) {
 		"source":  serviceID,
 		"subject": request.RequestID,
 		"data": map[string]any{
-			"request_id": request.RequestID,
-			"feed_id":    request.FeedID,
-			"code":       request.Code,
-			"error":      detail,
+			"request_id":   request.RequestID,
+			"canonical_id": request.CanonicalID,
+			"feed_id":      request.FeedID,
+			"code":         request.Code,
+			"error":        detail,
 		},
 	})
 }

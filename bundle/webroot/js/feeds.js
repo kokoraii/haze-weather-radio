@@ -29,9 +29,15 @@ const fields = {
     descriptionSuffix: document.getElementById('feedDescriptionSuffix'),
     coverageRegions: document.getElementById('feedCoverageRegions'),
     observationLocations: document.getElementById('feedObservationLocations'),
+    aviationReportLocations: document.getElementById('feedAviationReportLocations'),
     airQualityLocations: document.getElementById('feedAirQualityLocations'),
     climateLocations: document.getElementById('feedClimateLocations'),
     hydrometricLocations: document.getElementById('feedHydrometricLocations'),
+    hydrometricUpstreamLocations: document.getElementById('feedHydrometricUpstreamLocations'),
+    hydrometricDownstreamLocations: document.getElementById('feedHydrometricDownstreamLocations'),
+    marineForecastLocations: document.getElementById('feedMarineForecastLocations'),
+    marineForecastSubregions: document.getElementById('feedMarineForecastSubregions'),
+    marineConditionLocations: document.getElementById('feedMarineConditionLocations'),
     capCPUseLocations: document.getElementById('feedCapCPUseLocations'),
     nwsCAPUseLocations: document.getElementById('feedNWSCAPUseLocations'),
     capCPAllowlist: document.getElementById('feedCapCPAllowlist'),
@@ -110,9 +116,15 @@ function readEditor() {
         description_suffix: fields.descriptionSuffix.value.trim(),
         coverage_regions: fields.coverageRegions.value,
         observation_locations: fields.observationLocations.value,
+        aviation_report_locations: fields.aviationReportLocations.value,
         air_quality_locations: fields.airQualityLocations.value,
         climate_locations: fields.climateLocations.value,
         hydrometric_locations: fields.hydrometricLocations.value,
+        hydrometric_upstream_locations: fields.hydrometricUpstreamLocations.value,
+        hydrometric_downstream_locations: fields.hydrometricDownstreamLocations.value,
+        marine_forecast_locations: fields.marineForecastLocations.value,
+        marine_forecast_subregions: fields.marineForecastSubregions.value,
+        marine_condition_locations: fields.marineConditionLocations.value,
         cap_cp_use_feed_locations: fields.capCPUseLocations.value === 'true',
         nws_cap_use_feed_locations: fields.nwsCAPUseLocations.value === 'true',
         cap_cp_allowlist: fields.capCPAllowlist.value,
@@ -171,9 +183,15 @@ function writeEditor(feed) {
     setField('descriptionSuffix', feed.description_suffix || '');
     setField('coverageRegions', feed.coverage_regions || '');
     setField('observationLocations', feed.observation_locations || '');
+    setField('aviationReportLocations', feed.aviation_report_locations || '');
     setField('airQualityLocations', feed.air_quality_locations || '');
     setField('climateLocations', feed.climate_locations || '');
     setField('hydrometricLocations', feed.hydrometric_locations || '');
+    setField('hydrometricUpstreamLocations', feed.hydrometric_upstream_locations || '');
+    setField('hydrometricDownstreamLocations', feed.hydrometric_downstream_locations || '');
+    setField('marineForecastLocations', feed.marine_forecast_locations || '');
+    setField('marineForecastSubregions', feed.marine_forecast_subregions || '');
+    setField('marineConditionLocations', feed.marine_condition_locations || '');
     setField('capCPUseLocations', String(feed.cap_cp_use_feed_locations !== false));
     setField('nwsCAPUseLocations', String(feed.nws_cap_use_feed_locations !== false));
     setField('capCPAllowlist', feed.cap_cp_allowlist || '');

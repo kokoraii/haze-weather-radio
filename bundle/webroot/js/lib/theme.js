@@ -7,7 +7,7 @@ export function applyTheme(theme) {
 
 export function initTheme(toggleEl) {
     const saved = localStorage.getItem(THEME_KEY);
-    if (saved) applyTheme(saved);
+    applyTheme(saved === 'light' || saved === 'dark' ? saved : 'dark');
     window.lucide?.createIcons();
     syncIcon(toggleEl);
     toggleEl?.addEventListener('click', () => {

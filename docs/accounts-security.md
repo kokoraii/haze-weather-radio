@@ -1,4 +1,4 @@
-# Hardened Accounts Operations
+# Account Sign-In Operations
 
 Haze account mode protects the operator panel with PASETO v4.local sessions, stateful Redis leases, HMAC-peppered Argon2id password hashes, TOTP MFA, IP-bound sessions, CIDR policies, and tamper-evident audit logs.
 
@@ -44,7 +44,7 @@ The password pepper and MFA encryption key are recovery-critical. Losing the pep
 
 ## TLS and proxy trust
 
-Hardened login and authenticated requests require HTTPS. Account cookies are always `Secure`, `HttpOnly`, and `SameSite=Strict`. Either enable the built-in TLS listener or terminate TLS at a reverse proxy whose address is listed in `webpanel.authentication.trusted_proxy_cidrs`.
+Account sign-in and authenticated requests require HTTPS. Account cookies are always `Secure`, `HttpOnly`, and `SameSite=Strict`. Either enable the built-in TLS listener or terminate TLS at a reverse proxy whose address is listed in `webpanel.authentication.trusted_proxy_cidrs`.
 
 Haze accepts `X-Forwarded-Proto: https` only when the direct peer is a configured trusted proxy. Never add a broad client network to `trusted_proxy_cidrs`. Add only the exact proxy host or proxy subnet.
 

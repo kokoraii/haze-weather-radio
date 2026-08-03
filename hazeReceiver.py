@@ -48,7 +48,7 @@ DEFAULT_AUDIO_FILTERS = (
     'volume=30dB,'
     'alimiter=limit=0.90:level=disabled'
 )
-DEFAULT_PIFM_EXTRA_ARGS = ('--power', '0')
+DEFAULT_PIFM_EXTRA_ARGS = ('--power', '1')
 
 log = logging.getLogger(__name__)
 

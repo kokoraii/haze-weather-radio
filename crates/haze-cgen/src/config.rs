@@ -113,6 +113,8 @@ pub(crate) struct EndpointConfig {
     pub(crate) hardware_decoder_enabled: String,
     #[serde(rename = "@hardware_decoder", default)]
     pub(crate) hardware_decoder: String,
+    #[serde(rename = "@deinterlace_enabled", default)]
+    pub(crate) deinterlace_enabled: String,
     #[serde(rename = "@deinterlace_algorithm", default)]
     pub(crate) deinterlace_algorithm: String,
     #[serde(rename = "@deinterlace_backend", default)]
@@ -158,6 +160,7 @@ impl EndpointConfig {
             || self.audio_bitrate_kbps.is_some()
             || !self.hardware_decoder_enabled.trim().is_empty()
             || !self.hardware_decoder.trim().is_empty()
+            || !self.deinterlace_enabled.trim().is_empty()
             || !self.deinterlace_algorithm.trim().is_empty()
             || !self.deinterlace_backend.trim().is_empty()
             || !self.deinterlace_cadence.trim().is_empty()
@@ -366,6 +369,10 @@ pub(crate) struct OutputConfig {
     pub(crate) video_max_bitrate_kbps: u32,
     #[serde(rename = "@gop_frames", default)]
     pub(crate) gop_frames: u32,
+    #[serde(rename = "@interlaced", default)]
+    pub(crate) interlaced: bool,
+    #[serde(rename = "@field_order", default = "default_field_order")]
+    pub(crate) field_order: String,
     #[serde(rename = "@audio_codec", default)]
     pub(crate) audio_codec: String,
     #[serde(rename = "@audio_bitrate_kbps", default)]
@@ -1381,6 +1388,22 @@ fn decoder_preference(endpoint: &EndpointConfig) -> Result<DecoderPreference> {
 }
 
 fn deinterlace_spec(endpoint: &EndpointConfig) -> Result<DeinterlaceSpec> {
+    let enabled = match endpoint
+        .deinterlace_enabled
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "" | "1" | "true" | "yes" | "on" | "enabled" => true,
+        "0" | "false" | "no" | "off" | "disabled" => false,
+        other => bail!("unsupported deinterlace enabled value {other:?}"),
+    };
+    if !enabled {
+        return Ok(DeinterlaceSpec {
+            enabled: false,
+            ..DeinterlaceSpec::default()
+        });
+    }
     let algorithm = match endpoint
         .deinterlace_algorithm
         .trim()
@@ -1430,6 +1453,7 @@ fn deinterlace_spec(endpoint: &EndpointConfig) -> Result<DeinterlaceSpec> {
         other => bail!("unsupported deinterlace parity {other:?}"),
     };
     Ok(DeinterlaceSpec {
+        enabled,
         algorithm,
         backend,
         cadence,
@@ -1586,6 +1610,7 @@ fn output_spec(raw: &OutputConfig) -> Result<EncoderOutputSpec> {
             rate_control,
             gop_frames: NonZeroU32::new(raw.gop_frames)
                 .ok_or_else(|| anyhow::anyhow!("GOP frames must be non-zero"))?,
+            scan: scan_mode(raw.interlaced, &raw.field_order)?,
         },
         audio: AudioEncoderSpec {
             codec: configured_audio_codec_policy(&raw.audio_codec)?,
@@ -1703,6 +1728,7 @@ fn legacy_output_spec(feed: &FeedConfig) -> Result<EncoderOutputSpec> {
             },
             gop_frames: NonZeroU32::new(feed.encoder.video.gop.unwrap_or(60).max(1))
                 .ok_or_else(|| anyhow::anyhow!("GOP frames must be non-zero"))?,
+            scan: scan_mode(feed.video.interlaced, &feed.video.field_order)?,
         },
         audio: AudioEncoderSpec {
             codec: if preserve {
@@ -2249,7 +2275,7 @@ fn default_alert_scene_id() -> String {
 }
 
 fn default_compositor_engine() -> String {
-    "legacy".to_string()
+    "scene_v2".to_string()
 }
 
 fn auto_mode() -> String {
@@ -2988,6 +3014,22 @@ mod tests {
     }
 
     #[test]
+    fn explicit_output_interlacing_is_typed() {
+        let mut output = valid_explicit_output();
+        output.interlaced = true;
+        output.field_order = "bff".to_string();
+
+        let spec = output_spec(&output).expect("interlaced output spec");
+
+        assert_eq!(
+            spec.video.scan,
+            ScanMode::Interlaced {
+                field_order: FieldOrder::BottomFirst,
+            }
+        );
+    }
+
+    #[test]
     fn domain_token_parsers_reject_unknown_values() {
         assert!(pass_policy("maybe").is_err());
         assert!(demux_hint("dash").is_err());
@@ -2998,6 +3040,11 @@ mod tests {
             ..Default::default()
         };
         assert!(deinterlace_spec(&invalid).is_err());
+        let invalid_enabled = EndpointConfig {
+            deinterlace_enabled: "sometimes".to_string(),
+            ..Default::default()
+        };
+        assert!(deinterlace_spec(&invalid_enabled).is_err());
     }
 
     #[test]
@@ -3017,10 +3064,29 @@ mod tests {
         assert_eq!(
             deinterlace_spec(&endpoint).expect("explicit deinterlace spec"),
             DeinterlaceSpec {
+                enabled: true,
                 algorithm: DeinterlaceAlgorithm::MotionAdaptive,
                 backend: DeinterlaceBackend::Vaapi,
                 cadence: DeinterlaceCadence::Frame,
                 parity: DeinterlaceParity::Auto,
+            }
+        );
+    }
+
+    #[test]
+    fn disabled_deinterlacing_ignores_hidden_filter_options() {
+        let endpoint = EndpointConfig {
+            deinterlace_enabled: "false".to_string(),
+            deinterlace_algorithm: "not-a-filter".to_string(),
+            deinterlace_backend: "not-a-backend".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            deinterlace_spec(&endpoint).expect("disabled deinterlacing"),
+            DeinterlaceSpec {
+                enabled: false,
+                ..DeinterlaceSpec::default()
             }
         );
     }

@@ -36,6 +36,9 @@ type rootConfig struct {
 	} `yaml:"operator"`
 	Services struct {
 		Rust struct {
+			Location struct {
+				Mode string `yaml:"mode"`
+			} `yaml:"location"`
 			Media struct {
 				Enabled bool   `yaml:"enabled"`
 				Addr    string `yaml:"addr"`
@@ -58,6 +61,8 @@ type Config struct {
 	Extensions          []extensionConfig `yaml:"extensions"`
 	HTTP                httpConfig        `yaml:"http"`
 	SIP                 sipConfig         `yaml:"sip"`
+	Search              searchConfig      `yaml:"search"`
+	Twilio              twilioConfig      `yaml:"twilio"`
 	RTP                 rtpConfig         `yaml:"rtp"`
 	Cache               cacheConfig       `yaml:"cache"`
 	PromptsFile         string            `yaml:"prompts_file"`
@@ -71,6 +76,43 @@ type Config struct {
 	RenderTimeoutRaw    string            `yaml:"render_timeout"`
 	MaxConcurrentCalls  int               `yaml:"max_concurrent_calls"`
 	MaxRenderInflight   int               `yaml:"max_render_inflight"`
+}
+
+type searchConfig struct {
+	Enabled           *bool         `yaml:"enabled"`
+	VoiceEnabled      *bool         `yaml:"voice_enabled"`
+	SpoolDir          string        `yaml:"spool_dir"`
+	MultitapWindowRaw string        `yaml:"multitap_window"`
+	IdleSubmitRaw     string        `yaml:"idle_submit"`
+	ASRTimeoutRaw     string        `yaml:"asr_timeout"`
+	MaxAttempts       int           `yaml:"max_attempts"`
+	VADPrerollMS      int           `yaml:"vad_preroll_ms"`
+	VADTrailingMS     int           `yaml:"vad_trailing_ms"`
+	MinVoiceMS        int           `yaml:"min_voice_ms"`
+	MaxVoiceMS        int           `yaml:"max_voice_ms"`
+	MultitapWindow    time.Duration `yaml:"-"`
+	IdleSubmit        time.Duration `yaml:"-"`
+	ASRTimeout        time.Duration `yaml:"-"`
+}
+
+func (cfg searchConfig) enabled() bool {
+	return cfg.Enabled != nil && *cfg.Enabled
+}
+
+func (cfg searchConfig) voiceEnabled() bool {
+	return cfg.enabled() && cfg.VoiceEnabled != nil && *cfg.VoiceEnabled
+}
+
+type twilioConfig struct {
+	Enabled              bool          `yaml:"enabled"`
+	ExternalURL          string        `yaml:"external_url"`
+	AccountSIDEnv        string        `yaml:"account_sid_env"`
+	AuthTokenEnv         string        `yaml:"auth_token_env"`
+	SigningKeyEnv        string        `yaml:"signing_key_env"`
+	SessionTTLRaw        string        `yaml:"session_ttl"`
+	MaxMessageBytes      int64         `yaml:"max_message_bytes"`
+	MaxConcurrentStreams int           `yaml:"max_concurrent_streams"`
+	SessionTTL           time.Duration `yaml:"-"`
 }
 
 type extensionConfig struct {
@@ -268,6 +310,8 @@ type locationRecord struct {
 	Source    string `json:"source"`
 	Name      string `json:"name"`
 	Province  string `json:"province,omitempty"`
+	Country   string `json:"country,omitempty"`
+	Kind      string `json:"kind,omitempty"`
 	FeedID    string `json:"feed_id,omitempty"`
 	Forecast  string `json:"forecast_id,omitempty"`
 	StationID string `json:"station_id,omitempty"`
@@ -298,8 +342,7 @@ func loadConfig(path string, overrides Options) (loadedConfig, error) {
 		cfg.HTTP.Addr = overrides.HTTPAddr
 	}
 	if overrides.SIPAddr != "" {
-		cfg.SIP.Listen = overrides.SIPAddr
-		cfg.SIP.ListenPorts = nil
+		applySIPListenOverride(&cfg.SIP, overrides.SIPAddr)
 	}
 	if overrides.CacheDir != "" {
 		cfg.Cache.Dir = overrides.CacheDir
@@ -312,6 +355,15 @@ func loadConfig(path string, overrides Options) (loadedConfig, error) {
 	prompts, err := loadPromptConfig(promptsPath)
 	if err != nil {
 		return loadedConfig{}, err
+	}
+	if cfg.Search.enabled() {
+		spoolPath := resolvePath(baseDir, cfg.Search.SpoolDir)
+		name := strings.ToLower(filepath.Base(filepath.Clean(spoolPath)))
+		spoolAbs, _ := filepath.Abs(filepath.Clean(spoolPath))
+		baseAbs, _ := filepath.Abs(filepath.Clean(baseDir))
+		if spoolAbs == baseAbs || !strings.Contains(name, "asr") {
+			return loadedConfig{}, fmt.Errorf("IVR search spool must be a dedicated directory whose name contains asr")
+		}
 	}
 	return loadedConfig{
 		Root:              root,
@@ -326,6 +378,16 @@ func loadConfig(path string, overrides Options) (loadedConfig, error) {
 		NWS:               loadNWSForBase(baseDir),
 		Prompts:           prompts,
 	}, nil
+}
+
+func applySIPListenOverride(cfg *sipConfig, addr string) {
+	if cfg == nil || strings.TrimSpace(addr) == "" {
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(cfg.Listen), strings.TrimSpace(addr)) {
+		cfg.ListenPorts = nil
+	}
+	cfg.Listen = addr
 }
 
 func normalizeIVRConfig(cfg *Config) {
@@ -351,6 +413,65 @@ func normalizeIVRConfig(cfg *Config) {
 	if cfg.SIP.Registration.SupportedPath == nil {
 		defaultSupportedPath := true
 		cfg.SIP.Registration.SupportedPath = &defaultSupportedPath
+	}
+	if cfg.Search.Enabled == nil {
+		enabled := false
+		cfg.Search.Enabled = &enabled
+	}
+	if cfg.Search.VoiceEnabled == nil {
+		enabled := true
+		cfg.Search.VoiceEnabled = &enabled
+	}
+	if cfg.Search.SpoolDir == "" {
+		cfg.Search.SpoolDir = "runtime/ivr/asr"
+	}
+	cfg.Search.MultitapWindow = parsePositiveDuration(cfg.Search.MultitapWindowRaw, 700*time.Millisecond)
+	cfg.Search.IdleSubmit = parsePositiveDuration(cfg.Search.IdleSubmitRaw, 2500*time.Millisecond)
+	cfg.Search.ASRTimeout = parsePositiveDuration(cfg.Search.ASRTimeoutRaw, 18*time.Second)
+	if cfg.Search.MaxAttempts <= 0 || cfg.Search.MaxAttempts > 2 {
+		cfg.Search.MaxAttempts = 2
+	}
+	if cfg.Search.VADPrerollMS <= 0 {
+		cfg.Search.VADPrerollMS = 300
+	} else if cfg.Search.VADPrerollMS > 1000 {
+		cfg.Search.VADPrerollMS = 1000
+	}
+	if cfg.Search.VADTrailingMS <= 0 {
+		cfg.Search.VADTrailingMS = 900
+	} else if cfg.Search.VADTrailingMS > 2000 {
+		cfg.Search.VADTrailingMS = 2000
+	}
+	if cfg.Search.MinVoiceMS < 2000 {
+		cfg.Search.MinVoiceMS = 2000
+	}
+	if cfg.Search.MaxVoiceMS <= 0 {
+		cfg.Search.MaxVoiceMS = 8000
+	} else if cfg.Search.MaxVoiceMS < 2000 {
+		cfg.Search.MaxVoiceMS = 2000
+	}
+	if cfg.Search.MaxVoiceMS > 8000 {
+		cfg.Search.MaxVoiceMS = 8000
+	}
+	if cfg.Search.MinVoiceMS > cfg.Search.MaxVoiceMS {
+		cfg.Search.MinVoiceMS = cfg.Search.MaxVoiceMS
+	}
+	if cfg.Twilio.AccountSIDEnv == "" {
+		cfg.Twilio.AccountSIDEnv = "HAZE_TWILIO_ACCOUNT_SID"
+	}
+	if cfg.Twilio.AuthTokenEnv == "" {
+		cfg.Twilio.AuthTokenEnv = "HAZE_TWILIO_AUTH_TOKEN"
+	}
+	if cfg.Twilio.SigningKeyEnv == "" {
+		cfg.Twilio.SigningKeyEnv = "HAZE_IVR_SIGNING_KEY"
+	}
+	cfg.Twilio.SessionTTL = parsePositiveDuration(cfg.Twilio.SessionTTLRaw, 2*time.Minute)
+	if cfg.Twilio.SessionTTL > 2*time.Minute {
+		cfg.Twilio.SessionTTL = 2 * time.Minute
+	}
+	if cfg.Twilio.MaxMessageBytes <= 0 {
+		cfg.Twilio.MaxMessageBytes = 64 * 1024
+	} else if cfg.Twilio.MaxMessageBytes > 256*1024 {
+		cfg.Twilio.MaxMessageBytes = 256 * 1024
 	}
 	if cfg.RTP.PortMin == 0 {
 		cfg.RTP.PortMin = 30000
@@ -399,12 +520,25 @@ func normalizeIVRConfig(cfg *Config) {
 		timeout = 60 * time.Second
 	}
 	cfg.RenderTimeout = timeout
-	if cfg.MaxConcurrentCalls == 0 {
+	if cfg.MaxConcurrentCalls <= 0 {
 		cfg.MaxConcurrentCalls = 256
+	}
+	if cfg.Twilio.MaxConcurrentStreams <= 0 {
+		cfg.Twilio.MaxConcurrentStreams = cfg.MaxConcurrentCalls
+	} else if cfg.Twilio.MaxConcurrentStreams > cfg.MaxConcurrentCalls {
+		cfg.Twilio.MaxConcurrentStreams = cfg.MaxConcurrentCalls
 	}
 	if cfg.MaxRenderInflight == 0 {
 		cfg.MaxRenderInflight = 8
 	}
+}
+
+func parsePositiveDuration(raw string, fallback time.Duration) time.Duration {
+	parsed, err := time.ParseDuration(strings.TrimSpace(raw))
+	if err != nil || parsed <= 0 {
+		return fallback
+	}
+	return parsed
 }
 
 func normalizeIVRExtensions(cfg *Config) {
@@ -595,6 +729,10 @@ func (cfg loadedConfig) enabled() bool {
 
 func (cfg loadedConfig) cacheDir() string {
 	return resolvePath(cfg.BaseDir, cfg.IVR.Cache.Dir)
+}
+
+func (cfg loadedConfig) searchSpoolDir() string {
+	return resolvePath(cfg.BaseDir, cfg.IVR.Search.SpoolDir)
 }
 
 func (cfg loadedConfig) ttsReadersPath() string {

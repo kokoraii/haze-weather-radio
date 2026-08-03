@@ -157,6 +157,13 @@ function setSource(source) {
     micPanel.classList.toggle('active', mic);
     urlPanel.classList.toggle('active', !mic);
     sourceMetric.textContent = mic ? 'Mic' : 'Media';
+    document.querySelectorAll('input[name="breakinSource"]').forEach((input) => {
+        const label = input.closest('label');
+        const active = input.value === source;
+        label?.classList.toggle('active', active);
+        label?.setAttribute('aria-selected', active ? 'true' : 'false');
+        if (label) label.tabIndex = active ? 0 : -1;
+    });
 }
 
 function requireFeeds() {

@@ -102,6 +102,8 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc("/api/public/v1/panel/events", s.publicPanelEvents)
 		mux.HandleFunc("/api/public/v1/panel/state", s.publicPanelState)
 		mux.HandleFunc("/api/public/v1/feed/audio", s.publicFeedAudio)
+		mux.HandleFunc("/api/public/v1/feed/map", s.publicFeedMap)
+		mux.HandleFunc("/api/public/v1/map/basemap", s.publicBasemap)
 		mux.HandleFunc("/api/public/v1/feed/webrtc/offer", s.publicFeedWebRTCOffer)
 		mux.HandleFunc("/api/public/v1/alerts/archive/cap.xml", s.publicAlertsArchiveCAPXML)
 	}
@@ -119,6 +121,7 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc("/api/v1/cgen/fonts/", s.cgenFontAsset)
 		mux.HandleFunc("/api/v1/alerts/archive/cap.xml", s.alertsArchiveCAPXML)
 		mux.HandleFunc("/api/v1/alert/audio", s.alertAudioUpload)
+		mux.HandleFunc("/api/v1/locations/catalog/import", s.locationCatalogImport)
 		mux.HandleFunc("/api/v1/wx-on-demand/generate", s.wxOnDemandGenerate)
 		mux.HandleFunc("/api/v1/wx-on-demand/packages", s.wxOnDemandPackages)
 		mux.HandleFunc("/api/v1/wx-on-demand/readers", s.wxOnDemandReaders)
@@ -181,7 +184,7 @@ func (s *Server) admin(writer http.ResponseWriter, request *http.Request) {
 	if !requestMethodGETOrHEAD(writer, request) {
 		return
 	}
-	if !s.auth.Hardened() {
+	if !s.auth.AccountMode() {
 		if token := strings.TrimSpace(request.URL.Query().Get("token")); token != "" && s.auth.ValidToken(token) {
 			s.auth.SetCookieForRequest(writer, request, token)
 			cleanURL := *request.URL
@@ -266,7 +269,7 @@ func (s *Server) loginAPI(writer http.ResponseWriter, request *http.Request) {
 		"password_change_required": result.PasswordChangeRequired,
 		"persistent":               result.Persistent,
 	}
-	if !s.auth.Hardened() {
+	if !s.auth.AccountMode() {
 		response["token"] = result.Token
 	}
 	_ = json.NewEncoder(writer).Encode(response)
@@ -840,7 +843,7 @@ func commandErrorResponse(err error) (int, map[string]any) {
 func commandInfrastructureError(detail string) bool {
 	for _, marker := range []string{
 		"audit integrity", "audit log", "account store", "session registry", "redis", "database",
-		"context deadline", "temporarily unavailable", "event bridge", "connect session",
+		"context deadline", "temporarily unavailable", "event bridge", "location service bridge", "location bridge", "connect session",
 		"open audit", "read audit", "write audit", "sync audit", "publish ",
 	} {
 		if strings.Contains(detail, marker) {
@@ -873,7 +876,7 @@ func (s *Server) requireAdminRequest(writer http.ResponseWriter, request *http.R
 	if !ok {
 		return Identity{}, false
 	}
-	if s.auth.Hardened() && !identity.Account.IsAdmin {
+	if s.auth.AccountMode() && !identity.Account.IsAdmin {
 		err := &AuthError{Code: "administrator_required", Detail: "Administrator permission is required.", HTTPStatus: http.StatusForbidden}
 		status, response := commandErrorResponse(err)
 		response["type"] = "auth_error"
@@ -888,8 +891,8 @@ func (s *Server) requireOriginationRequest(writer http.ResponseWriter, request *
 	if !ok {
 		return Identity{}, false
 	}
-	if s.auth.Hardened() {
-		if err := s.auth.hardened.AllowOrigination(request.Context(), identity); err != nil {
+	if s.auth.AccountMode() {
+		if err := s.auth.accounts.AllowOrigination(request.Context(), identity); err != nil {
 			status, response := commandErrorResponse(err)
 			response["type"] = "auth_error"
 			writeJSONStatus(writer, status, response)
@@ -1291,7 +1294,7 @@ func (s *wsSession) handleCommand(command string, payload map[string]any) (any, 
 	if identity.PasswordChangeRequired && command != "profile.password.change" && command != "profile.get" {
 		return nil, &AuthError{Code: "password_change_required", Detail: "Password change is required before using the panel.", HTTPStatus: http.StatusForbidden}
 	}
-	if s.auth.Hardened() && !identity.Account.IsAdmin && !nonAdminCommandAllowed(command, payload, identity.Account) {
+	if s.auth.AccountMode() && !identity.Account.IsAdmin && !nonAdminCommandAllowed(command, payload, identity.Account) {
 		return nil, &AuthError{Code: "command_forbidden", Detail: fmt.Sprintf("Account is not authorized for command %q.", command), HTTPStatus: http.StatusForbidden}
 	}
 	if usesOriginationPolicy(command, payload) {
@@ -1299,8 +1302,8 @@ func (s *wsSession) handleCommand(command string, payload map[string]any) (any, 
 		if err != nil {
 			return nil, err
 		}
-		if s.auth.Hardened() {
-			if err := s.auth.hardened.AllowOrigination(s.request.Context(), identity); err != nil {
+		if s.auth.AccountMode() {
+			if err := s.auth.accounts.AllowOrigination(s.request.Context(), identity); err != nil {
 				return nil, err
 			}
 		}
@@ -1309,12 +1312,12 @@ func (s *wsSession) handleCommand(command string, payload map[string]any) (any, 
 			return nil, err
 		}
 	}
-	if s.auth.Hardened() && isOriginationExecution(command, payload) {
+	if s.auth.AccountMode() && isOriginationExecution(command, payload) {
 		if err := s.auditOrigination(identity, command, "ALERT_ORIGINATION_REQUESTED", payload, nil); err != nil {
 			return nil, err
 		}
 	}
-	webpanelMutation := s.auth.Hardened() && auditedWebpanelMutation(command, payload)
+	webpanelMutation := s.auth.AccountMode() && auditedWebpanelMutation(command, payload)
 	if webpanelMutation {
 		if err := s.auditGenericWebpanelMutation(identity, command, "REQUESTED", payload); err != nil {
 			return nil, err
@@ -1322,7 +1325,7 @@ func (s *wsSession) handleCommand(command string, payload map[string]any) (any, 
 	}
 	result, err := s.executeCommand(command, payload)
 	if err != nil {
-		if s.auth.Hardened() && isOriginationExecution(command, payload) {
+		if s.auth.AccountMode() && isOriginationExecution(command, payload) {
 			_ = s.auditOrigination(identity, command, "ALERT_ORIGINATION_FAILED", payload, map[string]any{"error": err.Error()})
 		}
 		if webpanelMutation {
@@ -1330,7 +1333,7 @@ func (s *wsSession) handleCommand(command string, payload map[string]any) (any, 
 		}
 		return nil, err
 	}
-	if s.auth.Hardened() && isOriginationExecution(command, payload) {
+	if s.auth.AccountMode() && isOriginationExecution(command, payload) {
 		resultMap, _ := result.(map[string]any)
 		if err := s.auditOrigination(identity, command, "ALERT_ORIGINATION_ACCEPTED", payload, resultMap); err != nil {
 			if resultMap != nil {
@@ -1459,6 +1462,8 @@ func (s *wsSession) executeCommand(command string, payload map[string]any) (any,
 		return listLogViewerFiles(logsViewerRoot(s.configPath))
 	case "logs.tail":
 		return tailLogViewerFile(logsViewerRoot(s.configPath), payload)
+	case "locations.query":
+		return s.queryLocationUtility(payload)
 	case "alerts.archive.action":
 		return handleAlertsArchiveAction(s.configPath, payload)
 	case "same.event_codes":
@@ -1685,7 +1690,7 @@ func (s *wsSession) panelState() (map[string]any, error) {
 		return nil, err
 	}
 	state["account"] = identity.Account
-	if s.auth.Hardened() && !identity.Account.IsAdmin {
+	if s.auth.AccountMode() && !identity.Account.IsAdmin {
 		delete(state, "config")
 		delete(state, "datapool")
 		delete(state, "events")
@@ -1732,13 +1737,7 @@ func publicFeedPagesAvailable(config Config, feeds []map[string]any) bool {
 		return false
 	}
 	for _, feed := range feeds {
-		if enabled, _ := feed["enabled"].(bool); !enabled {
-			continue
-		}
-		if httpStream, _ := feed["http_stream_enabled"].(bool); httpStream {
-			return true
-		}
-		if webrtc, _ := feed["webrtc_enabled"].(bool); webrtc && config.Webpanel.Public.Feeds.WebRTC.Enabled {
+		if enabled, _ := feed["enabled"].(bool); enabled {
 			return true
 		}
 	}
@@ -1818,9 +1817,10 @@ func contentSecurityPolicy(path string) string {
 		scriptSrc,
 		styleSrc,
 		"font-src 'self' https://fonts.gstatic.com",
-		"img-src 'self' data:",
-		"connect-src 'self' ws: wss: stun: stuns: turn: turns:",
+		"img-src 'self' data: https://tiles.openfreemap.org https://server.arcgisonline.com",
+		"connect-src 'self' https://tiles.openfreemap.org https://server.arcgisonline.com ws: wss: stun: stuns: turn: turns:",
 		"media-src 'self' blob: http: https:",
+		"worker-src 'self'",
 		"object-src 'none'",
 		"base-uri 'self'",
 		"frame-ancestors 'self'",

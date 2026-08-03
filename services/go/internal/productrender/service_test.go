@@ -31,19 +31,28 @@ func TestWxOnDemandRequestUsesWeatherSourceFromData(t *testing.T) {
 		"source":  "haze-ivr",
 		"subject": "wx-1",
 		"data": map[string]any{
-			"request_id":  "wx-1",
-			"feed_id":     "sk-0001",
-			"code":        "06032",
-			"source":      "hello_weather",
-			"forecast_id": "sk-32",
-			"latitude":    "51.347",
-			"longitude":   "-105.434",
-			"packages":    []any{"forecast"},
+			"request_id":        "wx-1",
+			"canonical_id":      "urn:haze:location:fixture",
+			"feed_id":           "sk-0001",
+			"code":              "06032",
+			"source":            "hello_weather",
+			"location_identity": "hello_weather:06032",
+			"country":           "CA",
+			"forecast_id":       "sk-32",
+			"latitude":          "51.347",
+			"longitude":         "-105.434",
+			"packages":          []any{"forecast"},
 		},
 	})
 
 	if request.Source != "hello_weather" {
 		t.Fatalf("weather source = %q, want hello_weather", request.Source)
+	}
+	if request.Identity != "hello_weather:06032" || request.Country != "CA" {
+		t.Fatalf("canonical identity = %q country = %q", request.Identity, request.Country)
+	}
+	if request.CanonicalID != "urn:haze:location:fixture" {
+		t.Fatalf("canonical ID = %q", request.CanonicalID)
 	}
 	if request.RequestID != "wx-1" || request.FeedID != "sk-0001" || request.ForecastID != "sk-32" {
 		t.Fatalf("parsed request = %#v", request)

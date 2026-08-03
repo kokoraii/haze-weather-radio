@@ -47,11 +47,14 @@ type renderRequest struct {
 
 type wxOnDemandRequest struct {
 	RequestID    string
+	CanonicalID  string
 	FeedID       string
 	Code         string
 	Source       string
+	Identity     string
 	LocationName string
 	Province     string
+	Country      string
 	ForecastID   string
 	StationID    string
 	Latitude     string

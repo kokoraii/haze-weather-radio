@@ -104,7 +104,7 @@ function Copy-BundleDirectory {
 
 New-Item -ItemType Directory -Force -Path $OutFull | Out-Null
 New-Item -ItemType Directory -Force -Path $BinFull | Out-Null
-foreach ($File in @("haze-web.exe", "haze-data-ingest.exe", "haze-tts.exe", "haze-sapi5-shim.exe", "haze-product-render.exe", "haze-playlist.exe", "haze-webhook.exe", "haze-ivr.exe", "libopus-0.dll", "libopusfile-0.dll", "libogg-0.dll", "libwinpthread-1.dll")) {
+foreach ($File in @("haze-web.exe", "haze-data-ingest.exe", "haze-tts.exe", "haze-sapi5-shim.exe", "haze-product-render.exe", "haze-playlist.exe", "haze-webhook.exe", "haze-asr.exe", "haze-ivr.exe", "whisper-server.exe", "libopus-0.dll", "libopusfile-0.dll", "libogg-0.dll", "libwinpthread-1.dll")) {
     $LegacyTarget = Join-Path $OutFull $File
     if (Test-Path -LiteralPath $LegacyTarget) {
         Remove-Item -LiteralPath $LegacyTarget -Force
@@ -199,6 +199,10 @@ if ($RunningOnWindows -and (Test-Path (Join-Path $Clang64Bin "x86_64-w64-mingw32
     Write-Warning "Building haze-web without native Opus support; install MSYS2 CLANG64 clang, pkgconf, opus, and opusfile for receiver Opus."
 }
 
+& (Join-Path $Root "scripts/build-whisper-runtime.ps1") `
+    -OutputDir $BinFull `
+    -LicenseDir (Join-Path $OutFull "licenses")
+
 Push-Location (Join-Path $Root "services/go")
 try {
     $env:GOCACHE = Join-Path $Root "target/go-build-cache"
@@ -241,9 +245,19 @@ try {
     Assert-NativeSuccess "haze-playlist build"
     go build -o (Join-Path $BinFull "haze-webhook.exe") ./cmd/haze-webhook
     Assert-NativeSuccess "haze-webhook build"
+    go build -o (Join-Path $BinFull "haze-asr.exe") ./cmd/haze-asr
+    Assert-NativeSuccess "haze-asr build"
     go build -o (Join-Path $BinFull "haze-ivr.exe") ./cmd/haze-ivr
     Assert-NativeSuccess "haze-ivr build"
     Copy-SherpaOnnxRuntimeLibraries -DestinationDir $BinFull
+    if ($RunningOnWindows) {
+        foreach ($DllName in @("libc++.dll", "libunwind.dll")) {
+            $DllPath = Join-Path $Clang64Bin $DllName
+            if (Test-Path -LiteralPath $DllPath -PathType Leaf) {
+                Copy-Item -LiteralPath $DllPath -Destination $BinFull -Force
+            }
+        }
+    }
     if ($BuildWebArgs.Count -gt 0) {
         foreach ($DllName in @("libopus-0.dll", "libopusfile-0.dll", "libogg-0.dll", "libwinpthread-1.dll")) {
             $DllPath = Join-Path $OpusBin $DllName
@@ -267,7 +281,7 @@ foreach ($BundledDir in @("webroot", "managed", "audio")) {
 
 $ManagedScripts = Join-Path (Join-Path $OutFull "managed") "scripts"
 New-Item -ItemType Directory -Force -Path $ManagedScripts | Out-Null
-foreach ($Script in @("scripts/tts/chatterbox_infer.py", "scripts/tts/f5_infer.py")) {
+foreach ($Script in @("scripts/tts/chatterbox_infer.py", "scripts/tts/f5_infer.py", "scripts/install-whisper-model.sh", "scripts/install-whisper-model.ps1")) {
     $Source = Join-Path $Root $Script
     if (Test-Path -LiteralPath $Source) {
         Copy-Item -LiteralPath $Source -Destination $ManagedScripts -Force

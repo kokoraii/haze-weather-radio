@@ -1121,3 +1121,88 @@ a.alert-card-id:hover {
         margin-left: 0;
     }
 }
+
+/* Tab strips use the same raised-page shape as browser tabs. */
+.browser-tabs,
+.cgen-tabs,
+.alert-tabs,
+.breakin-source-tabs {
+    align-items: flex-end;
+    background: color-mix(in srgb, var(--bg) 46%, var(--surface));
+    border: 0;
+    border-bottom: 1px solid var(--fluent-stroke);
+    border-radius: 0;
+    box-shadow: inset 0 -1px 0 color-mix(in srgb, var(--border-deep) 55%, transparent);
+    display: flex;
+    flex-wrap: nowrap;
+    gap: 2px;
+    margin: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 7px 7px 0;
+    scrollbar-width: thin;
+}
+
+.browser-tab,
+.cgen-tab,
+.alert-tab,
+.breakin-source-tabs > label {
+    align-items: center;
+    background: linear-gradient(180deg, var(--surface-raised-top), color-mix(in srgb, var(--surface-raised-bot) 88%, var(--bg)));
+    border: 1px solid var(--fluent-stroke);
+    border-bottom-color: var(--fluent-stroke);
+    border-radius: 8px 8px 0 0;
+    box-shadow: inset 0 1px 0 var(--fluent-stroke-strong), 0 -1px 3px rgba(0, 0, 0, 0.12);
+    color: var(--muted);
+    cursor: pointer;
+    display: inline-flex;
+    flex: 0 0 auto;
+    font-size: 12.5px;
+    font-weight: 650;
+    gap: 7px;
+    justify-content: center;
+    margin: 0 0 -1px;
+    min-height: 34px;
+    padding: 6px 13px 7px;
+    position: relative;
+    white-space: nowrap;
+}
+
+.browser-tab:hover,
+.cgen-tab:hover,
+.alert-tab:hover,
+.breakin-source-tabs > label:hover {
+    background: linear-gradient(180deg, var(--fluent-hover), color-mix(in srgb, var(--surface-raised-bot) 84%, var(--fluent-hover)));
+    color: var(--text);
+}
+
+.browser-tab.active,
+.browser-tab[aria-selected="true"],
+.cgen-tab.active,
+.cgen-tab[aria-selected="true"],
+.alert-tab.active,
+.alert-tab[aria-selected="true"],
+.breakin-source-tabs > label.active,
+.breakin-source-tabs > label[aria-selected="true"] {
+    background: var(--surface);
+    border-color: var(--fluent-stroke);
+    border-bottom-color: var(--surface);
+    box-shadow: inset 0 2px 0 var(--accent), 0 -2px 5px rgba(0, 0, 0, 0.12);
+    color: var(--text);
+    z-index: 1;
+}
+
+.browser-tab:focus-visible,
+.cgen-tab:focus-visible,
+.alert-tab:focus-visible,
+.breakin-source-tabs > label:focus-within {
+    outline: 2px solid color-mix(in srgb, var(--border-focus) 72%, transparent);
+    outline-offset: -3px;
+}
+
+.breakin-source-tabs > label input[type="radio"] {
+    height: 1px;
+    opacity: 0;
+    position: absolute;
+    width: 1px;
+}

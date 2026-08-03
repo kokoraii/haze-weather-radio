@@ -77,7 +77,7 @@ type AuthError struct {
 
 func (e *AuthError) Error() string { return e.Detail }
 
-type hardenedAuth struct {
+type accountAuth struct {
 	store               *accountStore
 	sessions            sessionRegistry
 	audit               *auditLogger
@@ -192,9 +192,9 @@ func (l *attemptLimiter) ResetPrefix(prefix string) {
 	l.mu.Unlock()
 }
 
-func newHardenedAuth(config Config, configPath string) *hardenedAuth {
+func newAccountAuth(config Config, configPath string) *accountAuth {
 	authConfig := config.Webpanel.Authentication
-	h := &hardenedAuth{
+	h := &accountAuth{
 		enforceMFA:          authConfig.EnforceMFA,
 		redisRequired:       authConfig.RedisRequired,
 		sessionTTL:          durationSeconds(authConfig.SessionTTLSeconds, 12*time.Hour),
@@ -276,7 +276,7 @@ func newHardenedAuth(config Config, configPath string) *hardenedAuth {
 			return h
 		}
 	} else if authConfig.RedisRequired {
-		h.initializationError = fmt.Errorf("%s is required for hardened session revocation", redisEnv)
+		h.initializationError = fmt.Errorf("%s is required for account session revocation", redisEnv)
 		h.store.Close()
 		return h
 	} else {
@@ -300,7 +300,7 @@ func newHardenedAuth(config Config, configPath string) *hardenedAuth {
 	return h
 }
 
-func (h *hardenedAuth) Close() {
+func (h *accountAuth) Close() {
 	if h == nil {
 		return
 	}
@@ -312,7 +312,7 @@ func (h *hardenedAuth) Close() {
 	}
 }
 
-func (h *hardenedAuth) bootstrapFirstAdmin(ctx context.Context, usernameEnv string, passwordEnv string) error {
+func (h *accountAuth) bootstrapFirstAdmin(ctx context.Context, usernameEnv string, passwordEnv string) error {
 	count, err := h.store.Count(ctx)
 	if err != nil {
 		return err
@@ -352,7 +352,7 @@ func (h *hardenedAuth) bootstrapFirstAdmin(ctx context.Context, usernameEnv stri
 	return nil
 }
 
-func (h *hardenedAuth) Login(ctx context.Context, input LoginInput) (LoginResult, error) {
+func (h *accountAuth) Login(ctx context.Context, input LoginInput) (LoginResult, error) {
 	if h == nil || !h.configured {
 		return LoginResult{}, h.unavailableError()
 	}
@@ -361,7 +361,7 @@ func (h *hardenedAuth) Login(ctx context.Context, input LoginInput) (LoginResult
 	userAgent := cleanUserAgent(input.Request)
 	if !h.secureRequest(input.Request) {
 		h.auditPreauthenticationFailure("LOGIN_INSECURE_TRANSPORT_DENIED", username, ip, userAgent, "critical")
-		return LoginResult{}, &AuthError{Code: "https_required", Detail: "Hardened account sign in requires HTTPS.", HTTPStatus: http.StatusUpgradeRequired}
+		return LoginResult{}, &AuthError{Code: "https_required", Detail: "Sign in requires HTTPS.", HTTPStatus: http.StatusUpgradeRequired}
 	}
 	if !validUsername.MatchString(username) || len(input.Password) == 0 || len(input.Password) > maxPasswordBytes {
 		return LoginResult{}, invalidCredentials()
@@ -556,7 +556,7 @@ func (h *hardenedAuth) Login(ctx context.Context, input LoginInput) (LoginResult
 	}, nil
 }
 
-func (h *hardenedAuth) auditPreauthenticationFailure(event string, attemptedUsername string, ip string, userAgent string, severity string) {
+func (h *accountAuth) auditPreauthenticationFailure(event string, attemptedUsername string, ip string, userAgent string, severity string) {
 	if h == nil || h.audit == nil || h.preauthAuditLimiter == nil {
 		return
 	}
@@ -576,7 +576,7 @@ func (h *hardenedAuth) auditPreauthenticationFailure(event string, attemptedUser
 	})
 }
 
-func (h *hardenedAuth) refreshLoginAccount(ctx context.Context, previous Account) (Account, error) {
+func (h *accountAuth) refreshLoginAccount(ctx context.Context, previous Account) (Account, error) {
 	account, err := h.store.ByID(ctx, previous.ID)
 	if errors.Is(err, errAccountNotFound) {
 		return Account{}, invalidCredentials()
@@ -593,7 +593,7 @@ func (h *hardenedAuth) refreshLoginAccount(ctx context.Context, previous Account
 	return account, nil
 }
 
-func (h *hardenedAuth) startMFAEnrollment(ctx context.Context, account Account, ip string, userAgent string) (LoginResult, error) {
+func (h *accountAuth) startMFAEnrollment(ctx context.Context, account Account, ip string, userAgent string) (LoginResult, error) {
 	key, err := totp.Generate(totp.GenerateOpts{
 		Issuer: pasetoIssuer, AccountName: account.Username, Period: 30, SecretSize: 32,
 		Digits: otp.DigitsSix, Algorithm: otp.AlgorithmSHA1, Rand: rand.Reader,
@@ -619,7 +619,7 @@ func (h *hardenedAuth) startMFAEnrollment(ctx context.Context, account Account, 
 	}, mfaEnrollmentRequiredError()
 }
 
-func (h *hardenedAuth) pendingMFAEnrollment(account Account) (LoginResult, error) {
+func (h *accountAuth) pendingMFAEnrollment(account Account) (LoginResult, error) {
 	secret, err := h.decryptMFASecret(account.ID, account.mfaSecret)
 	if err != nil {
 		return LoginResult{}, &AuthError{Code: "auth_unavailable", Detail: "MFA enrollment could not be recovered.", HTTPStatus: http.StatusServiceUnavailable}
@@ -635,14 +635,14 @@ func mfaEnrollmentRequiredError() error {
 	return &AuthError{Code: "mfa_enrollment_required", Detail: "Add the MFA secret to an authenticator, then enter its current code.", HTTPStatus: http.StatusUnauthorized}
 }
 
-func (h *hardenedAuth) Authenticate(request *http.Request) (Identity, error) {
+func (h *accountAuth) Authenticate(request *http.Request) (Identity, error) {
 	if h == nil || !h.configured {
 		return Identity{}, h.unavailableError()
 	}
 	if !h.secureRequest(request) {
-		return Identity{}, &AuthError{Code: "https_required", Detail: "Hardened account sessions require HTTPS.", HTTPStatus: http.StatusUpgradeRequired}
+		return Identity{}, &AuthError{Code: "https_required", Detail: "This page requires HTTPS.", HTTPStatus: http.StatusUpgradeRequired}
 	}
-	rawToken := hardenedTokenFromRequest(request)
+	rawToken := accountTokenFromRequest(request)
 	if rawToken == "" {
 		return Identity{}, &AuthError{Code: "unauthorized", Detail: "Authentication is required.", HTTPStatus: http.StatusUnauthorized}
 	}
@@ -728,7 +728,7 @@ func (h *hardenedAuth) Authenticate(request *http.Request) (Identity, error) {
 	}, nil
 }
 
-func (h *hardenedAuth) auditExpiredSession(request *http.Request, rawToken string) {
+func (h *accountAuth) auditExpiredSession(request *http.Request, rawToken string) {
 	parser := paseto.NewParserWithoutExpiryCheck()
 	parser.AddRule(paseto.IssuedBy(pasetoIssuer), paseto.ForAudience(pasetoAudience))
 	token, err := parser.ParseV4Local(h.pasetoKey, rawToken, []byte(pasetoImplicitAssertion))
@@ -764,7 +764,7 @@ func (h *hardenedAuth) auditExpiredSession(request *http.Request, rawToken strin
 	})
 }
 
-func (h *hardenedAuth) Logout(request *http.Request) error {
+func (h *accountAuth) Logout(request *http.Request) error {
 	if h == nil || h.sessions == nil || request == nil {
 		return nil
 	}
@@ -792,19 +792,19 @@ func (h *hardenedAuth) Logout(request *http.Request) error {
 	return nil
 }
 
-func (h *hardenedAuth) ListAccounts(ctx context.Context) ([]Account, error) {
+func (h *accountAuth) ListAccounts(ctx context.Context) ([]Account, error) {
 	return h.store.List(ctx)
 }
 
-func (h *hardenedAuth) ListSessions(ctx context.Context, userID string) ([]ActiveSession, error) {
+func (h *accountAuth) ListSessions(ctx context.Context, userID string) ([]ActiveSession, error) {
 	return h.sessions.ListUser(ctx, userID)
 }
 
-func (h *hardenedAuth) RevokeSession(ctx context.Context, digest string) error {
+func (h *accountAuth) RevokeSession(ctx context.Context, digest string) error {
 	return h.sessions.DeleteDigest(ctx, digest)
 }
 
-func (h *hardenedAuth) RevokeUser(ctx context.Context, userID string) error {
+func (h *accountAuth) RevokeUser(ctx context.Context, userID string) error {
 	account, _ := h.store.ByID(ctx, userID)
 	if err := h.store.BumpAuthVersion(ctx, userID); err != nil {
 		return err
@@ -813,12 +813,12 @@ func (h *hardenedAuth) RevokeUser(ctx context.Context, userID string) error {
 	return nil
 }
 
-func (h *hardenedAuth) PurgeUserSessionLeases(ctx context.Context, userID string) {
+func (h *accountAuth) PurgeUserSessionLeases(ctx context.Context, userID string) {
 	account, _ := h.store.ByID(ctx, userID)
 	h.purgeUserSessionLeases(ctx, userID, account)
 }
 
-func (h *hardenedAuth) purgeUserSessionLeases(ctx context.Context, userID string, account Account) {
+func (h *accountAuth) purgeUserSessionLeases(ctx context.Context, userID string, account Account) {
 	if err := h.sessions.DeleteUser(ctx, userID); err != nil {
 		username := account.Username
 		if username == "" {
@@ -833,7 +833,7 @@ func (h *hardenedAuth) purgeUserSessionLeases(ctx context.Context, userID string
 	}
 }
 
-func (h *hardenedAuth) ResetLoginLimits(ctx context.Context, username string, ip string) {
+func (h *accountAuth) ResetLoginLimits(ctx context.Context, username string, ip string) {
 	username = strings.ToLower(strings.TrimSpace(username))
 	if username != "" {
 		h.loginLimiter.ResetPrefix(username + "|")
@@ -854,7 +854,7 @@ func (h *hardenedAuth) ResetLoginLimits(ctx context.Context, username string, ip
 	}
 }
 
-func (h *hardenedAuth) admitLoginAttempt(ctx context.Context, username string, pairKey string, ip string, ipLimit int, now time.Time) (bool, bool, error) {
+func (h *accountAuth) admitLoginAttempt(ctx context.Context, username string, pairKey string, ip string, ipLimit int, now time.Time) (bool, bool, error) {
 	if registry, ok := h.sessions.(*redisSessionRegistry); ok {
 		pairMember, err := randomUUID()
 		if err != nil {
@@ -886,7 +886,7 @@ func (h *hardenedAuth) admitLoginAttempt(ctx context.Context, username string, p
 	return true, h.loginIPLimiter.Allow(ip, ipLimit, h.loginWindow, now), nil
 }
 
-func (h *hardenedAuth) resetLoginPair(ctx context.Context, pairKey string) {
+func (h *accountAuth) resetLoginPair(ctx context.Context, pairKey string) {
 	h.loginLimiter.Reset(pairKey)
 	if registry, ok := h.sessions.(*redisSessionRegistry); ok {
 		rateCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
@@ -895,7 +895,7 @@ func (h *hardenedAuth) resetLoginPair(ctx context.Context, pairKey string) {
 	}
 }
 
-func (h *hardenedAuth) AllowOrigination(ctx context.Context, identity Identity) error {
+func (h *accountAuth) AllowOrigination(ctx context.Context, identity Identity) error {
 	if !identity.Account.AllowOrigination {
 		return &AuthError{Code: "origination_forbidden", Detail: "This account is not allowed to originate alerts.", HTTPStatus: http.StatusForbidden}
 	}
@@ -922,7 +922,7 @@ func (h *hardenedAuth) AllowOrigination(ctx context.Context, identity Identity) 
 	return nil
 }
 
-func (h *hardenedAuth) hashPassword(password string) (string, error) {
+func (h *accountAuth) hashPassword(password string) (string, error) {
 	if !utf8.ValidString(password) || utf8.RuneCountInString(password) < 12 {
 		return "", fmt.Errorf("password must contain at least 12 characters")
 	}
@@ -942,7 +942,7 @@ func (h *hardenedAuth) hashPassword(password string) (string, error) {
 		base64.RawStdEncoding.EncodeToString(salt), base64.RawStdEncoding.EncodeToString(output)), nil
 }
 
-func (h *hardenedAuth) verifyPassword(ctx context.Context, encoded string, password string) (bool, error) {
+func (h *accountAuth) verifyPassword(ctx context.Context, encoded string, password string) (bool, error) {
 	params, salt, expected, err := parseSecureArgon2Hash(encoded)
 	if err != nil {
 		return false, err
@@ -987,7 +987,7 @@ func pepperPassword(pepper []byte, password string) []byte {
 	return mac.Sum(nil)
 }
 
-func (h *hardenedAuth) issueToken(account Account, sessionID string, ip string, issuedAt time.Time, expiresAt time.Time, passwordChangeRequired bool) (string, error) {
+func (h *accountAuth) issueToken(account Account, sessionID string, ip string, issuedAt time.Time, expiresAt time.Time, passwordChangeRequired bool) (string, error) {
 	token := paseto.NewToken()
 	token.SetIssuer(pasetoIssuer)
 	token.SetAudience(pasetoAudience)
@@ -1010,7 +1010,7 @@ func (h *hardenedAuth) issueToken(account Account, sessionID string, ip string, 
 	return token.V4Encrypt(h.pasetoKey, []byte(pasetoImplicitAssertion)), nil
 }
 
-func (h *hardenedAuth) encryptMFASecret(accountID string, secret string) (string, error) {
+func (h *accountAuth) encryptMFASecret(accountID string, secret string) (string, error) {
 	accountID = strings.TrimSpace(accountID)
 	if accountID == "" {
 		return "", fmt.Errorf("account ID is required to encrypt an MFA secret")
@@ -1027,7 +1027,7 @@ func (h *hardenedAuth) encryptMFASecret(accountID string, secret string) (string
 	return "mfa2." + base64.RawURLEncoding.EncodeToString(append(nonce, sealed...)), nil
 }
 
-func (h *hardenedAuth) decryptMFASecret(accountID string, encrypted string) (string, error) {
+func (h *accountAuth) decryptMFASecret(accountID string, encrypted string) (string, error) {
 	accountID = strings.TrimSpace(accountID)
 	if accountID == "" {
 		return "", fmt.Errorf("account ID is required to decrypt an MFA secret")
@@ -1053,7 +1053,7 @@ func (h *hardenedAuth) decryptMFASecret(accountID string, encrypted string) (str
 	return string(opened), nil
 }
 
-func (h *hardenedAuth) validateMFA(ctx context.Context, account Account, passcode string, now time.Time) error {
+func (h *accountAuth) validateMFA(ctx context.Context, account Account, passcode string, now time.Time) error {
 	secret, err := h.decryptMFASecret(account.ID, account.mfaSecret)
 	if err != nil {
 		return err
@@ -1081,7 +1081,7 @@ func (h *hardenedAuth) validateMFA(ctx context.Context, account Account, passcod
 	return h.store.AcceptMFAStep(ctx, account.ID, account.authVersion, acceptedStep)
 }
 
-func (h *hardenedAuth) clientIP(request *http.Request) string {
+func (h *accountAuth) clientIP(request *http.Request) string {
 	if request == nil {
 		return "0.0.0.0"
 	}
@@ -1109,7 +1109,7 @@ func (h *hardenedAuth) clientIP(request *http.Request) string {
 	return remote
 }
 
-func (h *hardenedAuth) secureRequest(request *http.Request) bool {
+func (h *accountAuth) secureRequest(request *http.Request) bool {
 	if request == nil {
 		return false
 	}
@@ -1123,7 +1123,7 @@ func (h *hardenedAuth) secureRequest(request *http.Request) bool {
 	return strings.EqualFold(strings.TrimSpace(request.Header.Get("X-Forwarded-Proto")), "https")
 }
 
-func hardenedTokenFromRequest(request *http.Request) string {
+func accountTokenFromRequest(request *http.Request) string {
 	if request == nil {
 		return ""
 	}
@@ -1288,10 +1288,10 @@ func invalidCredentials() error {
 	return &AuthError{Code: "invalid_credentials", Detail: "The username, password, or authentication code is incorrect.", HTTPStatus: http.StatusUnauthorized}
 }
 
-func (h *hardenedAuth) unavailableError() error {
-	detail := "Hardened authentication is not configured."
+func (h *accountAuth) unavailableError() error {
+	detail := "Sign-in is not configured."
 	if h != nil && h.initializationError != nil {
-		detail = "Hardened authentication could not be initialized."
+		detail = "Sign-in is unavailable. Check the server configuration."
 	}
 	return &AuthError{Code: "auth_unavailable", Detail: detail, HTTPStatus: http.StatusServiceUnavailable}
 }

@@ -14,6 +14,8 @@ type Event struct {
 	Source    string         `json:"source"`
 	Timestamp time.Time      `json:"timestamp"`
 	Subject   string         `json:"subject,omitempty"`
+	Target    string         `json:"target,omitempty"`
+	ReplyTo   string         `json:"reply_to,omitempty"`
 	Data      map[string]any `json:"data,omitempty"`
 }
 

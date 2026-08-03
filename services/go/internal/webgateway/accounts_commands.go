@@ -12,12 +12,12 @@ import (
 )
 
 func (s *wsSession) accountCommand(command string, payload map[string]any) (any, error) {
-	if s == nil || s.auth == nil || s.auth.hardened == nil {
-		return nil, fmt.Errorf("account management requires hardened account mode")
+	if s == nil || s.auth == nil || s.auth.accounts == nil {
+		return nil, fmt.Errorf("account management is unavailable in the current sign-in mode")
 	}
 	if serializedAccountMutation(command) {
-		s.auth.hardened.accountMutationMu.Lock()
-		defer s.auth.hardened.accountMutationMu.Unlock()
+		s.auth.accounts.accountMutationMu.Lock()
+		defer s.auth.accounts.accountMutationMu.Unlock()
 	}
 	// Re-authenticate after waiting for the mutation lock. A password reset,
 	// session revocation, or role change that completed while this request was
@@ -33,7 +33,7 @@ func (s *wsSession) accountCommand(command string, payload map[string]any) (any,
 		if !actor.Account.IsAdmin {
 			return nil, fmt.Errorf("administrator permission is required")
 		}
-		accounts, err := s.auth.hardened.ListAccounts(ctx)
+		accounts, err := s.auth.accounts.ListAccounts(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -53,11 +53,11 @@ func (s *wsSession) accountCommand(command string, payload map[string]any) (any,
 		if !actor.Account.IsAdmin {
 			return nil, fmt.Errorf("administrator permission is required")
 		}
-		account, err := s.auth.hardened.store.ByID(ctx, stringValue(payload, "id"))
+		account, err := s.auth.accounts.store.ByID(ctx, stringValue(payload, "id"))
 		if err != nil {
 			return nil, err
 		}
-		sessions, err := s.auth.hardened.ListSessions(ctx, account.ID)
+		sessions, err := s.auth.accounts.ListSessions(ctx, account.ID)
 		if err != nil {
 			return nil, err
 		}
@@ -70,17 +70,17 @@ func (s *wsSession) accountCommand(command string, payload map[string]any) (any,
 			PasswordExpiryDays: 90, AllowUserPasswordChange: true, LoggingEnabled: true,
 		}, payload)
 		password := stringValue(payload, "password")
-		hash, err := s.auth.hardened.hashPassword(password)
+		hash, err := s.auth.accounts.hashPassword(password)
 		if err != nil {
 			return nil, err
 		}
 		if err := s.auditWebpanel(actor, "ACCOUNT_CREATE_REQUESTED", account, map[string]any{"is_admin": account.IsAdmin}); err != nil {
 			return nil, err
 		}
-		if err := s.auth.hardened.store.Create(ctx, account, hash); err != nil {
+		if err := s.auth.accounts.store.Create(ctx, account, hash); err != nil {
 			return nil, err
 		}
-		created, err := s.auth.hardened.store.ByUsername(ctx, account.Username)
+		created, err := s.auth.accounts.store.ByUsername(ctx, account.Username)
 		if err != nil {
 			return nil, err
 		}
@@ -92,7 +92,7 @@ func (s *wsSession) accountCommand(command string, payload map[string]any) (any,
 		if !actor.Account.IsAdmin {
 			return nil, fmt.Errorf("administrator permission is required")
 		}
-		account, err := s.auth.hardened.store.ByID(ctx, stringValue(payload, "id"))
+		account, err := s.auth.accounts.store.ByID(ctx, stringValue(payload, "id"))
 		if err != nil {
 			return nil, err
 		}
@@ -114,20 +114,20 @@ func (s *wsSession) accountCommand(command string, payload map[string]any) (any,
 		}
 		renamed := oldUsername != account.Username
 		if renamed {
-			if err := s.auth.hardened.audit.RenameAccount(oldUsername, account.Username); err != nil {
+			if err := s.auth.accounts.audit.RenameAccount(oldUsername, account.Username); err != nil {
 				return nil, err
 			}
 		}
-		if err := s.auth.hardened.store.Save(ctx, account); err != nil {
+		if err := s.auth.accounts.store.Save(ctx, account); err != nil {
 			if renamed {
-				_ = s.auth.hardened.audit.RenameAccount(account.Username, oldUsername)
+				_ = s.auth.accounts.audit.RenameAccount(account.Username, oldUsername)
 			}
 			return nil, err
 		}
 		// Save advances auth_version for every policy update. Purge the stale
 		// leases as cleanup; the version change remains authoritative if Redis
 		// is temporarily unavailable.
-		s.auth.hardened.PurgeUserSessionLeases(ctx, account.ID)
+		s.auth.accounts.PurgeUserSessionLeases(ctx, account.ID)
 		if actor.Account.ID == account.ID {
 			actor.Account.Username = account.Username
 		}
@@ -139,22 +139,22 @@ func (s *wsSession) accountCommand(command string, payload map[string]any) (any,
 		if !actor.Account.IsAdmin {
 			return nil, fmt.Errorf("administrator permission is required")
 		}
-		account, err := s.auth.hardened.store.ByID(ctx, stringValue(payload, "id"))
+		account, err := s.auth.accounts.store.ByID(ctx, stringValue(payload, "id"))
 		if err != nil {
 			return nil, err
 		}
-		hash, err := s.auth.hardened.hashPassword(stringValue(payload, "password"))
+		hash, err := s.auth.accounts.hashPassword(stringValue(payload, "password"))
 		if err != nil {
 			return nil, err
 		}
 		if err := s.auditWebpanel(actor, "PASSWORD_RESET_REQUESTED_BY_ADMIN", account, nil); err != nil {
 			return nil, err
 		}
-		if err := s.auth.hardened.store.SetPassword(ctx, account.ID, hash); err != nil {
+		if err := s.auth.accounts.store.SetPassword(ctx, account.ID, hash); err != nil {
 			return nil, err
 		}
-		s.auth.hardened.ResetLoginLimits(ctx, account.Username, account.LastIP)
-		if err := s.auth.hardened.RevokeUser(ctx, account.ID); err != nil {
+		s.auth.accounts.ResetLoginLimits(ctx, account.Username, account.LastIP)
+		if err := s.auth.accounts.RevokeUser(ctx, account.ID); err != nil {
 			return nil, err
 		}
 		if err := s.auditWebpanel(actor, "PASSWORD_RESET_BY_ADMIN", account, nil); err != nil {
@@ -165,18 +165,18 @@ func (s *wsSession) accountCommand(command string, payload map[string]any) (any,
 		if !actor.Account.IsAdmin {
 			return nil, fmt.Errorf("administrator permission is required")
 		}
-		account, err := s.auth.hardened.store.ByID(ctx, stringValue(payload, "id"))
+		account, err := s.auth.accounts.store.ByID(ctx, stringValue(payload, "id"))
 		if err != nil {
 			return nil, err
 		}
 		if err := s.auditWebpanel(actor, "MFA_RESET_REQUESTED_BY_ADMIN", account, nil); err != nil {
 			return nil, err
 		}
-		if err := s.auth.hardened.store.SetMFA(ctx, account.ID, "", false); err != nil {
+		if err := s.auth.accounts.store.SetMFA(ctx, account.ID, "", false); err != nil {
 			return nil, err
 		}
-		s.auth.hardened.ResetLoginLimits(ctx, account.Username, account.LastIP)
-		if err := s.auth.hardened.RevokeUser(ctx, account.ID); err != nil {
+		s.auth.accounts.ResetLoginLimits(ctx, account.Username, account.LastIP)
+		if err := s.auth.accounts.RevokeUser(ctx, account.ID); err != nil {
 			return nil, err
 		}
 		if err := s.auditWebpanel(actor, "MFA_RESET_BY_ADMIN", account, nil); err != nil {
@@ -187,18 +187,18 @@ func (s *wsSession) accountCommand(command string, payload map[string]any) (any,
 		if !actor.Account.IsAdmin {
 			return nil, fmt.Errorf("administrator permission is required")
 		}
-		account, err := s.auth.hardened.store.ByID(ctx, stringValue(payload, "id"))
+		account, err := s.auth.accounts.store.ByID(ctx, stringValue(payload, "id"))
 		if err != nil {
 			return nil, err
 		}
 		if err := s.auditWebpanel(actor, "ACCOUNT_UNLOCK_REQUESTED", account, nil); err != nil {
 			return nil, err
 		}
-		if err := s.auth.hardened.store.Unlock(ctx, account.ID); err != nil {
+		if err := s.auth.accounts.store.Unlock(ctx, account.ID); err != nil {
 			return nil, err
 		}
-		s.auth.hardened.ResetLoginLimits(ctx, account.Username, account.LastIP)
-		if err := s.auth.hardened.RevokeUser(ctx, account.ID); err != nil {
+		s.auth.accounts.ResetLoginLimits(ctx, account.Username, account.LastIP)
+		if err := s.auth.accounts.RevokeUser(ctx, account.ID); err != nil {
 			return nil, err
 		}
 		if err := s.auditWebpanel(actor, "ACCOUNT_UNLOCKED", account, nil); err != nil {
@@ -209,12 +209,12 @@ func (s *wsSession) accountCommand(command string, payload map[string]any) (any,
 		if !actor.Account.IsAdmin {
 			return nil, fmt.Errorf("administrator permission is required")
 		}
-		account, err := s.auth.hardened.store.ByID(ctx, stringValue(payload, "id"))
+		account, err := s.auth.accounts.store.ByID(ctx, stringValue(payload, "id"))
 		if err != nil {
 			return nil, err
 		}
 		sessionID := stringValue(payload, "session_id")
-		sessions, err := s.auth.hardened.ListSessions(ctx, account.ID)
+		sessions, err := s.auth.accounts.ListSessions(ctx, account.ID)
 		if err != nil {
 			return nil, err
 		}
@@ -231,7 +231,7 @@ func (s *wsSession) accountCommand(command string, payload map[string]any) (any,
 		if err := s.auditWebpanel(actor, "SESSION_REVOCATION_REQUESTED_BY_ADMIN", account, map[string]any{"session_id": sessionID}); err != nil {
 			return nil, err
 		}
-		if err := s.auth.hardened.RevokeSession(ctx, sessionID); err != nil {
+		if err := s.auth.accounts.RevokeSession(ctx, sessionID); err != nil {
 			return nil, err
 		}
 		if err := s.auditWebpanel(actor, "SESSION_REVOKED_BY_ADMIN", account, map[string]any{"session_id": sessionID}); err != nil {
@@ -242,14 +242,14 @@ func (s *wsSession) accountCommand(command string, payload map[string]any) (any,
 		if !actor.Account.IsAdmin {
 			return nil, fmt.Errorf("administrator permission is required")
 		}
-		account, err := s.auth.hardened.store.ByID(ctx, stringValue(payload, "id"))
+		account, err := s.auth.accounts.store.ByID(ctx, stringValue(payload, "id"))
 		if err != nil {
 			return nil, err
 		}
 		if err := s.auditWebpanel(actor, "ALL_SESSIONS_REVOCATION_REQUESTED_BY_ADMIN", account, nil); err != nil {
 			return nil, err
 		}
-		if err := s.auth.hardened.RevokeUser(ctx, account.ID); err != nil {
+		if err := s.auth.accounts.RevokeUser(ctx, account.ID); err != nil {
 			return nil, err
 		}
 		if err := s.auditWebpanel(actor, "ALL_SESSIONS_REVOKED_BY_ADMIN", account, nil); err != nil {
@@ -263,7 +263,7 @@ func (s *wsSession) accountCommand(command string, payload map[string]any) (any,
 		if subtle.ConstantTimeCompare([]byte(stringValue(payload, "confirmation")), []byte("DELETE")) != 1 {
 			return nil, fmt.Errorf("type DELETE to confirm account deletion")
 		}
-		account, err := s.auth.hardened.store.ByID(ctx, stringValue(payload, "id"))
+		account, err := s.auth.accounts.store.ByID(ctx, stringValue(payload, "id"))
 		if err != nil {
 			return nil, err
 		}
@@ -278,10 +278,10 @@ func (s *wsSession) accountCommand(command string, payload map[string]any) (any,
 		if err := s.auditWebpanel(actor, "ACCOUNT_DELETE_REQUESTED", account, nil); err != nil {
 			return nil, err
 		}
-		if err := s.auth.hardened.RevokeUser(ctx, account.ID); err != nil {
+		if err := s.auth.accounts.RevokeUser(ctx, account.ID); err != nil {
 			return nil, err
 		}
-		if err := s.auth.hardened.store.Delete(ctx, account.ID); err != nil {
+		if err := s.auth.accounts.store.Delete(ctx, account.ID); err != nil {
 			return nil, err
 		}
 		if err := s.auditWebpanel(actor, "ACCOUNT_DELETED", account, nil); err != nil {
@@ -291,14 +291,14 @@ func (s *wsSession) accountCommand(command string, payload map[string]any) (any,
 	case "profile.get":
 		return map[string]any{"account": actor.Account, "session": actor.Session, "password_change_required": actor.PasswordChangeRequired}, nil
 	case "profile.sessions":
-		sessions, err := s.auth.hardened.ListSessions(ctx, actor.Account.ID)
+		sessions, err := s.auth.accounts.ListSessions(ctx, actor.Account.ID)
 		if err != nil {
 			return nil, err
 		}
 		return map[string]any{"sessions": sessions}, nil
 	case "profile.session.revoke":
 		sessionID := stringValue(payload, "session_id")
-		sessions, err := s.auth.hardened.ListSessions(ctx, actor.Account.ID)
+		sessions, err := s.auth.accounts.ListSessions(ctx, actor.Account.ID)
 		if err != nil {
 			return nil, err
 		}
@@ -315,7 +315,7 @@ func (s *wsSession) accountCommand(command string, payload map[string]any) (any,
 		if err := s.auditWebpanel(actor, "SESSION_REVOCATION_REQUESTED_BY_USER", actor.Account, map[string]any{"session_id": sessionID}); err != nil {
 			return nil, err
 		}
-		if err := s.auth.hardened.RevokeSession(ctx, sessionID); err != nil {
+		if err := s.auth.accounts.RevokeSession(ctx, sessionID); err != nil {
 			return nil, err
 		}
 		if err := s.auditWebpanel(actor, "SESSION_REVOKED_BY_USER", actor.Account, map[string]any{"session_id": sessionID}); err != nil {
@@ -326,28 +326,28 @@ func (s *wsSession) accountCommand(command string, payload map[string]any) (any,
 		if !actor.Account.AllowUserPasswordChange {
 			return nil, &AuthError{Code: "password_change_forbidden", Detail: "This account is not allowed to change its password.", HTTPStatus: http.StatusForbidden}
 		}
-		ok, err := s.auth.hardened.verifyPassword(ctx, actor.Account.passwordHash, stringValue(payload, "current_password"))
+		ok, err := s.auth.accounts.verifyPassword(ctx, actor.Account.passwordHash, stringValue(payload, "current_password"))
 		if err != nil {
 			return nil, err
 		}
 		if !ok {
 			return nil, fmt.Errorf("current password is incorrect")
 		}
-		hash, err := s.auth.hardened.hashPassword(stringValue(payload, "new_password"))
+		hash, err := s.auth.accounts.hashPassword(stringValue(payload, "new_password"))
 		if err != nil {
 			return nil, err
 		}
 		if err := s.auditWebpanel(actor, "PASSWORD_CHANGE_REQUESTED_BY_USER", actor.Account, nil); err != nil {
 			return nil, err
 		}
-		if err := s.auth.hardened.store.SetPasswordIfAuthVersion(ctx, actor.Account.ID, hash, actor.Account.authVersion); err != nil {
+		if err := s.auth.accounts.store.SetPasswordIfAuthVersion(ctx, actor.Account.ID, hash, actor.Account.authVersion); err != nil {
 			if errors.Is(err, errAccountVersionChanged) {
 				return nil, &AuthError{Code: "session_changed", Detail: "The account changed while the password update was in progress. Sign in again.", HTTPStatus: http.StatusConflict}
 			}
 			return nil, err
 		}
-		s.auth.hardened.ResetLoginLimits(ctx, actor.Account.Username, actor.Session.IP)
-		if err := s.auth.hardened.RevokeUser(ctx, actor.Account.ID); err != nil {
+		s.auth.accounts.ResetLoginLimits(ctx, actor.Account.Username, actor.Session.IP)
+		if err := s.auth.accounts.RevokeUser(ctx, actor.Account.ID); err != nil {
 			return nil, err
 		}
 		if err := s.auditWebpanel(actor, "PASSWORD_CHANGED_BY_USER", actor.Account, nil); err != nil {
@@ -454,7 +454,7 @@ func accountPolicyFromPayload(account Account, payload map[string]any) Account {
 }
 
 func (s *wsSession) requireAnotherAdministrator(ctx context.Context, excludedID string) error {
-	accounts, err := s.auth.hardened.ListAccounts(ctx)
+	accounts, err := s.auth.accounts.ListAccounts(ctx)
 	if err != nil {
 		return err
 	}
@@ -467,7 +467,7 @@ func (s *wsSession) requireAnotherAdministrator(ctx context.Context, excludedID 
 }
 
 func (s *wsSession) auditWebpanel(actor Identity, action string, target Account, details map[string]any) error {
-	if s.auth.hardened.audit == nil || !actor.Account.LoggingEnabled {
+	if s.auth.accounts.audit == nil || !actor.Account.LoggingEnabled {
 		return nil
 	}
 	if details == nil {
@@ -475,7 +475,7 @@ func (s *wsSession) auditWebpanel(actor Identity, action string, target Account,
 	}
 	details["target_account_id"] = target.ID
 	details["target_username"] = target.Username
-	if err := s.auth.hardened.audit.Append("webpanel", AuditEvent{
+	if err := s.auth.accounts.audit.Append("webpanel", AuditEvent{
 		Event: action, ActorID: actor.Account.ID, ActorUsername: actor.Account.Username,
 		SessionID: actor.Session.ID, IP: actor.Session.IP, UserAgent: actor.Session.UserAgent,
 		Details: details,

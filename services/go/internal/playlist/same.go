@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/meowraii/haze-weather-radio/services/go/internal/alertmodel"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/locationdb"
 )
 
@@ -196,16 +197,35 @@ func sameLocationsFromData(data map[string]any) []string {
 	locations := stringListAny(firstValue(nil, data, "same_locations", "locations"))
 	out := make([]string, 0, len(locations))
 	seen := map[string]struct{}{}
-	for _, raw := range locations {
+	add := func(raw string) {
+		if len(out) >= 31 {
+			return
+		}
 		code := sameLocationCode(raw)
 		if code == "" {
-			continue
+			return
 		}
 		if _, ok := seen[code]; ok {
-			continue
+			return
 		}
 		seen[code] = struct{}{}
 		out = append(out, code)
+	}
+	if packet, ok := alertmodel.FromMap(data); ok {
+		for _, location := range packet.Areas.Locations {
+			if !location.Actionable || location.Ambiguous || strings.TrimSpace(location.CanonicalID) == "" {
+				continue
+			}
+			for _, identifier := range location.CanonicalIdentifiers {
+				scheme := strings.ToLower(strings.TrimSpace(identifier.Scheme))
+				if scheme == "same" || scheme == "fips" || scheme == "clc" {
+					add(identifier.Value)
+				}
+			}
+		}
+	}
+	for _, raw := range locations {
+		add(raw)
 		if len(out) >= 31 {
 			break
 		}

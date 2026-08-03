@@ -1,7 +1,9 @@
 import { PanelClient } from './lib/ws-client.js';
 import { session } from './lib/session.js';
+import { initTheme } from './lib/theme.js';
 
 const API_BASE = '/api/public/v1';
+const PUBLIC_BASEMAP_PROFILE_URL = `${API_BASE}/map/basemap`;
 
 const summaryCards = document.getElementById('publicSummaryCards');
 const buildInfo = document.getElementById('publicBuildInfo');
@@ -21,6 +23,9 @@ const listenPanel = document.getElementById('publicListenPanel');
 const publicAlertsSection = document.getElementById('publicAlertsSection');
 const publicTlsNotice = document.getElementById('publicTlsNotice');
 const publicTlsNoticeText = document.getElementById('publicTlsNoticeText');
+const themeToggle = document.getElementById('themeToggle');
+
+initTheme(themeToggle);
 
 let summaryState = null;
 const currentPath = window.location.pathname.replace(/\/+$/, '') || '/';
@@ -46,6 +51,11 @@ let lastListenSignature = '';
 let lastNoticeText = '';
 let activeAlertTab = 'accepted';
 let publicFeedTokenReconnectAttempted = false;
+let listenMap = null;
+let listenMapPopup = null;
+let listenMapAbort = null;
+let listenAlertAbort = null;
+let listenAlertReloadTimer = null;
 
 function removeTokenFromPublicURL() {
     try {
@@ -662,6 +672,29 @@ function cardMarkup(feed) {
         : (canPlay ? 'ready' : (summaryState?.media_available ? 'unavailable' : 'waiting'));
     const httpURL = canHTTP ? httpStreamURL(feedId, false, prefs.mode === 'http' ? prefs.codec : DEFAULT_HTTP_CODEC) : '';
     const httpSelected = prefs.mode === 'http';
+    const playerControls = canPlay ? `
+            <div class="public-feed-controls">
+                <div class="public-feed-listeners" data-feed-listeners="${escapeHtml(feedId)}">
+                    <span class="public-feed-listener-metric" data-feed-listener-current-metric="${escapeHtml(feedId)}" title="Concurrent listeners" aria-label="Concurrent listeners: ${escapeHtml(listenerCountLabel(listeners.current))}">
+                        <i data-lucide="headphones" width="16" height="16"></i>
+                        <strong data-feed-listener-current="${escapeHtml(feedId)}">${escapeHtml(listenerCountLabel(listeners.current))}</strong>
+                    </span>
+                    <span class="public-feed-listener-metric public-feed-listener-peak" data-feed-listener-peak-metric="${escapeHtml(feedId)}" title="${escapeHtml(peakListenerTitle(listeners))}" aria-label="Peak concurrent listeners: ${escapeHtml(peakListenerLabel(listeners.peak))}">
+                        <i data-lucide="chart-no-axes-combined" width="16" height="16"></i>
+                        <strong data-feed-listener-peak="${escapeHtml(feedId)}">${escapeHtml(peakListenerLabel(listeners.peak))}</strong>
+                    </span>
+                </div>
+                <div class="public-feed-audio-row">
+                    <audio class="public-feed-audio" data-feed-audio="${escapeHtml(feedId)}" data-feed-http-enabled="${canHTTP ? '1' : '0'}" ${httpSelected && canHTTP ? `src="${escapeHtml(httpURL)}"` : ''} controls playsinline preload="none"></audio>
+                    ${canHTTP ? `
+                        <button class="btn-action public-player-btn public-feed-copy-btn" type="button" data-feed-share="${escapeHtml(feedId)}" title="Copy HTTP stream link">
+                            <i data-lucide="copy" width="15" height="15"></i>
+                            <span>Copy</span>
+                        </button>
+                    ` : ''}
+                </div>
+            </div>
+    ` : '';
 
     return `
         <article class="feed-card public-feed-card" data-feed-card="${escapeHtml(feedId)}" data-feed-state="${escapeHtml(feedState)}" data-feed-mode-selected="${escapeHtml(prefs.mode)}" role="link" tabindex="0" aria-label="Open ${escapeHtml(siteNames)} feed">
@@ -679,25 +712,7 @@ function cardMarkup(feed) {
                     </div>
                 </div>
             </div>
-            <div class="public-feed-controls">
-                <div class="public-feed-listeners" data-feed-listeners="${escapeHtml(feedId)}">
-                    <span class="public-feed-listener-metric" data-feed-listener-current-metric="${escapeHtml(feedId)}" title="Concurrent listeners" aria-label="Concurrent listeners: ${escapeHtml(listenerCountLabel(listeners.current))}">
-                        <i data-lucide="headphones" width="16" height="16"></i>
-                        <strong data-feed-listener-current="${escapeHtml(feedId)}">${escapeHtml(listenerCountLabel(listeners.current))}</strong>
-                    </span>
-                    <span class="public-feed-listener-metric public-feed-listener-peak" data-feed-listener-peak-metric="${escapeHtml(feedId)}" title="${escapeHtml(peakListenerTitle(listeners))}" aria-label="Peak concurrent listeners: ${escapeHtml(peakListenerLabel(listeners.peak))}">
-                        <i data-lucide="chart-no-axes-combined" width="16" height="16"></i>
-                        <strong data-feed-listener-peak="${escapeHtml(feedId)}">${escapeHtml(peakListenerLabel(listeners.peak))}</strong>
-                    </span>
-                </div>
-                <div class="public-feed-audio-row">
-                    <audio class="public-feed-audio" data-feed-audio="${escapeHtml(feedId)}" data-feed-http-enabled="${canHTTP ? '1' : '0'}" ${httpSelected && canHTTP ? `src="${escapeHtml(httpURL)}"` : ''} controls playsinline preload="none" ${canPlay ? '' : 'hidden'}></audio>
-                    <button class="btn-action public-player-btn public-feed-copy-btn" type="button" data-feed-share="${escapeHtml(feedId)}" title="Copy HTTP stream link" ${canHTTP ? '' : 'disabled'}>
-                        <i data-lucide="copy" width="15" height="15"></i>
-                        <span>Copy</span>
-                    </button>
-                </div>
-            </div>
+            ${playerControls}
         </article>
     `;
 }
@@ -1071,10 +1086,14 @@ function renderFeeds(feeds) {
     for (const feed of feeds) {
         const feedId = String(feed.id || '');
         const existing = findFeedElement('feed-card', feedId);
-        if (existing && feedPlayers.has(feedId)) {
+        const canPlay = feedCanWebRTC(feed) || feedCanHTTP(feed);
+        if (existing && feedPlayers.has(feedId) && canPlay) {
             updateExistingFeedCard(existing, feed);
             fragment.appendChild(existing);
         } else {
+            if (!canPlay && feedPlayers.has(feedId)) {
+                stopFeed(feedId, { silent: true });
+            }
             fragment.appendChild(createFeedCard(feed));
         }
     }
@@ -2779,9 +2798,733 @@ function webRTCOutputMixerDisabled() {
     return !webRTCOutputMixerEnabled();
 }
 
+function destroyListenMap() {
+    listenMapAbort?.abort();
+    listenMapAbort = null;
+    listenAlertAbort?.abort();
+    listenAlertAbort = null;
+    if (listenAlertReloadTimer) window.clearTimeout(listenAlertReloadTimer);
+    listenAlertReloadTimer = null;
+    listenMapPopup?.remove();
+    listenMapPopup = null;
+    listenMap?.remove();
+    listenMap = null;
+}
+
+function feedMapURL(feedID, alerts = false, bounds = null) {
+    const params = new URLSearchParams({ feed: feedID });
+    if (alerts) {
+        params.set('alerts', '1');
+        if (bounds) params.set('bbox', [bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth()].join(','));
+    }
+    return `${API_BASE}/feed/map?${params.toString()}`;
+}
+
+function fallbackFeedMapStyle() {
+    return {
+        version: 8,
+        sources: {},
+        layers: [{ id: 'background', type: 'background', paint: { 'background-color': '#071018' } }],
+    };
+}
+
+function validPublicBasemapProfile(profile) {
+    try {
+        const styleURL = new URL(String(profile?.style_url || ''));
+        const satelliteURL = new URL(String(profile?.satellite?.tile_url || ''));
+        return styleURL.protocol === 'https:'
+            && styleURL.hostname === 'tiles.openfreemap.org'
+            && styleURL.pathname === '/styles/dark'
+            && !styleURL.search
+            && !styleURL.hash
+            && satelliteURL.protocol === 'https:'
+            && satelliteURL.hostname === 'server.arcgisonline.com'
+            && decodeURIComponent(satelliteURL.pathname).toLowerCase() === '/arcgis/rest/services/world_imagery/mapserver/tile/{z}/{y}/{x}'
+            && !satelliteURL.search
+            && !satelliteURL.hash
+            && Number(profile?.satellite?.max_zoom) >= 1
+            && Number(profile?.satellite?.max_zoom) <= 20;
+    } catch {
+        return false;
+    }
+}
+
+async function fetchPublicBasemapProfile(signal) {
+    const response = await fetch(PUBLIC_BASEMAP_PROFILE_URL, {
+        method: 'GET',
+        credentials: 'same-origin',
+        headers: session.authHeaders({ Accept: 'application/json' }),
+        signal,
+    });
+    if (!response.ok) return null;
+    const profile = await response.json();
+    return validPublicBasemapProfile(profile) ? profile : null;
+}
+
+async function fetchFeedMap(feedID, alerts, signal, bounds = null) {
+    const response = await fetch(feedMapURL(feedID, alerts, bounds), {
+        method: 'GET',
+        credentials: 'same-origin',
+        headers: session.authHeaders({ Accept: 'application/json' }),
+        signal,
+    });
+    if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.detail || `Location map request failed: ${response.status}`);
+    }
+    return response.json();
+}
+
+function locationCoordinateText(location) {
+    const latitude = Number(location?.latitude);
+    const longitude = Number(location?.longitude);
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return 'Unavailable';
+    return `${latitude.toFixed(4)}, ${longitude.toFixed(4)}`;
+}
+
+function locationCodeValues(...values) {
+    const codes = new Set();
+    const add = (value) => {
+        if (typeof value === 'string') {
+            const code = value.trim();
+            if (code) codes.add(code);
+        } else if (Array.isArray(value)) {
+            value.forEach(add);
+        }
+    };
+    values.forEach(add);
+    return [...codes].sort((left, right) => left.localeCompare(right));
+}
+
+async function copyLocationValue(value, button, label) {
+    let copied = false;
+    try {
+        if (navigator.clipboard?.writeText) {
+            await navigator.clipboard.writeText(value);
+            copied = true;
+        }
+    } catch {
+        // The fallback below covers browsers that deny the Clipboard API here.
+    }
+    if (!copied) {
+        const fallback = document.createElement('textarea');
+        fallback.value = value;
+        fallback.setAttribute('readonly', '');
+        fallback.style.position = 'fixed';
+        fallback.style.opacity = '0';
+        document.body.append(fallback);
+        fallback.select();
+        try {
+            copied = document.execCommand('copy');
+        } finally {
+            fallback.remove();
+        }
+    }
+    const originalLabel = `Copy ${label}`;
+    button.textContent = copied ? '✓' : '!';
+    button.dataset.copyState = copied ? 'copied' : 'failed';
+    button.setAttribute('aria-label', copied ? `Copied ${label}` : `Could not copy ${label}`);
+    button.title = copied ? `Copied ${label}` : `Could not copy ${label}`;
+    window.setTimeout(() => {
+        button.textContent = '⧉';
+        button.dataset.copyState = '';
+        button.setAttribute('aria-label', originalLabel);
+        button.title = originalLabel;
+    }, 1400);
+}
+
+function locationCopyButton(value, label) {
+    const button = document.createElement('button');
+    const copyLabel = `Copy ${label}`;
+    button.type = 'button';
+    button.className = 'public-location-copy-button';
+    button.dataset.locationCopyValue = value;
+    button.setAttribute('aria-label', copyLabel);
+    button.title = copyLabel;
+    button.textContent = '⧉';
+    button.addEventListener('click', () => {
+        void copyLocationValue(value, button, label);
+    });
+    return button;
+}
+
+function appendLocationCode(cell, labelText, code) {
+    const pair = document.createElement('span');
+    pair.className = 'public-location-code-pair';
+    pair.dataset.locationCode = code;
+    const value = document.createElement('span');
+    value.className = 'public-location-code-value';
+    value.textContent = code;
+    pair.append(value, locationCopyButton(code, `${labelText} code ${code}`));
+    cell.append(pair);
+}
+
+function appendLocationCodeColumn(cell, label, values) {
+    cell.classList.add('public-location-code-cell');
+    if (!values.length) {
+        cell.textContent = 'Unavailable';
+        return;
+    }
+    for (const code of values) appendLocationCode(cell, label, code);
+}
+
+function appendLocationCoordinates(cell, location) {
+    cell.classList.add('public-location-coordinate-cell');
+    const coordinateText = locationCoordinateText(location);
+    if (coordinateText === 'Unavailable') {
+        cell.textContent = coordinateText;
+        return;
+    }
+    const coordinate = document.createElement('span');
+    coordinate.className = 'public-location-coordinate';
+    coordinate.dataset.locationCoordinate = coordinateText;
+    const value = document.createElement('span');
+    value.className = 'public-location-coordinate-value';
+    value.textContent = coordinateText;
+    coordinate.append(value, locationCopyButton(coordinateText, `coordinates ${coordinateText}`));
+    cell.append(coordinate);
+}
+
+function feedMapLocationColumns(locations) {
+    const countries = new Set(locations.map((location) => String(location?.country || '').toUpperCase()));
+    const hasSGC = countries.has('CA') || locations.some((location) => locationCodeValues(location?.sgc_codes).length);
+    const hasUSCodes = countries.has('US') || locations.some((location) => locationCodeValues(
+        location?.fips_codes,
+        location?.nws_county_codes,
+        location?.nws_zone_codes,
+    ).length);
+    const columns = [
+        { key: 'name', label: 'Location Name', type: 'name' },
+        {
+            key: 'same',
+            label: 'SAME',
+            type: 'code',
+            values: (location) => locationCodeValues(location?.same_codes, location?.same_code),
+        },
+    ];
+    if (hasSGC) {
+        columns.push({
+            key: 'sgc',
+            label: 'SGC',
+            type: 'code',
+            values: (location) => locationCodeValues(location?.sgc_codes),
+        });
+    }
+    if (hasUSCodes) {
+        columns.push(
+            {
+                key: 'fips',
+                label: 'FIPS',
+                type: 'code',
+                values: (location) => locationCodeValues(location?.fips_codes),
+            },
+            {
+                key: 'nws-county',
+                label: 'NWS County',
+                type: 'code',
+                values: (location) => locationCodeValues(location?.nws_county_codes),
+            },
+            {
+                key: 'nws-zone',
+                label: 'NWS Zone',
+                type: 'code',
+                values: (location) => locationCodeValues(location?.nws_zone_codes),
+            },
+        );
+    }
+    columns.push({ key: 'coordinates', label: 'Lat/Lon', type: 'coordinates' });
+    return columns;
+}
+
+function renderFeedMapLocationHeader(columns) {
+    const head = listenPanel?.querySelector('[data-feed-location-head]');
+    if (!head) return;
+    const row = document.createElement('tr');
+    for (const column of columns) {
+        const header = document.createElement('th');
+        header.scope = 'col';
+        header.dataset.locationColumn = column.key;
+        header.textContent = column.label;
+        row.append(header);
+    }
+    head.replaceChildren(row);
+}
+
+function renderFeedMapLocations(locations) {
+    const body = listenPanel?.querySelector('[data-feed-location-rows]');
+    if (!body) return new Map();
+    const locationItems = Array.isArray(locations) ? locations : [];
+    const columns = feedMapLocationColumns(locationItems);
+    renderFeedMapLocationHeader(columns);
+    body.replaceChildren();
+    const rows = new Map();
+    for (const location of locationItems) {
+        const row = document.createElement('tr');
+        row.dataset.locationKey = String(location.key || '');
+        for (const column of columns) {
+            const cell = document.createElement('td');
+            cell.dataset.locationColumn = column.key;
+            if (column.type === 'name') {
+                cell.textContent = location.name || 'Unnamed location';
+            } else if (column.type === 'code') {
+                appendLocationCodeColumn(cell, column.label, column.values(location));
+            } else {
+                appendLocationCoordinates(cell, location);
+            }
+            row.append(cell);
+        }
+        body.append(row);
+        rows.set(row.dataset.locationKey, row);
+    }
+    if (!body.children.length) {
+        const row = document.createElement('tr');
+        const cell = document.createElement('td');
+        cell.colSpan = columns.length;
+        cell.className = 'public-location-empty';
+        cell.textContent = 'No mapped CLCs or counties are configured for this feed.';
+        row.append(cell);
+        body.append(row);
+    }
+    return rows;
+}
+
+function geometryBounds(featureCollection) {
+    const bounds = new window.maplibregl.LngLatBounds();
+    let populated = false;
+    const visit = (coordinates) => {
+        if (!Array.isArray(coordinates)) return;
+        if (coordinates.length >= 2 && Number.isFinite(Number(coordinates[0])) && Number.isFinite(Number(coordinates[1]))) {
+            bounds.extend([Number(coordinates[0]), Number(coordinates[1])]);
+            populated = true;
+            return;
+        }
+        coordinates.forEach(visit);
+    };
+    for (const feature of featureCollection?.features || []) visit(feature?.geometry?.coordinates);
+    return populated ? bounds : null;
+}
+
+function alertFillExpression() {
+    return [
+        'match', ['downcase', ['coalesce', ['get', 'severity'], 'unknown']],
+        'extreme', '#991b1b',
+        'severe', '#dc2626',
+        'moderate', '#f59e0b',
+        'minor', '#facc15',
+        '#a855f7',
+    ];
+}
+
+function addDetailedBasemapContextLayers(map) {
+    const source = 'openmaptiles';
+    if (!map.getSource(source)) return;
+
+    const styleLayers = map.getStyle()?.layers || [];
+    for (const layer of styleLayers) {
+        if (layer.source === source && layer['source-layer'] === 'boundary' && layer.type === 'line') {
+            map.setLayoutProperty(layer.id, 'visibility', 'none');
+        }
+        if (layer.source === source && layer['source-layer'] === 'place' && layer.type === 'symbol') {
+            map.setPaintProperty(layer.id, 'text-color', '#f1f5f9');
+            map.setPaintProperty(layer.id, 'text-halo-color', 'rgba(3, 8, 18, 0.96)');
+            map.setPaintProperty(layer.id, 'text-halo-width', 1.45);
+        }
+    }
+
+    const firstPlaceLabel = styleLayers.find((layer) => layer.source === source && layer['source-layer'] === 'place' && layer.type === 'symbol')?.id;
+    const addLayer = (layer) => {
+        if (!map.getLayer(layer.id)) map.addLayer(layer, firstPlaceLabel);
+    };
+    const boundaryFilter = (levels) => [
+        'all',
+        ['in', ['to-string', ['get', 'admin_level']], ['literal', levels.map(String)]],
+        ['!=', ['to-string', ['coalesce', ['get', 'maritime'], 0]], '1'],
+    ];
+
+    addLayer({
+        id: 'haze-context-country-boundaries',
+        type: 'line',
+        source,
+        'source-layer': 'boundary',
+        minzoom: 1,
+        filter: boundaryFilter([2]),
+        paint: {
+            'line-color': 'rgba(226, 232, 240, 0.86)',
+            'line-width': ['interpolate', ['linear'], ['zoom'], 1, 1.05, 7, 2.15],
+        },
+    });
+    addLayer({
+        id: 'haze-context-state-boundaries',
+        type: 'line',
+        source,
+        'source-layer': 'boundary',
+        minzoom: 3,
+        filter: boundaryFilter([4]),
+        paint: {
+            'line-color': 'rgba(148, 163, 184, 0.78)',
+            'line-width': ['interpolate', ['linear'], ['zoom'], 3, 0.75, 10, 1.55],
+        },
+    });
+    addLayer({
+        id: 'haze-context-municipal-boundaries',
+        type: 'line',
+        source,
+        'source-layer': 'boundary',
+        minzoom: 5.5,
+        filter: boundaryFilter([6, 7, 8, 9, 10]),
+        paint: {
+            'line-color': 'rgba(125, 211, 252, 0.48)',
+            'line-width': ['interpolate', ['linear'], ['zoom'], 5.5, 0.55, 13, 1.25],
+            'line-dasharray': [2.5, 1.5],
+        },
+    });
+    addLayer({
+        id: 'haze-context-border-inspect',
+        type: 'line',
+        source,
+        'source-layer': 'boundary',
+        minzoom: 3,
+        filter: boundaryFilter([2, 4, 6, 7, 8, 9, 10]),
+        layout: { visibility: 'none' },
+        paint: {
+            'line-color': 'rgba(196, 181, 253, 0.46)',
+            'line-width': ['interpolate', ['linear'], ['zoom'], 3, 1, 13, 1.8],
+        },
+    });
+    addLayer({
+        id: 'haze-context-border-hover',
+        type: 'line',
+        source,
+        'source-layer': 'boundary',
+        minzoom: 3,
+        filter: ['==', ['get', 'name'], '__haze_no_border__'],
+        layout: { visibility: 'none' },
+        paint: {
+            'line-color': '#fbbf24',
+            'line-width': ['interpolate', ['linear'], ['zoom'], 3, 2.2, 13, 4],
+        },
+    });
+
+    for (const layer of styleLayers) {
+        if (layer.source === source && layer['source-layer'] === 'place' && layer.type === 'symbol' && map.getLayer(layer.id)) {
+            map.moveLayer(layer.id);
+        }
+    }
+}
+
+function readableMapProperty(key) {
+    const labels = {
+        admin_level: 'Admin level', alert_id: 'Alert ID', area_description: 'Area', certainty: 'Certainty',
+        code: 'Source code', country: 'Country', effective: 'Effective', event: 'Event', expires: 'Expires',
+        fips_codes: 'FIPS', geometry_method: 'Geometry', headline: 'Headline', latitude: 'Latitude',
+        location_name: 'Location', longitude: 'Longitude', message_type: 'Message type', nws_county_codes: 'NWS county',
+        nws_zone_codes: 'NWS zone', onset: 'Onset', provider_version: 'Dataset', same_code: 'SAME',
+        same_codes: 'SAME codes', sender: 'Sender', sender_name: 'Sender name', severity: 'Severity', sgc_codes: 'SGC',
+        source: 'Source', status: 'Status', urgency: 'Urgency', class: 'Class', disputed: 'Disputed', maritime: 'Maritime',
+    };
+    return labels[key] || key.replaceAll('_', ' ').replace(/^./, (letter) => letter.toUpperCase());
+}
+
+function mapPopupContent(title, properties, excluded = []) {
+    const content = document.createElement('div');
+    const heading = document.createElement('strong');
+    heading.textContent = String(title || 'Map feature');
+    content.append(heading);
+    const omitted = new Set(excluded);
+    const entries = Object.entries(properties || {})
+        .filter(([key, value]) => !omitted.has(key) && value !== null && value !== undefined && String(value).trim() !== '')
+        .sort(([left], [right]) => readableMapProperty(left).localeCompare(readableMapProperty(right)));
+    if (entries.length) {
+        const details = document.createElement('dl');
+        for (const [key, value] of entries) {
+            const term = document.createElement('dt');
+            const description = document.createElement('dd');
+            term.textContent = readableMapProperty(key);
+            description.textContent = String(value);
+            details.append(term, description);
+        }
+        content.append(details);
+    }
+    return content;
+}
+
+function borderHoverFilter(properties) {
+    const filters = [];
+    for (const key of ['admin_level', 'name', 'name_en', 'name:en']) {
+        const value = properties?.[key];
+        if (value !== undefined && value !== null && String(value) !== '') filters.push(['==', ['to-string', ['get', key]], String(value)]);
+    }
+    return filters.length ? ['all', ...filters] : ['==', ['get', 'name'], '__haze_no_border__'];
+}
+
+function addSatelliteBasemapLayer(map, profile) {
+    const satellite = profile?.satellite;
+    if (!satellite?.tile_url || map.getSource('haze-satellite')) return false;
+    map.addSource('haze-satellite', {
+        type: 'raster',
+        tiles: [satellite.tile_url],
+        tileSize: 256,
+        maxzoom: Number(satellite.max_zoom || 19),
+        attribution: satellite.attribution || '',
+    });
+    const firstLabel = (map.getStyle()?.layers || []).find((layer) => layer.type === 'symbol')?.id;
+    map.addLayer({
+        id: 'haze-satellite-layer',
+        type: 'raster',
+        source: 'haze-satellite',
+        layout: { visibility: 'none' },
+        paint: { 'raster-fade-duration': 0, 'raster-contrast': 0.12, 'raster-saturation': -0.08 },
+    }, firstLabel);
+    return true;
+}
+
+function addBasemapModeControl(map) {
+    const container = document.createElement('div');
+    container.className = 'maplibregl-ctrl maplibregl-ctrl-group haze-basemap-control';
+    const buttons = new Map();
+    const selectMode = (mode) => {
+        const satellite = mode === 'satellite';
+        if (map.getLayer('haze-satellite-layer')) {
+            map.setLayoutProperty('haze-satellite-layer', 'visibility', satellite ? 'visible' : 'none');
+        }
+        for (const [candidate, button] of buttons.entries()) {
+            const active = candidate === mode;
+            button.dataset.active = String(active);
+            button.setAttribute('aria-pressed', String(active));
+        }
+    };
+    for (const [mode, label] of [['vector', 'Vector'], ['satellite', 'Satellite']]) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.textContent = label;
+        button.title = `Show ${label.toLowerCase()} basemap`;
+        button.setAttribute('aria-label', button.title);
+        button.addEventListener('click', () => selectMode(mode));
+        buttons.set(mode, button);
+        container.append(button);
+    }
+    selectMode('vector');
+    map.addControl({
+        onAdd: () => container,
+        onRemove: () => container.remove(),
+    }, 'top-left');
+}
+
+function setFeedMapStatus(text, state = 'pending') {
+    const status = listenPanel?.querySelector('[data-feed-map-status]');
+    if (!status) return;
+    status.textContent = text;
+    status.dataset.state = state;
+}
+
+async function initializeFeedMap(feedID) {
+    destroyListenMap();
+    const mapElement = listenPanel?.querySelector('[data-feed-map]');
+    const alertToggle = listenPanel?.querySelector('[data-feed-alert-toggle]');
+    const borderToggle = listenPanel?.querySelector('[data-feed-border-toggle]');
+    if (!mapElement || !window.maplibregl) {
+        setFeedMapStatus('MapLibre is unavailable in this browser.', 'err');
+        return;
+    }
+    listenMapAbort = new AbortController();
+    const signal = listenMapAbort.signal;
+    if (alertToggle) alertToggle.disabled = true;
+    if (borderToggle) borderToggle.disabled = true;
+    try {
+        setFeedMapStatus('Loading served locations from haze-location...', 'pending');
+        const [payload, basemapProfile] = await Promise.all([
+            fetchFeedMap(feedID, false, signal),
+            fetchPublicBasemapProfile(signal).catch(() => null),
+        ]);
+        if (signal.aborted) return;
+        const rows = renderFeedMapLocations(payload.locations);
+        const servedCount = Array.isArray(payload.locations) ? payload.locations.length : 0;
+        const servedStatus = () => `${servedCount} served location${servedCount === 1 ? '' : 's'} from catalog ${payload.catalog_generation || 'unknown'}.`;
+        window.maplibregl.setWorkerUrl('/assets/vendor/maplibre/maplibre-gl-csp-worker.js?v=5.24.0');
+        let mapLayersAttached = false;
+        let basemapFallbackAttempted = !basemapProfile;
+        listenMap = new window.maplibregl.Map({
+            container: mapElement,
+            attributionControl: false,
+            center: [-106, 54],
+            zoom: 2.2,
+            minZoom: 1,
+            maxZoom: 14,
+            maxPitch: 0,
+            pitchWithRotate: false,
+            renderWorldCopies: false,
+            fadeDuration: 0,
+            style: basemapProfile?.style_url || fallbackFeedMapStyle(),
+        });
+        listenMap.addControl(new window.maplibregl.NavigationControl({ showCompass: false }), 'top-right');
+        listenMap.addControl(new window.maplibregl.AttributionControl({
+            compact: true,
+            customAttribution: basemapProfile?.attribution
+                ? `Boundaries: ECCC and NOAA/NWS. ${basemapProfile.attribution}`
+                : 'Boundaries: ECCC and NOAA/NWS',
+        }));
+        const attachMapLayers = () => {
+            if (!listenMap || signal.aborted || mapLayersAttached || !listenMap.isStyleLoaded()) return;
+            mapLayersAttached = true;
+            listenMap.addSource('served-locations', { type: 'geojson', data: payload.coverage });
+            listenMap.addLayer({
+                id: 'served-location-fill', type: 'fill', source: 'served-locations',
+                paint: { 'fill-color': '#06b6d4', 'fill-opacity': 0.38 },
+            });
+            listenMap.addLayer({
+                id: 'served-location-outline', type: 'line', source: 'served-locations',
+                paint: { 'line-color': '#38bdf8', 'line-width': 1.9 },
+            });
+            listenMap.addLayer({
+                id: 'served-location-hover', type: 'line', source: 'served-locations',
+                filter: ['==', ['get', 'key'], ''],
+                paint: { 'line-color': '#fbbf24', 'line-width': 4 },
+            });
+            listenMap.addSource('active-alerts', { type: 'geojson', data: payload.alerts });
+            listenMap.addLayer({
+                id: 'active-alert-fill', type: 'fill', source: 'active-alerts',
+                paint: { 'fill-color': alertFillExpression(), 'fill-opacity': 0.42 },
+            });
+            listenMap.addLayer({
+                id: 'active-alert-outline', type: 'line', source: 'active-alerts',
+                paint: { 'line-color': '#fecaca', 'line-width': 2.6 },
+            });
+            const hasSatellite = addSatelliteBasemapLayer(listenMap, basemapProfile);
+            addDetailedBasemapContextLayers(listenMap);
+            if (hasSatellite) addBasemapModeControl(listenMap);
+            const bounds = geometryBounds(payload.coverage);
+            if (bounds) listenMap.fitBounds(bounds, { padding: 36, maxZoom: 9, duration: 0 });
+            let activeRow = null;
+            listenMap.on('mousemove', 'served-location-fill', (event) => {
+                const feature = event.features?.[0];
+                const properties = feature?.properties || {};
+                const key = String(properties.key || '');
+                listenMap.getCanvas().style.cursor = 'pointer';
+                listenMap.setFilter('served-location-hover', ['==', ['get', 'key'], key]);
+                activeRow?.classList.remove('map-hover');
+                activeRow = rows.get(key) || null;
+                activeRow?.classList.add('map-hover');
+                activeRow?.scrollIntoView({ block: 'nearest' });
+                listenMapPopup ||= new window.maplibregl.Popup({ closeButton: false, closeOnClick: false, offset: 12, anchor: 'bottom', className: 'public-location-popup' });
+                listenMapPopup
+                    .setLngLat(event.lngLat)
+                    .setDOMContent(mapPopupContent(properties.location_name || 'Unnamed location', properties, ['key', 'location_name']))
+                    .addTo(listenMap);
+            });
+            listenMap.on('mouseleave', 'served-location-fill', () => {
+                listenMap.getCanvas().style.cursor = '';
+                listenMap.setFilter('served-location-hover', ['==', ['get', 'key'], '']);
+                activeRow?.classList.remove('map-hover');
+                activeRow = null;
+                listenMapPopup?.remove();
+            });
+
+            listenMap.on('mousemove', 'haze-context-border-inspect', (event) => {
+                if (!borderToggle?.checked) return;
+                const properties = event.features?.[0]?.properties || {};
+                listenMap.getCanvas().style.cursor = 'crosshair';
+                listenMap.setFilter('haze-context-border-hover', borderHoverFilter(properties));
+                const title = properties.name_en || properties['name:en'] || properties.name || 'Administrative boundary';
+                listenMapPopup ||= new window.maplibregl.Popup({ closeButton: false, closeOnClick: false, offset: 12, anchor: 'bottom', className: 'public-location-popup' });
+                listenMapPopup.setLngLat(event.lngLat).setDOMContent(mapPopupContent(title, properties, ['name', 'name_en', 'name:en'])).addTo(listenMap);
+            });
+            listenMap.on('mouseleave', 'haze-context-border-inspect', () => {
+                if (listenMap?.getLayer('haze-context-border-hover')) {
+                    listenMap.setFilter('haze-context-border-hover', ['==', ['get', 'name'], '__haze_no_border__']);
+                }
+                listenMap.getCanvas().style.cursor = '';
+                listenMapPopup?.remove();
+            });
+            borderToggle?.addEventListener('change', () => {
+                const visibility = borderToggle.checked ? 'visible' : 'none';
+                listenMap.setLayoutProperty('haze-context-border-inspect', 'visibility', visibility);
+                listenMap.setLayoutProperty('haze-context-border-hover', 'visibility', visibility);
+                if (!borderToggle.checked) {
+                    listenMap.setFilter('haze-context-border-hover', ['==', ['get', 'name'], '__haze_no_border__']);
+                    listenMapPopup?.remove();
+                }
+            });
+
+            listenMap.on('mousemove', 'active-alert-fill', (event) => {
+                const properties = event.features?.[0]?.properties || {};
+                listenMap.getCanvas().style.cursor = 'pointer';
+                listenMapPopup ||= new window.maplibregl.Popup({ closeButton: false, closeOnClick: false, offset: 12, anchor: 'bottom', className: 'public-location-popup' });
+                listenMapPopup
+                    .setLngLat(event.lngLat)
+                    .setDOMContent(mapPopupContent(properties.headline || properties.event || 'Alert in effect', properties, ['headline']))
+                    .addTo(listenMap);
+            });
+            listenMap.on('mouseleave', 'active-alert-fill', () => {
+                listenMap.getCanvas().style.cursor = '';
+                listenMapPopup?.remove();
+            });
+
+            setFeedMapStatus(servedStatus(), servedCount ? 'ok' : 'warn');
+            if (alertToggle) alertToggle.disabled = false;
+            if (borderToggle) borderToggle.disabled = false;
+        };
+        listenMap.on('load', attachMapLayers);
+        listenMap.on('style.load', attachMapLayers);
+        listenMap.on('error', () => {
+            if (!listenMap || signal.aborted || mapLayersAttached) return;
+            if (basemapProfile && !basemapFallbackAttempted) {
+                basemapFallbackAttempted = true;
+                listenMap.setStyle(fallbackFeedMapStyle());
+                setFeedMapStatus('Detailed basemap unavailable. Showing served locations only.', 'warn');
+                return;
+            }
+            setFeedMapStatus('The served-location map could not be rendered.', 'err');
+        });
+        const loadVisibleAlerts = async () => {
+            if (!listenMap?.getSource('active-alerts')) return;
+            listenAlertAbort?.abort();
+            const controller = new AbortController();
+            listenAlertAbort = controller;
+            setFeedMapStatus('Loading alerts in effect for this map view...', 'pending');
+            try {
+                const alertPayload = await fetchFeedMap(feedID, true, controller.signal, listenMap.getBounds());
+                if (controller.signal.aborted || signal.aborted || !listenMap?.getSource('active-alerts')) return;
+                listenMap.getSource('active-alerts').setData(alertPayload.alerts);
+                const count = Number(alertPayload.alert_count || 0);
+                const truncated = alertPayload.alert_truncated ? ' The result limit was reached.' : '';
+                setFeedMapStatus(count ? `${count} active alert area${count === 1 ? '' : 's'} in this map view.${truncated}` : 'No alerts are in effect in this map view.', count ? 'warn' : 'ok');
+            } catch (error) {
+                if (error.name !== 'AbortError') {
+                    setFeedMapStatus(error.message || 'Alerts could not be loaded.', 'err');
+                    alertToggle.checked = false;
+                }
+            } finally {
+                if (listenAlertAbort === controller) listenAlertAbort = null;
+            }
+        };
+        alertToggle?.addEventListener('change', () => {
+            if (!listenMap?.getSource('active-alerts')) return;
+            if (!alertToggle.checked) {
+                listenAlertAbort?.abort();
+                listenAlertAbort = null;
+                listenMap.getSource('active-alerts').setData({ type: 'FeatureCollection', features: [] });
+                setFeedMapStatus(servedStatus(), servedCount ? 'ok' : 'warn');
+                return;
+            }
+            void loadVisibleAlerts();
+        });
+        listenMap.on('moveend', () => {
+            if (!alertToggle?.checked) return;
+            if (listenAlertReloadTimer) window.clearTimeout(listenAlertReloadTimer);
+            listenAlertReloadTimer = window.setTimeout(() => void loadVisibleAlerts(), 180);
+        });
+    } catch (error) {
+        if (error.name !== 'AbortError') setFeedMapStatus(error.message || 'Served locations could not be loaded.', 'err');
+        if (alertToggle) alertToggle.disabled = false;
+        if (borderToggle) borderToggle.disabled = false;
+    }
+}
+
 function renderListen(feeds) {
     if (!listenNotice || !listenPanel) return;
+    currentPublicFeeds = feeds || [];
     if (summaryState?.feeds_access === 'disabled') {
+        destroyListenMap();
         listenNotice.textContent = 'Public feeds are disabled on this system.';
         listenPanel.innerHTML = '';
         return;
@@ -2789,17 +3532,17 @@ function renderListen(feeds) {
     const feedID = requestedListenFeedID(feeds || []);
     const feed = (feeds || []).find((item) => String(item.id || '') === feedID);
     if (!feed) {
+        destroyListenMap();
         listenNotice.textContent = 'No public feed was found for this link.';
         listenPanel.innerHTML = '';
         return;
     }
-    if (!feedCanHTTP(feed)) {
-        listenNotice.textContent = 'This feed does not have public HTTP audio enabled.';
-        listenPanel.innerHTML = '';
-        lastListenSignature = 'unavailable';
-        return;
-    }
-    const codec = requestedListenCodec();
+    const webRTCAvailable = feedCanWebRTC(feed);
+    const httpAvailable = feedCanHTTP(feed);
+    const canPlay = webRTCAvailable || httpAvailable;
+    const preferences = normalizedFeedPreferences(feedID, feed);
+    const mode = preferences.mode === 'webrtc' && webRTCAvailable ? 'webrtc' : 'http';
+    const codec = mode === 'http' ? requestedListenCodec() : preferences.codec;
     const tx = feed.transmitter || {};
     const siteNames = (tx.site_names || [tx.site_name]).filter(Boolean).join(', ') || feed.name || 'Unnamed site';
     const nowPlaying = publicNowPlaying(feed.runtime?.now_playing);
@@ -2808,6 +3551,8 @@ function renderListen(feeds) {
         codec,
         media: Boolean(summaryState?.media_available),
         siteNames,
+        mode,
+        webrtc: Boolean(feed.webrtc_enabled),
         http: Boolean(feed.http_stream_enabled),
     });
     if (listenSignature === lastListenSignature) {
@@ -2818,31 +3563,111 @@ function renderListen(feeds) {
         return;
     }
     lastListenSignature = listenSignature;
-    const streamURL = httpStreamURL(feedID, false, codec);
-    listenNotice.textContent = 'Public HTTP listener ready.';
-    listenPanel.innerHTML = `
-        <article class="feed-card public-listen-card">
-            <div class="public-listen-title">
-                <p class="feed-id">${escapeHtml(feedID)}</p>
-                <h3>${escapeHtml(siteNames)}</h3>
-                <p class="public-feed-now" data-listen-now-playing>${escapeHtml(nowPlaying)}</p>
-            </div>
-            <div class="public-listen-toolbar">
-                <label class="public-listen-field">
-                    <span>Format</span>
-                    <select data-listen-codec>
-                        ${HTTP_CODECS.map(([value, label]) => `
-                            <option value="${value}" ${codec === value ? 'selected' : ''}>${label}</option>
-                        `).join('')}
-                    </select>
-                </label>
-                <a class="btn-action public-player-btn" href="${escapeHtml(streamURL)}" data-listen-raw>
-                    <i data-lucide="link" width="14" height="14"></i>
-                    <span>Raw</span>
-                </a>
-            </div>
-            <audio class="public-listen-audio" src="${escapeHtml(streamURL)}" controls autoplay playsinline preload="none"></audio>
+    const activePlayer = feedPlayers.get(feedID);
+    if (activePlayer && (!canPlay || activePlayer.mode !== mode)) {
+        stopFeed(feedID, { silent: true });
+    }
+    const streamURL = httpAvailable ? httpStreamURL(feedID, false, codec) : '';
+    listenNotice.textContent = !canPlay
+        ? 'Feed information is available. Streaming is not configured for this feed.'
+        : (mode === 'webrtc' ? 'Public WebRTC listener ready.' : 'Public HTTP listener ready.');
+    const titleMarkup = `
+        <div class="public-listen-title">
+            <p class="feed-id">${escapeHtml(feedID)}</p>
+            <h3>${escapeHtml(siteNames)}</h3>
+            <p class="public-feed-now" data-listen-now-playing>${escapeHtml(nowPlaying)}</p>
+        </div>
+    `;
+    let feedInfoMarkup = `
+        <article class="feed-card public-listen-card public-listen-info-card">
+            ${titleMarkup}
+            <p class="public-listen-stream-unavailable">Streaming is not configured for this feed.</p>
         </article>
+    `;
+    if (mode === 'webrtc' && webRTCAvailable) {
+        feedInfoMarkup = `
+            <article class="feed-card public-listen-card public-listen-player-card" data-feed-card="${escapeHtml(feedID)}">
+                ${titleMarkup}
+                <div class="public-listen-toolbar">
+                    <label class="public-listen-field">
+                        <span>Codec</span>
+                        <select data-listen-webrtc-codec>
+                            ${WEBRTC_CODECS.map(([value, label]) => `
+                                <option value="${value}" ${codec === value ? 'selected' : ''}>${label}</option>
+                            `).join('')}
+                        </select>
+                    </label>
+                    <button class="btn-action public-player-btn" type="button" data-feed-play="${escapeHtml(feedID)}" data-feed-playable="1">
+                        <i data-lucide="play" width="14" height="14"></i>
+                        <span>Listen</span>
+                    </button>
+                    <button class="btn-action public-player-btn" type="button" data-feed-stop="${escapeHtml(feedID)}" disabled>
+                        <i data-lucide="square" width="14" height="14"></i>
+                        <span>Stop</span>
+                    </button>
+                </div>
+                <audio class="public-listen-audio" data-feed-audio="${escapeHtml(feedID)}" data-feed-http-enabled="0" controls playsinline preload="none"></audio>
+                <p class="public-player-status" data-feed-status="${escapeHtml(feedID)}">Ready over WebRTC</p>
+            </article>
+        `;
+    } else if (httpAvailable) {
+        feedInfoMarkup = `
+            <article class="feed-card public-listen-card public-listen-player-card">
+                ${titleMarkup}
+                <div class="public-listen-toolbar">
+                    <label class="public-listen-field">
+                        <span>Format</span>
+                        <select data-listen-codec>
+                            ${HTTP_CODECS.map(([value, label]) => `
+                                <option value="${value}" ${codec === value ? 'selected' : ''}>${label}</option>
+                            `).join('')}
+                        </select>
+                    </label>
+                    <a class="btn-action public-player-btn" href="${escapeHtml(streamURL)}" data-listen-raw>
+                        <i data-lucide="link" width="14" height="14"></i>
+                        <span>Raw</span>
+                    </a>
+                </div>
+                <audio class="public-listen-audio" src="${escapeHtml(streamURL)}" controls autoplay playsinline preload="none"></audio>
+            </article>
+        `;
+    }
+    listenPanel.innerHTML = `
+        ${feedInfoMarkup}
+        <div class="public-feed-map-layout">
+            <section class="feed-card public-location-card">
+                <div class="public-feed-map-heading">
+                    <div>
+                        <h3>Locations</h3>
+                    </div>
+                </div>
+                <div class="public-location-table-wrap">
+                    <table class="public-location-table">
+                        <thead data-feed-location-head><tr><th>Location Name</th><th>SAME</th><th>Lat/Lon</th></tr></thead>
+                        <tbody data-feed-location-rows><tr><td colspan="3" class="public-location-empty">Loading locations...</td></tr></tbody>
+                    </table>
+                </div>
+            </section>
+            <section class="feed-card public-map-card">
+                <div class="public-feed-map-heading public-map-toolbar">
+                    <div>
+                        <h3>Coverage Map</h3>
+                    </div>
+                    <div class="public-map-toggles">
+                        <label class="public-map-toggle">
+                            <input type="checkbox" data-feed-border-toggle>
+                            <span>Borders</span>
+                        </label>
+                        <label class="public-map-toggle">
+                            <input type="checkbox" data-feed-alert-toggle>
+                            <span>Alerts in effect</span>
+                        </label>
+                    </div>
+                </div>
+                <p class="status-banner public-map-status" data-feed-map-status>Loading served locations...</p>
+                <div class="public-feed-map" data-feed-map aria-label="Map of served CLCs and counties"></div>
+            </section>
+        </div>
     `;
     const select = listenPanel.querySelector('[data-listen-codec]');
     select?.addEventListener('change', () => {
@@ -2853,6 +3678,43 @@ function renderListen(feeds) {
         const nextURL = listenPageURL(feedID, false, nextCodec, { includeToken: true });
         window.location.assign(nextURL);
     });
+    const webRTCCodec = listenPanel.querySelector('[data-listen-webrtc-codec]');
+    webRTCCodec?.addEventListener('change', () => {
+        publicFeedGlobalPreferences.mode = 'webrtc';
+        publicFeedGlobalPreferences.codec = webRTCCodec.value;
+        writePublicFeedGlobalPreferences();
+        stopFeed(feedID, { silent: true });
+        setPlayerStatus(feedID, 'Codec changed');
+    });
+    const webRTCPlay = listenPanel.querySelector('[data-feed-play]');
+    webRTCPlay?.addEventListener('click', () => {
+        publicFeedGlobalPreferences.mode = 'webrtc';
+        publicFeedGlobalPreferences.codec = webRTCCodec?.value || DEFAULT_WEBRTC_CODEC;
+        writePublicFeedGlobalPreferences();
+        startFeedWebRTC(feedID);
+    });
+    listenPanel.querySelector('[data-feed-stop]')?.addEventListener('click', () => stopFeed(feedID));
+    const webRTCAudio = listenPanel.querySelector('[data-feed-audio]');
+    webRTCAudio?.addEventListener('play', () => {
+        webRTCAudio.dataset.hazeUserPaused = '0';
+        const player = feedPlayers.get(feedID);
+        if (player?.trackAttached) {
+            resumeFeedAudio(feedID, player);
+        } else if (webRTCAudio.dataset.hazeWebRTCStarting !== '1') {
+            webRTCAudio.dataset.hazeWebRTCStarting = '1';
+            startFeedWebRTC(feedID).finally(() => {
+                webRTCAudio.dataset.hazeWebRTCStarting = '0';
+            });
+        }
+    });
+    webRTCAudio?.addEventListener('pause', () => {
+        const player = feedPlayers.get(feedID);
+        if (player && !player.stopping) {
+            webRTCAudio.dataset.hazeUserPaused = '1';
+            setPlayerStatus(feedID, 'Paused');
+        }
+    });
+    initializeFeedMap(feedID);
     window.lucide?.createIcons();
 }
 
@@ -2902,7 +3764,10 @@ document.querySelectorAll('[data-public-alert-tab]').forEach((button) => {
     button.addEventListener('click', () => {
         activeAlertTab = button.dataset.publicAlertTab || 'accepted';
         document.querySelectorAll('[data-public-alert-tab]').forEach((item) => {
-            item.classList.toggle('active', item === button);
+            const active = item === button;
+            item.classList.toggle('active', active);
+            item.setAttribute('aria-selected', active ? 'true' : 'false');
+            item.tabIndex = active ? 0 : -1;
         });
         lastAlertsSignature = '';
         if (summaryState) {

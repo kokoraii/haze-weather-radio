@@ -30,6 +30,11 @@ type rootConfig struct {
 		Go struct {
 			ProductRender productRenderConfig `yaml:"product_render"`
 		} `yaml:"go"`
+		Rust struct {
+			Location struct {
+				Mode string `yaml:"mode"`
+			} `yaml:"location"`
+		} `yaml:"rust"`
 	} `yaml:"services"`
 }
 
@@ -142,11 +147,13 @@ type alertFilterOtherXML struct {
 }
 
 type coverageRegionXML struct {
-	ID             string                 `xml:"id,attr"`
-	Source         string                 `xml:"source,attr"`
-	Name           string                 `xml:"name,attr"`
-	DeriveForecast string                 `xml:"derive_forecast,attr"`
-	Subregions     []coverageSubregionXML `xml:"subregion"`
+	ID                  string                 `xml:"id,attr"`
+	Source              string                 `xml:"source,attr"`
+	Name                string                 `xml:"name,attr"`
+	DeriveForecast      string                 `xml:"derive_forecast,attr"`
+	CanonicalID         string                 `xml:"canonical_id,attr"`
+	ForecastCanonicalID string                 `xml:"forecast_canonical_id,attr"`
+	Subregions          []coverageSubregionXML `xml:"subregion"`
 }
 
 type hydrometricLocationGroupXML struct {
@@ -154,7 +161,8 @@ type hydrometricLocationGroupXML struct {
 }
 
 type coverageSubregionXML struct {
-	ID string `xml:"id,attr"`
+	ID          string `xml:"id,attr"`
+	CanonicalID string `xml:"canonical_id,attr"`
 }
 
 type locationXML struct {
@@ -164,6 +172,7 @@ type locationXML struct {
 	Latitude     string `xml:"latitude,attr"`
 	Longitude    string `xml:"longitude,attr"`
 	NormalID     string `xml:"normal_id,attr"`
+	CanonicalID  string `xml:"canonical_id,attr"`
 }
 
 type transmitterXML struct {

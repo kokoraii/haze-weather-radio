@@ -8,8 +8,9 @@
     <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
     <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
     <link rel="manifest" href="/assets/site.webmanifest">
-    <link rel="stylesheet" href="/assets/styles.css?v=20260709-public-feed-metrics-4">
-    <link rel="stylesheet" href="/assets/layout.css?v=20260709-public-feed-metrics-4">
+    <link rel="stylesheet" href="/assets/vendor/maplibre/maplibre-gl.css?v=5.24.0">
+    <link rel="stylesheet" href="/assets/styles.css?v=20260803-dark-map-1">
+    <link rel="stylesheet" href="/assets/layout.css?v=20260803-dark-map-1">
 </head>
 <body>
     <div class="app-shell public-app-shell">
@@ -39,6 +40,12 @@
                     Admin Login
                 </a>
             </nav>
+
+            <div class="sidebar-footer public-sidebar-footer">
+                <button id="themeToggle" type="button" class="sidebar-icon-btn" title="Toggle theme" aria-label="Toggle theme">
+                    <i data-lucide="sun" width="15" height="15"></i>
+                </button>
+            </div>
         </aside>
 
         <div class="main-wrap">
@@ -87,10 +94,10 @@
 
                 <section class="section-block" id="publicAlertsSection" hidden>
                     <p id="publicAlertsNotice" class="status-banner">Checking alert archive...</p>
-                    <div class="alert-tabs public-alert-tabs" role="tablist" aria-label="Alert archive">
-                        <button class="alert-tab active" type="button" data-public-alert-tab="accepted">Accepted Alerts</button>
-                        <button class="alert-tab" type="button" data-public-alert-tab="rejected">Rejected Alerts</button>
-                        <button class="alert-tab" type="button" data-public-alert-tab="expired">Expired Alerts</button>
+                    <div class="alert-tabs browser-tabs public-alert-tabs" role="tablist" aria-label="Alert archive">
+                        <button class="alert-tab active" type="button" role="tab" aria-selected="true" data-public-alert-tab="accepted">Accepted Alerts</button>
+                        <button class="alert-tab" type="button" role="tab" aria-selected="false" data-public-alert-tab="rejected">Rejected Alerts</button>
+                        <button class="alert-tab" type="button" role="tab" aria-selected="false" data-public-alert-tab="expired">Expired Alerts</button>
                     </div>
                     <div id="publicAlertsList" class="alerts-archive-list public-alert-list"></div>
                 </section>
@@ -98,7 +105,8 @@
         </div>
     </div>
 
-    <script src="/assets/js/lib/public-icons.js?v=20260709-public-feed-metrics-4"></script>
-    <script type="module" src="/assets/js/public.js?v=20260717-independent-streaming-6"></script>
+    <script src="/assets/vendor/maplibre/maplibre-gl-csp.js?v=5.24.0"></script>
+    <script src="/assets/js/lib/public-icons.js?v=20260803-dark-map-1"></script>
+    <script type="module" src="/assets/js/public.js?v=20260803-dark-map-1"></script>
 </body>
 </html>

@@ -304,11 +304,12 @@ if [[ "$skip_cargo_build" -eq 0 ]]; then
     cargo build "${cargo_profile_args[@]}" -p haze
     cargo build "${cargo_profile_args[@]}" -p haze-cap
     cargo build "${cargo_profile_args[@]}" -p haze-easnet
+    cargo build "${cargo_profile_args[@]}" -p haze-location
     cargo build "${cargo_profile_args[@]}" -p haze-playout --features ffmpeg-runtime
     cargo build "${cargo_profile_args[@]}" -p haze-media --features gstreamer-backend
     cargo build "${cargo_profile_args[@]}" -p haze-cgen --features "gpu-wgpu"
   else
-    cargo build "${cargo_profile_args[@]}" -p haze -p haze-cap -p haze-easnet -p haze-playout
+    cargo build "${cargo_profile_args[@]}" -p haze -p haze-cap -p haze-easnet -p haze-location -p haze-playout
     cargo build "${cargo_profile_args[@]}" -p haze-media --features gstreamer-backend
     cargo build "${cargo_profile_args[@]}" -p haze-cgen --features "gpu-wgpu"
   fi
@@ -318,6 +319,7 @@ profile_dir="$profile"
 exe_path="$root/target/$profile_dir/haze"
 cap_rust_exe_path="$root/target/$profile_dir/haze-cap-ingest"
 easnet_exe_path="$root/target/$profile_dir/haze-easnet"
+location_exe_path="$root/target/$profile_dir/haze-location"
 playout_exe_path="$root/target/$profile_dir/haze-playout-rs"
 media_exe_path="$root/target/$profile_dir/haze-media"
 cgen_exe_path="$root/target/$profile_dir/haze-cgen"
@@ -331,6 +333,10 @@ if [[ ! -x "$cap_rust_exe_path" ]]; then
 fi
 if [[ ! -x "$easnet_exe_path" ]]; then
   echo "Missing Rust EAS NET executable: $easnet_exe_path" >&2
+  exit 1
+fi
+if [[ ! -x "$location_exe_path" ]]; then
+  echo "Missing Rust location executable: $location_exe_path" >&2
   exit 1
 fi
 if [[ ! -x "$playout_exe_path" ]]; then
@@ -360,10 +366,12 @@ rm -f \
   "$out_full/haze-cap-ingest" \
   "$out_full/haze-cap-ingest-rs" \
   "$out_full/haze-easnet" \
+  "$out_full/haze-location" \
   "$out_full/haze-tts" \
   "$out_full/haze-product-render" \
   "$out_full/haze-playlist" \
   "$out_full/haze-webhook" \
+  "$out_full/haze-asr" \
   "$out_full/haze-ivr" \
   "$out_full/haze-playout" \
   "$out_full/haze-playout-rs" \
@@ -374,10 +382,13 @@ rm -f \
   "$bin_full/haze-cap-ingest" \
   "$bin_full/haze-cap-ingest-rs" \
   "$bin_full/haze-easnet" \
+  "$bin_full/haze-location" \
   "$bin_full/haze-tts" \
   "$bin_full/haze-product-render" \
   "$bin_full/haze-playlist" \
   "$bin_full/haze-webhook" \
+  "$bin_full/haze-asr" \
+  "$bin_full/whisper-server" \
   "$bin_full/haze-ivr" \
   "$bin_full/haze-playout" \
   "$bin_full/haze-playout-rs" \
@@ -391,6 +402,8 @@ cp "$cap_rust_exe_path" "$bin_full/haze-cap-ingest"
 chmod +x "$bin_full/haze-cap-ingest"
 cp "$easnet_exe_path" "$bin_full/haze-easnet"
 chmod +x "$bin_full/haze-easnet"
+cp "$location_exe_path" "$bin_full/haze-location"
+chmod +x "$bin_full/haze-location"
 cp "$playout_exe_path" "$bin_full/haze-playout-rs"
 chmod +x "$bin_full/haze-playout-rs"
 cp "$media_exe_path" "$bin_full/haze-media"
@@ -398,11 +411,12 @@ chmod +x "$bin_full/haze-media"
 cp "$cgen_exe_path" "$bin_full/haze-cgen"
 chmod +x "$bin_full/haze-cgen"
 
-copy_linux_runtime_dependencies "$bin_full" "$out_full/haze" "$bin_full/haze-cap-ingest" "$bin_full/haze-easnet" "$bin_full/haze-playout-rs" "$bin_full/haze-media" "$bin_full/haze-cgen"
+copy_linux_runtime_dependencies "$bin_full" "$out_full/haze" "$bin_full/haze-cap-ingest" "$bin_full/haze-easnet" "$bin_full/haze-location" "$bin_full/haze-playout-rs" "$bin_full/haze-media" "$bin_full/haze-cgen"
 copy_gstreamer_runtime "$bin_full"
 
 if [[ "$skip_go_services" -eq 0 ]]; then
   bash "$script_dir/build-go-services.sh" --output-dir "$output_dir"
+  copy_linux_runtime_dependencies "$bin_full" "$bin_full/whisper-server"
 fi
 
 [[ -e config.yaml ]] && cp config.yaml "$out_full/"
@@ -415,7 +429,7 @@ done
 mkdir -p "$out_full/managed"
 managed_scripts="$out_full/managed/scripts"
 mkdir -p "$managed_scripts"
-for script in scripts/tts/chatterbox_infer.py scripts/tts/f5_infer.py; do
+for script in scripts/tts/chatterbox_infer.py scripts/tts/f5_infer.py scripts/install-whisper-model.sh scripts/install-whisper-model.ps1; do
   if [[ -f "$root/$script" ]]; then
     cp "$root/$script" "$managed_scripts/"
   fi
@@ -424,7 +438,7 @@ printf '%s\n' "Haze Weather Radio runtime directory" > "$out_full/.haze-runtime"
 
 mkdir -p "$out_full/audio"
 
-for dir in audio/_uploads audio/_previews bin logs runtime runtime/audio/alerts runtime/audio/playlist runtime/audio/playout runtime/audio/tts runtime/feeds runtime/playlists runtime/queues/alerts runtime/state; do
+for dir in audio/_uploads audio/_previews bin logs runtime runtime/audio/alerts runtime/audio/playlist runtime/audio/playout runtime/audio/tts runtime/feeds runtime/models/whisper runtime/playlists runtime/queues/alerts runtime/state; do
   mkdir -p "$out_full/$dir"
 done
 

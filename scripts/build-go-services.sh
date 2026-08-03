@@ -98,6 +98,7 @@ rm -f \
   "$out_full/haze-product-render" \
   "$out_full/haze-playlist" \
   "$out_full/haze-webhook" \
+  "$out_full/haze-asr" \
   "$out_full/haze-ivr"
 
 copy_bundle_dir() {
@@ -182,6 +183,10 @@ else
   echo "Warning: building haze-web without native Opus support; receiver Opus/WebRTC audio will be degraded." >&2
 fi
 
+bash "$root/scripts/build-whisper-runtime.sh" \
+  --output-dir "$bin_full" \
+  --license-dir "$out_full/licenses"
+
 go build "${build_web_args[@]}" -ldflags "$web_ldflags" -o "$bin_full/haze-web" ./cmd/haze-web
 copy_sherpa_onnx_runtime_libraries "$bin_full"
 if [[ "${#build_web_args[@]}" -gt 0 ]]; then
@@ -192,6 +197,7 @@ go build -o "$bin_full/haze-tts" ./cmd/haze-tts
 go build -o "$bin_full/haze-product-render" ./cmd/haze-product-render
 go build -o "$bin_full/haze-playlist" ./cmd/haze-playlist
 go build -o "$bin_full/haze-webhook" ./cmd/haze-webhook
+go build -o "$bin_full/haze-asr" ./cmd/haze-asr
 go build -o "$bin_full/haze-ivr" ./cmd/haze-ivr
 
 chmod +x \
@@ -201,6 +207,7 @@ chmod +x \
   "$bin_full/haze-product-render" \
   "$bin_full/haze-playlist" \
   "$bin_full/haze-webhook" \
+  "$bin_full/haze-asr" \
   "$bin_full/haze-ivr"
 
 for bundled_dir in webroot managed audio; do
@@ -209,7 +216,7 @@ done
 
 managed_scripts="$out_full/managed/scripts"
 mkdir -p "$managed_scripts"
-for script in scripts/tts/chatterbox_infer.py scripts/tts/f5_infer.py; do
+for script in scripts/tts/chatterbox_infer.py scripts/tts/f5_infer.py scripts/install-whisper-model.sh scripts/install-whisper-model.ps1; do
   if [[ -f "$root/$script" ]]; then
     cp "$root/$script" "$managed_scripts/"
   fi

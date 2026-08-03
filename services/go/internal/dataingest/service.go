@@ -22,6 +22,7 @@ import (
 
 	"github.com/meowraii/haze-weather-radio/services/go/internal/datastore"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/events"
+	"github.com/meowraii/haze-weather-radio/services/go/internal/locationclient"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/locationdb"
 	"gopkg.in/yaml.v3"
 )
@@ -48,6 +49,11 @@ type rootConfig struct {
 				Timeout  string `yaml:"timeout"`
 			} `yaml:"data_ingest"`
 		} `yaml:"go"`
+		Rust struct {
+			Location struct {
+				Mode string `yaml:"mode"`
+			} `yaml:"location"`
+		} `yaml:"rust"`
 	} `yaml:"services"`
 }
 
@@ -91,10 +97,12 @@ type feedXML struct {
 }
 
 type coverageRegionXML struct {
-	ID             string `xml:"id,attr"`
-	Source         string `xml:"source,attr"`
-	Name           string `xml:"name,attr"`
-	DeriveForecast string `xml:"derive_forecast,attr"`
+	ID                  string `xml:"id,attr"`
+	Source              string `xml:"source,attr"`
+	Name                string `xml:"name,attr"`
+	DeriveForecast      string `xml:"derive_forecast,attr"`
+	CanonicalID         string `xml:"canonical_id,attr"`
+	ForecastCanonicalID string `xml:"forecast_canonical_id,attr"`
 }
 
 type hydrometricLocationGroupXML struct {
@@ -108,6 +116,7 @@ type locationXML struct {
 	Latitude     string `xml:"latitude,attr"`
 	Longitude    string `xml:"longitude,attr"`
 	NormalID     string `xml:"normal_id,attr"`
+	CanonicalID  string `xml:"canonical_id,attr"`
 }
 
 type loadedConfig struct {
@@ -162,6 +171,7 @@ func Run(ctx context.Context, options Options) error {
 	client := dataIngestHTTPClient(timeout)
 	cycleTimeout := dataIngestCycleTimeout(interval, timeout)
 	for {
+		cfg = hydrateConfiguredLocations(ctx, cfg, strings.TrimSpace(os.Getenv("HAZE_HOST_BRIDGE_ADDR")))
 		cycleCtx, cancel := context.WithTimeout(ctx, cycleTimeout)
 		err := fetchOnce(cycleCtx, cfg, client, publisher, store)
 		cancel()
@@ -254,7 +264,8 @@ func fetchOnce(ctx context.Context, cfg loadedConfig, client *http.Client, publi
 				log.Printf("observation store failed for %s: %v", loc.ID, err)
 				continue
 			}
-			publishDataReady(publisher, feed.ID, "current_conditions", loc.ID)
+			publishLocationDiscovery(publisher, loc, payload, "weather_station", "surface_observation")
+			publishDataReady(publisher, feed.ID, "current_conditions", loc.ID, loc.CanonicalID)
 		}
 		for _, loc := range feed.Locations.AviationReportLocations.Locations {
 			if err := ctx.Err(); err != nil {
@@ -277,7 +288,8 @@ func fetchOnce(ctx context.Context, cfg loadedConfig, client *http.Client, publi
 				log.Printf("aviation observation store failed for %s: %v", loc.ID, err)
 				continue
 			}
-			publishDataReady(publisher, feed.ID, "aviation_reports", loc.ID)
+			publishLocationDiscovery(publisher, loc, payload, "airport", "aviation_observation")
+			publishDataReady(publisher, feed.ID, "aviation_reports", loc.ID, loc.CanonicalID)
 		}
 		for _, loc := range feed.Locations.MarineConditions.Locations {
 			if err := ctx.Err(); err != nil {
@@ -297,7 +309,8 @@ func fetchOnce(ctx context.Context, cfg loadedConfig, client *http.Client, publi
 				log.Printf("marine observation store failed for %s: %v", loc.ID, err)
 				continue
 			}
-			publishDataReady(publisher, feed.ID, "marine_reports", loc.ID)
+			publishLocationDiscovery(publisher, loc, payload, "marine_station", "marine_observation")
+			publishDataReady(publisher, feed.ID, "marine_reports", loc.ID, loc.CanonicalID)
 		}
 		for _, region := range feed.Locations.Coverage.Regions {
 			if err := ctx.Err(); err != nil {
@@ -328,7 +341,8 @@ func fetchOnce(ctx context.Context, cfg loadedConfig, client *http.Client, publi
 				log.Printf("forecast store failed for %s: %v", forecastID, err)
 				continue
 			}
-			publishDataReady(publisher, feed.ID, "forecast", forecastID)
+			publishForecastDiscovery(publisher, region, forecastID, payload)
+			publishDataReady(publisher, feed.ID, "forecast", forecastID, region.ForecastCanonicalID)
 		}
 		for _, loc := range feed.Locations.AirQualityLocations.Locations {
 			if err := ctx.Err(); err != nil {
@@ -346,7 +360,8 @@ func fetchOnce(ctx context.Context, cfg loadedConfig, client *http.Client, publi
 				log.Printf("air quality store failed for %s: %v", loc.ID, err)
 				continue
 			}
-			publishDataReady(publisher, feed.ID, "air_quality", loc.ID)
+			publishLocationDiscovery(publisher, loc, payload, "air_quality_station", "air_quality")
+			publishDataReady(publisher, feed.ID, "air_quality", loc.ID, loc.CanonicalID)
 		}
 		for _, loc := range feed.Locations.ClimateLocations.Locations {
 			if err := ctx.Err(); err != nil {
@@ -364,7 +379,8 @@ func fetchOnce(ctx context.Context, cfg loadedConfig, client *http.Client, publi
 				log.Printf("climate summary store failed for %s: %v", loc.ID, err)
 				continue
 			}
-			publishDataReady(publisher, feed.ID, "climate_summary", loc.ID)
+			publishLocationDiscovery(publisher, loc, payload, "climate_station", "climate")
+			publishDataReady(publisher, feed.ID, "climate_summary", loc.ID, loc.CanonicalID)
 		}
 		for _, loc := range feedMarineForecastLocations(feed) {
 			if err := ctx.Err(); err != nil {
@@ -382,7 +398,7 @@ func fetchOnce(ctx context.Context, cfg loadedConfig, client *http.Client, publi
 				log.Printf("marine forecast store failed for %s: %v", loc.ID, err)
 				continue
 			}
-			publishDataReady(publisher, feed.ID, "marine_forecast", loc.ID)
+			publishDataReady(publisher, feed.ID, "marine_forecast", loc.ID, loc.CanonicalID)
 		}
 		fetchFeedSpecialtyProducts(ctx, client, publisher, store, feed, ecccCache)
 	}
@@ -3278,6 +3294,10 @@ func fetchFeedSpecialtyProducts(ctx context.Context, client *http.Client, publis
 		if len(payload) == 0 {
 			continue
 		}
+		canonicalIDs := feedCanonicalLocationIDs(feed)
+		if len(canonicalIDs) > 0 {
+			payload["_canonical_location_ids"] = canonicalIDs
+		}
 		if err := store.StoreProductPayload(ctx, datastore.ProductPayloadRecord{
 			Kind:    fetcher.kind,
 			Source:  "eccc",
@@ -3287,7 +3307,7 @@ func fetchFeedSpecialtyProducts(ctx context.Context, client *http.Client, publis
 			log.Printf("%s store failed for feed %s: %v", fetcher.kind, feed.ID, err)
 			continue
 		}
-		publishDataReady(publisher, feed.ID, fetcher.kind, feed.ID)
+		publishDataReady(publisher, feed.ID, fetcher.kind, feed.ID, canonicalIDs...)
 	}
 }
 
@@ -3367,6 +3387,9 @@ func fetchHydrometricProduct(ctx context.Context, client *http.Client, feed feed
 		items = append(items, map[string]any{
 			"id":           firstNonBlank(features[0].ID, textValue(props["IDENTIFIER"])),
 			"station_id":   firstNonBlank(textValue(props["STATION_NUMBER"]), loc.ID),
+			"canonical_id": loc.CanonicalID,
+			"raw_source":   loc.Source,
+			"raw_id":       loc.ID,
 			"station":      firstNonBlank(loc.NameOverride, titleText(textValue(props["STATION_NAME"]))),
 			"relation":     entry.Relation,
 			"order":        index,
@@ -3397,6 +3420,31 @@ func feedHydrometricLocations(feed feedXML) []hydrometricLocationEntry {
 	appendAll("upstream", feed.Locations.HydrometricLocations.Upstream.Locations)
 	appendAll("downstream", feed.Locations.HydrometricLocations.Downstream.Locations)
 	return out
+}
+
+func feedCanonicalLocationIDs(feed feedXML) []string {
+	ids := []string{}
+	for _, region := range feed.Locations.Coverage.Regions {
+		ids = append(ids, region.CanonicalID, region.ForecastCanonicalID)
+	}
+	groups := [][]locationXML{
+		feed.Locations.ObservationLocations.Locations,
+		feed.Locations.AviationReportLocations.Locations,
+		feed.Locations.AirQualityLocations.Locations,
+		feed.Locations.ClimateLocations.Locations,
+		feed.Locations.MarineForecastLocations.Locations,
+		feed.Locations.MarineForecastLocations.Subregions,
+		feed.Locations.MarineConditions.Locations,
+		feed.Locations.HydrometricLocations.Locations,
+		feed.Locations.HydrometricLocations.Upstream.Locations,
+		feed.Locations.HydrometricLocations.Downstream.Locations,
+	}
+	for _, group := range groups {
+		for _, location := range group {
+			ids = append(ids, location.CanonicalID)
+		}
+	}
+	return uniqueNonBlankStrings(ids...)
 }
 
 func fetchCollectionFeatures(ctx context.Context, client *http.Client, collection string, query string) ([]geoFeature, string, error) {
@@ -3782,14 +3830,137 @@ func loadDotEnv(path string) {
 	}
 }
 
-func publishDataReady(publisher events.Publisher, feedID string, kind string, subject string) {
+func publishDataReady(publisher events.Publisher, feedID string, kind string, subject string, canonicalIDs ...string) {
+	data := map[string]any{"feed_id": feedID, "kind": kind, "id": subject}
+	canonicalIDs = uniqueNonBlankStrings(canonicalIDs...)
+	if len(canonicalIDs) > 0 {
+		data["canonical_id"] = canonicalIDs[0]
+		data["canonical_location_ids"] = canonicalIDs
+	}
 	if err := publisher.Publish(events.Event{
 		Type:    "data.ready",
 		Source:  serviceID,
 		Subject: subject,
-		Data:    map[string]any{"feed_id": feedID, "kind": kind, "id": subject},
+		Data:    data,
 	}); err != nil {
 		log.Printf("data ready publish failed for %s/%s: %v", kind, subject, err)
+	}
+}
+
+func publishLocationDiscovery(publisher events.Publisher, loc locationXML, payload map[string]any, kind string, capability string) {
+	purpose := ""
+	switch capability {
+	case "surface_observation":
+		purpose = "observation"
+	case "aviation_observation":
+		purpose = "aviation"
+	case "marine_observation":
+		purpose = "marine_observation"
+	case "air_quality":
+		purpose = "air_quality"
+	case "climate":
+		purpose = "climate"
+	}
+	configuredInput, configured := locationclient.ConfiguredIdentifier(loc.Source, purpose, loc.ID)
+	identifierScheme, identifierAuthority := configuredInput.Scheme, configuredInput.Authority
+	if !configured {
+		identifierScheme = "provider"
+		identifierAuthority = sourceKind(loc.Source)
+	}
+	name := firstNonBlank(
+		loc.NameOverride,
+		localizedText(payload["station"], "en"),
+		localizedText(payload["location"], "en"),
+		localizedText(payload["name"], "en"),
+		loc.ID,
+	)
+	identifiers := []map[string]any{{
+		"authority": identifierAuthority, "scheme": identifierScheme,
+		"value": loc.ID, "normalized_value": strings.ToUpper(strings.TrimSpace(loc.ID)),
+		"primary": true, "confidence": "exact", "source_id": serviceID,
+	}}
+	stationID := strings.TrimSpace(textValue(payload["station_id"]))
+	if stationID != "" && !strings.EqualFold(stationID, loc.ID) {
+		identifiers = append(identifiers, map[string]any{
+			"authority": sourceKind(loc.Source), "scheme": "eccc_station",
+			"value": stationID, "normalized_value": strings.ToUpper(stationID),
+			"primary": false, "confidence": "high", "source_id": serviceID,
+		})
+	}
+	entity := map[string]any{
+		"id": "", "kind": kind, "capabilities": []string{capability},
+		"country": "CA", "lifecycle_status": "unknown", "reporting_status": "recently_reporting",
+		"source_quality": 0.8, "identifiers": identifiers,
+		"names": []map[string]any{{
+			"locale": "en-CA", "value": name, "normalized_value": strings.ToLower(name),
+			"name_kind": "canonical", "primary": true, "source_id": serviceID,
+		}},
+		"attributes": map[string]any{"discovered_from": "validated_data_ingest"},
+	}
+	if geometry := discoveryPoint(loc, payload); geometry != nil {
+		entity["geometry"] = geometry
+	}
+	publishOverlayUpsert(publisher, loc.ID, entity)
+}
+
+func publishForecastDiscovery(publisher events.Publisher, region coverageRegionXML, forecastID string, payload map[string]any) {
+	name := firstNonBlank(
+		localizedText(payload["name"], "en"),
+		region.Name,
+		region.ID,
+	)
+	entity := map[string]any{
+		"id": "", "kind": "public_forecast_location", "capabilities": []string{"forecast"},
+		"country": "CA", "lifecycle_status": "unknown", "reporting_status": "not_applicable",
+		"source_quality": 0.85,
+		"identifiers": []map[string]any{
+			{"authority": "eccc", "scheme": "clc", "value": region.ID, "normalized_value": strings.ToUpper(region.ID), "primary": true, "confidence": "exact", "source_id": serviceID},
+			{"authority": "eccc", "scheme": "eccc_citypage", "value": forecastID, "normalized_value": strings.ToUpper(forecastID), "primary": false, "confidence": "exact", "source_id": serviceID},
+		},
+		"names": []map[string]any{{
+			"locale": "en-CA", "value": name, "normalized_value": strings.ToLower(name),
+			"name_kind": "canonical", "primary": true, "source_id": serviceID,
+		}},
+		"attributes": map[string]any{"discovered_from": "validated_data_ingest"},
+	}
+	publishOverlayUpsert(publisher, region.ID, entity)
+}
+
+func publishOverlayUpsert(publisher events.Publisher, subject string, entity map[string]any) {
+	requestID := fmt.Sprintf("data-location-%d", time.Now().UnixNano())
+	if err := publisher.Publish(events.Event{
+		Type:    "location.overlay.upsert.request",
+		Source:  serviceID,
+		Target:  "haze-location",
+		Subject: requestID,
+		Data: map[string]any{
+			"api_version": 1,
+			"request_id":  requestID,
+			"source_id":   serviceID,
+			"expires_at":  time.Now().UTC().Add(30 * 24 * time.Hour).Format(time.RFC3339),
+			"entity":      entity,
+			"raw_subject": subject,
+		},
+	}); err != nil {
+		log.Printf("location discovery publish failed for %s: %v", subject, err)
+	}
+}
+
+func discoveryPoint(loc locationXML, payload map[string]any) map[string]any {
+	latitude, latOK := numberValue(payload["latitude"])
+	longitude, lonOK := numberValue(payload["longitude"])
+	if value, err := strconv.ParseFloat(strings.TrimSpace(loc.Latitude), 64); err == nil {
+		latitude, latOK = value, true
+	}
+	if value, err := strconv.ParseFloat(strings.TrimSpace(loc.Longitude), 64); err == nil {
+		longitude, lonOK = value, true
+	}
+	if !latOK || !lonOK || latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180 {
+		return nil
+	}
+	return map[string]any{
+		"geometry_type": "point", "latitude": latitude, "longitude": longitude,
+		"bbox": []float64{longitude, latitude, longitude, latitude}, "source_id": serviceID,
 	}
 }
 
@@ -3809,14 +3980,19 @@ func persistObservation(ctx context.Context, store datastore.Store, loc location
 	source := sourceKind(loc.Source)
 	name := firstNonBlank(loc.NameOverride, localizedText(payload["station"], "en"), loc.ID)
 	stationID := fallbackText(textValue(payload["station_id"]), loc.ID)
+	latitude, longitude := configuredLocationPoint(loc)
+	attachCanonicalLocation(payload, loc.CanonicalID, loc.Source, loc.ID)
 	if err := store.UpsertLocation(ctx, datastore.LocationRecord{
-		Source:     source,
-		LocationID: loc.ID,
-		Kind:       "observation_station",
-		NameEN:     name,
-		NameFR:     firstNonBlank(localizedText(payload["station"], "fr"), name),
-		StationID:  stationID,
-		CityPageID: cityPageID(source, loc.ID),
+		CanonicalID: loc.CanonicalID,
+		Source:      source,
+		LocationID:  loc.ID,
+		Kind:        "observation_station",
+		NameEN:      name,
+		NameFR:      firstNonBlank(localizedText(payload["station"], "fr"), name),
+		StationID:   stationID,
+		CityPageID:  cityPageID(source, loc.ID),
+		Latitude:    latitude,
+		Longitude:   longitude,
 		Metadata: map[string]any{
 			"configured_source": loc.Source,
 			"name_override":     loc.NameOverride,
@@ -3840,14 +4016,16 @@ func persistForecast(ctx context.Context, store datastore.Store, region coverage
 	source := sourceKind(region.Source)
 	nameBlock, _ := payload["name"].(map[string]any)
 	nameEN := firstNonBlank(localizedText(nameBlock, "en"), region.Name, region.ID)
+	attachCanonicalLocation(payload, region.CanonicalID, region.Source, region.ID)
 	if err := store.UpsertLocation(ctx, datastore.LocationRecord{
-		Source:     source,
-		LocationID: region.ID,
-		Kind:       "forecast_region",
-		NameEN:     nameEN,
-		NameFR:     firstNonBlank(localizedText(nameBlock, "fr"), nameEN),
-		CityPageID: forecastID,
-		CLC:        region.ID,
+		CanonicalID: region.CanonicalID,
+		Source:      source,
+		LocationID:  region.ID,
+		Kind:        "forecast_region",
+		NameEN:      nameEN,
+		NameFR:      firstNonBlank(localizedText(nameBlock, "fr"), nameEN),
+		CityPageID:  forecastID,
+		CLC:         region.ID,
 		Metadata: map[string]any{
 			"derive_forecast": forecastID,
 			"configured_name": region.Name,
@@ -3871,12 +4049,17 @@ func persistAirQuality(ctx context.Context, store datastore.Store, loc locationX
 	}
 	source := sourceKind(loc.Source)
 	name := firstNonBlank(loc.NameOverride, localizedText(payload["location"], "en"), loc.ID)
+	latitude, longitude := configuredLocationPoint(loc)
+	attachCanonicalLocation(payload, loc.CanonicalID, loc.Source, loc.ID)
 	if err := store.UpsertLocation(ctx, datastore.LocationRecord{
-		Source:     source,
-		LocationID: loc.ID,
-		Kind:       "air_quality_location",
-		NameEN:     name,
-		NameFR:     firstNonBlank(localizedText(payload["location"], "fr"), name),
+		CanonicalID: loc.CanonicalID,
+		Source:      source,
+		LocationID:  loc.ID,
+		Kind:        "air_quality_location",
+		NameEN:      name,
+		NameFR:      firstNonBlank(localizedText(payload["location"], "fr"), name),
+		Latitude:    latitude,
+		Longitude:   longitude,
 		Metadata: map[string]any{
 			"configured_source": loc.Source,
 			"name_override":     loc.NameOverride,
@@ -3898,12 +4081,17 @@ func persistClimateSummary(ctx context.Context, store datastore.Store, loc locat
 	}
 	source := sourceKind(loc.Source)
 	name := firstNonBlank(loc.NameOverride, localizedText(payload["name"], "en"), loc.ID)
+	latitude, longitude := configuredLocationPoint(loc)
+	attachCanonicalLocation(payload, loc.CanonicalID, loc.Source, loc.ID)
 	if err := store.UpsertLocation(ctx, datastore.LocationRecord{
-		Source:     source,
-		LocationID: loc.ID,
-		Kind:       "climate_location",
-		NameEN:     name,
-		NameFR:     firstNonBlank(localizedText(payload["name"], "fr"), name),
+		CanonicalID: loc.CanonicalID,
+		Source:      source,
+		LocationID:  loc.ID,
+		Kind:        "climate_location",
+		NameEN:      name,
+		NameFR:      firstNonBlank(localizedText(payload["name"], "fr"), name),
+		Latitude:    latitude,
+		Longitude:   longitude,
 		Metadata: map[string]any{
 			"configured_source": loc.Source,
 			"name_override":     loc.NameOverride,
@@ -3928,12 +4116,17 @@ func persistMarineForecast(ctx context.Context, store datastore.Store, loc locat
 	props := mapAt(payload, "properties")
 	area := mapAt(props, "area")
 	name := firstNonBlank(loc.NameOverride, localizedText(mapAt(area, "value"), "en"), loc.ID)
+	latitude, longitude := configuredLocationPoint(loc)
+	attachCanonicalLocation(payload, loc.CanonicalID, loc.Source, loc.ID)
 	if err := store.UpsertLocation(ctx, datastore.LocationRecord{
-		Source:     source,
-		LocationID: loc.ID,
-		Kind:       "marine_forecast_area",
-		NameEN:     name,
-		NameFR:     firstNonBlank(localizedText(mapAt(area, "value"), "fr"), name),
+		CanonicalID: loc.CanonicalID,
+		Source:      source,
+		LocationID:  loc.ID,
+		Kind:        "marine_forecast_area",
+		NameEN:      name,
+		NameFR:      firstNonBlank(localizedText(mapAt(area, "value"), "fr"), name),
+		Latitude:    latitude,
+		Longitude:   longitude,
 		Metadata: map[string]any{
 			"configured_source": loc.Source,
 			"name_override":     loc.NameOverride,
@@ -3947,6 +4140,26 @@ func persistMarineForecast(ctx context.Context, store datastore.Store, loc locat
 		ID:      loc.ID,
 		Payload: payload,
 	})
+}
+
+func configuredLocationPoint(loc locationXML) (*float64, *float64) {
+	latitude, longitude, ok := configuredPoint(loc)
+	if !ok {
+		return nil, nil
+	}
+	return &latitude, &longitude
+}
+
+func attachCanonicalLocation(payload map[string]any, canonicalID string, source string, rawID string) {
+	canonicalID = strings.TrimSpace(canonicalID)
+	if payload == nil || canonicalID == "" {
+		return
+	}
+	payload["_location"] = map[string]any{
+		"canonical_id": canonicalID,
+		"raw_source":   strings.TrimSpace(source),
+		"raw_id":       strings.TrimSpace(rawID),
+	}
 }
 
 func cityPageID(source string, id string) string {

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Loopback development profile. Feed audio is available only through WebRTC. -->
+<outputs>
+  <feed id="cwxr-*">
+    <webrtc enabled="true"/>
+    <icecast enabled="false"/>
+    <udp enabled="false"/>
+    <rtp enabled="false"/>
+    <rtmp enabled="false"/>
+    <srt enabled="false"/>
+    <rtsp enabled="false"/>
+    <audio_device enabled="false"/>
+  </feed>
+</outputs>

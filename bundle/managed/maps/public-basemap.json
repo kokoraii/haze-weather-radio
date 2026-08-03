@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "haze-public-detailed-basemap",
+  "name": "Haze detailed dark public basemap",
+  "style_url": "https://tiles.openfreemap.org/styles/dark",
+  "attribution": "Map data © OpenStreetMap contributors, basemap © OpenFreeMap",
+  "satellite": {
+    "id": "esri-world-imagery",
+    "name": "Satellite",
+    "tile_url": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    "attribution": "Imagery © Esri and its imagery partners",
+    "max_zoom": 19
+  }
+}

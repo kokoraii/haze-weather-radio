@@ -25,6 +25,7 @@ func TestCgenSaveAndActionsRoundTripXML(t *testing.T) {
 				"mode":                            "release",
 				"program_input_url":               "udp://239.0.0.1:9000?overrun_nonfatal=1&reuse=1",
 				"program_input_format":            "mpegts",
+				"deinterlace_enabled":             true,
 				"deinterlace_algorithm":           "yadif",
 				"deinterlace_backend":             "software",
 				"deinterlace_cadence":             "field",
@@ -86,7 +87,8 @@ func TestCgenSaveAndActionsRoundTripXML(t *testing.T) {
 	if feeds[0]["program_input_url"] != "udp://239.0.0.1:9000?overrun_nonfatal=1&reuse=1" {
 		t.Fatalf("program input = %#v", feeds[0]["program_input_url"])
 	}
-	if feeds[0]["deinterlace_algorithm"] != "yadif" ||
+	if feeds[0]["deinterlace_enabled"] != true ||
+		feeds[0]["deinterlace_algorithm"] != "yadif" ||
 		feeds[0]["deinterlace_backend"] != "software" ||
 		feeds[0]["deinterlace_cadence"] != "field" ||
 		feeds[0]["deinterlace_parity"] != "tff" {
@@ -137,7 +139,7 @@ func TestCgenSaveAndActionsRoundTripXML(t *testing.T) {
 	}
 	for _, want := range []string{
 		"<program>",
-		"<input url=\"udp://239.0.0.1:9000?overrun_nonfatal=1&amp;reuse=1\" format=\"mpegts\" deinterlace_algorithm=\"yadif\" deinterlace_backend=\"software\" deinterlace_cadence=\"field\" deinterlace_parity=\"tff\"></input>",
+		"<input url=\"udp://239.0.0.1:9000?overrun_nonfatal=1&amp;reuse=1\" format=\"mpegts\" deinterlace_enabled=\"true\" deinterlace_algorithm=\"yadif\" deinterlace_backend=\"software\" deinterlace_cadence=\"field\" deinterlace_parity=\"tff\"></input>",
 		"<output url=\"udp://239.0.0.2:9001?pkt_size=1316\" format=\"mpegts\" vcodec=\"libx264\" acodec=\"aac\"",
 		"<priority>",
 		"<media>",
@@ -233,6 +235,72 @@ func TestCgenSaveAndActionsRoundTripXML(t *testing.T) {
 	}
 }
 
+func TestCgenDeinterlaceEnabledDefaultsAndDisabledRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("version: test\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	offFeed := map[string]any{
+		"id": "CGEN_OFF",
+		"program_input": map[string]any{
+			"type":                  "dummy",
+			"deinterlace_enabled":   false,
+			"deinterlace_algorithm": "not-a-filter",
+			"deinterlace_backend":   "not-a-backend",
+		},
+	}
+	mapped, err := cgenFeedFromMap(offFeed)
+	if err != nil {
+		t.Fatalf("map cgen feed: %v", err)
+	}
+	if mapped.ProgramInput.DeinterlaceEnabled != "false" {
+		t.Fatalf("mapped disabled deinterlacing = %#v", mapped.ProgramInput)
+	}
+
+	saved, err := saveCgenPayload(configPath, map[string]any{
+		"enabled": true,
+		"feeds": []any{
+			offFeed,
+			map[string]any{
+				"id":            "CGEN_DEFAULT",
+				"program_input": map[string]any{"type": "dummy"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("save cgen: %v", err)
+	}
+
+	feeds := saved["feeds"].([]map[string]any)
+	byID := make(map[string]map[string]any, len(feeds))
+	for _, feed := range feeds {
+		byID[feed["id"].(string)] = feed
+	}
+	disabled := byID["CGEN_OFF"]
+	defaults := byID["CGEN_DEFAULT"]
+	if disabled["deinterlace_enabled"] != false {
+		t.Fatalf("disabled deinterlacing = %#v", disabled["deinterlace_enabled"])
+	}
+	input := disabled["program_input"].(map[string]any)
+	if input["deinterlace_enabled"] != false {
+		t.Fatalf("nested disabled deinterlacing = %#v", input)
+	}
+	if defaults["deinterlace_enabled"] != true {
+		t.Fatalf("default deinterlacing = %#v", defaults["deinterlace_enabled"])
+	}
+
+	rawXML, err := os.ReadFile(filepath.Join(dir, defaultCgenFile))
+	if err != nil {
+		t.Fatalf("read cgen XML: %v", err)
+	}
+	if !strings.Contains(string(rawXML), `deinterlace_enabled="false"`) ||
+		!strings.Contains(string(rawXML), `deinterlace_enabled="true"`) {
+		t.Fatalf("written XML missing explicit deinterlace states:\n%s", rawXML)
+	}
+}
+
 func TestCgenPayloadIncludesRuntimeCompositorStatus(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")
@@ -325,13 +393,18 @@ func TestCgenV2RoundTripRevisionAndActionPreserveSections(t *testing.T) {
 			"field_order": "tff",
 			"background":  "#102030ff",
 		},
-		"alert": map[string]any{"feed_id": "CAP_MAIN"},
+		"alert": map[string]any{
+			"feed_id":      "CAP_MAIN",
+			"audio_source": "both",
+		},
 		"ancillary": map[string]any{
 			"captions": "pass",
 			"scte35":   "pass",
 			"scte104":  "drop",
 		},
 		"audio_routing": map[string]any{
+			"idle_source":           "routine",
+			"mute_standby_routine":  false,
 			"topology":              "force_layout",
 			"force_layout":          "stereo",
 			"idle_program_gain_db":  "0",
@@ -375,6 +448,8 @@ func TestCgenV2RoundTripRevisionAndActionPreserveSections(t *testing.T) {
 				"video_bitrate_kbps":     8000,
 				"video_max_bitrate_kbps": 10000,
 				"gop_frames":             60,
+				"interlaced":             true,
+				"field_order":            "bff",
 				"audio_codec":            "aac",
 				"audio_bitrate_kbps":     192,
 				"sample_rate":            48000,
@@ -410,11 +485,19 @@ func TestCgenV2RoundTripRevisionAndActionPreserveSections(t *testing.T) {
 	}
 	feeds := saved["feeds"].([]map[string]any)
 	got := feeds[0]
-	if got["alert_feed_id"] != "CAP_MAIN" || got["audio_topology"] != "force_layout" || got["alert_scene_id"] != "Standard_Crawl" {
+	if got["alert_feed_id"] != "CAP_MAIN" || got["audio_source"] != "both" ||
+		got["audio_idle"] != "routine" || got["mute_standby_routine"] != false ||
+		got["audio_topology"] != "force_layout" || got["alert_scene_id"] != "Standard_Crawl" {
 		t.Fatalf("v2 feed fields = %#v", got)
 	}
+	nestedAlert := got["alert"].(map[string]any)
+	nestedAudio := got["audio_routing"].(map[string]any)
+	if nestedAlert["audio_source"] != "both" || nestedAudio["idle_source"] != "routine" || nestedAudio["mute_standby_routine"] != false {
+		t.Fatalf("nested routing fields = alert %#v audio %#v", nestedAlert, nestedAudio)
+	}
 	outputs := got["outputs"].([]map[string]any)
-	if len(outputs) != 1 || outputs[0]["url"] != "${CGEN_PRIMARY_URL}" {
+	if len(outputs) != 1 || outputs[0]["url"] != "${CGEN_PRIMARY_URL}" ||
+		outputs[0]["interlaced"] != true || outputs[0]["field_order"] != "bff" {
 		t.Fatalf("outputs = %#v", outputs)
 	}
 	if _, err := saveCgenPayload(configPath, payload); err == nil || !strings.Contains(err.Error(), "expected_revision is required") {
@@ -467,8 +550,13 @@ func TestCgenV2RoundTripRevisionAndActionPreserveSections(t *testing.T) {
 	}
 	payload["expected_revision"] = stringValue(acted, "revision")
 	feed["name"] = "CGEN Main Updated"
-	if _, err := saveCgenPayload(configPath, payload); err != nil {
+	finalPayload, err := saveCgenPayload(configPath, payload)
+	if err != nil {
 		t.Fatalf("save with current revision: %v", err)
+	}
+	finalFeed := finalPayload["feeds"].([]map[string]any)[0]
+	if finalFeed["text"] != "Revision test" || finalFeed["mode"] != "overlay" {
+		t.Fatalf("canonical save dropped runtime-owned presentation state: %#v", finalFeed)
 	}
 }
 
@@ -538,6 +626,18 @@ func TestCgenV2RejectsDuplicateIDsPIDsAndUnsupportedRTMP(t *testing.T) {
 				return feed
 			}(),
 			want: "deinterlace algorithm",
+		},
+		{
+			name: "invalid deinterlace enabled value",
+			feed: func() map[string]any {
+				feed := baseFeed()
+				feed["program_input"] = map[string]any{
+					"type":                "dummy",
+					"deinterlace_enabled": "sometimes",
+				}
+				return feed
+			}(),
+			want: "deinterlace enabled value",
 		},
 		{
 			name: "hardware parity override",

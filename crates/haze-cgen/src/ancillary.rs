@@ -369,6 +369,7 @@ mod tests {
                     bitrate_kbps: NonZeroU32::new(4_000).expect("non-zero"),
                 },
                 gop_frames: NonZeroU32::new(60).expect("non-zero"),
+                scan: crate::architecture::ScanMode::Progressive,
             },
             audio: AudioEncoderSpec {
                 codec: AudioCodecPolicy::Encode(AudioCodec::Aac),

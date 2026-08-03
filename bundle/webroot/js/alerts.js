@@ -442,7 +442,10 @@ export function initAlertsArchiveView() {
         button.addEventListener('click', () => {
             activeTab = button.dataset.alertTab || 'accepted';
             document.querySelectorAll('[data-alert-tab]').forEach((tab) => {
-                tab.classList.toggle('active', tab === button);
+                const active = tab === button;
+                tab.classList.toggle('active', active);
+                tab.setAttribute('aria-selected', active ? 'true' : 'false');
+                tab.tabIndex = active ? 0 : -1;
             });
             renderArchive();
         });

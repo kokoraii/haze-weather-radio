@@ -6,6 +6,8 @@ mod same_cli;
 #[allow(dead_code)]
 mod same_core;
 mod signals;
+#[cfg(any(windows, target_os = "linux"))]
+mod tray;
 #[cfg(windows)]
 mod windows_service_host;
 
@@ -171,22 +173,74 @@ pub fn run(args: DaemonArgs) -> Result<()> {
         media_bridge.publisher(),
     )?;
     let mut go_services = go_services::GoServiceSupervisor::start(&host)?;
+    #[cfg(windows)]
+    let desktop_tray = if args.service {
+        None
+    } else {
+        tray::TrayController::start()
+    };
+    #[cfg(target_os = "linux")]
+    let desktop_tray = tray::TrayController::start();
     wait_for_shutdown(
+        &host,
         &mut daemon_services,
         &mut go_services,
         host_bridge.publisher(),
         service_events,
+        #[cfg(any(windows, target_os = "linux"))]
+        desktop_tray.as_ref(),
     )
 }
 
 fn wait_for_shutdown(
+    host: &ServiceHostConfig,
     daemon_services: &mut daemon_services::DaemonServices,
     go_services: &mut go_services::GoServiceSupervisor,
     publisher: Sender<Value>,
     service_events: Receiver<Value>,
+    #[cfg(any(windows, target_os = "linux"))] desktop_tray: Option<&tray::TrayController>,
 ) -> Result<()> {
     info!("Haze host services running");
     while !signals::shutdown_requested() {
+        #[cfg(any(windows, target_os = "linux"))]
+        if let Some(desktop_tray) = desktop_tray {
+            while let Some(command) = desktop_tray.try_recv() {
+                match command {
+                    tray::TrayCommand::OpenPublicPanel => {
+                        match go_services::public_panel_url(host) {
+                            Ok(url) => match tray::open_public_panel(&url) {
+                                Ok(()) => info!("opened public panel at {url}"),
+                                Err(err) => tracing::warn!("{err:#}"),
+                            },
+                            Err(err) => tracing::warn!(
+                                "failed to resolve the public panel address: {err:#}"
+                            ),
+                        }
+                    }
+                    tray::TrayCommand::RestartAllServices => {
+                        let _ = publisher.send(json!({
+                            "type": "service.restart_all.started",
+                            "source": "haze-tray",
+                        }));
+                        let restarted = go_services.restart_all();
+                        let _ = publisher.send(json!({
+                            "type": "service.restart_all.completed",
+                            "source": "haze-tray",
+                            "data": { "service_count": restarted },
+                        }));
+                        info!("desktop tray restarted {restarted} managed services");
+                    }
+                    tray::TrayCommand::Exit => {
+                        info!("desktop tray requested Haze shutdown");
+                        signals::request_shutdown();
+                        break;
+                    }
+                }
+            }
+        }
+        if signals::shutdown_requested() {
+            break;
+        }
         while let Ok(event) = service_events.try_recv() {
             if go_services.handle_control_event(&event) {
                 go_services.poll_children();
@@ -484,16 +538,20 @@ fn parse_env_value(raw: &str) -> String {
 
 #[cfg(windows)]
 fn process_alive(pid: u32) -> bool {
-    use windows_sys::Win32::Foundation::{CloseHandle, FALSE};
-    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    use windows_sys::Win32::Foundation::{CloseHandle, FALSE, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
 
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
         if handle.is_null() {
             return false;
         }
+        let mut exit_code = 0;
+        let queried = GetExitCodeProcess(handle, &mut exit_code);
         CloseHandle(handle);
-        true
+        queried != FALSE && exit_code == STILL_ACTIVE as u32
     }
 }
 
@@ -590,6 +648,20 @@ mod tests {
         assert_eq!(parse_lock_pid("1234\nextra"), Some(1234));
         assert_eq!(parse_lock_pid(" nope "), None);
         assert_eq!(parse_lock_pid(""), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_process_liveness_rejects_an_exited_process_with_an_open_handle() {
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "exit", "0"])
+            .spawn()
+            .expect("short-lived child should start");
+        let pid = child.id();
+        child.wait().expect("short-lived child should exit");
+
+        assert!(!process_alive(pid));
+        assert!(process_alive(std::process::id()));
     }
 
     #[test]

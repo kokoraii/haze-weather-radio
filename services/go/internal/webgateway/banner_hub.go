@@ -32,6 +32,7 @@ type bannerOnAirAlert struct {
 	AlertText          string
 	BannerText         string
 	BroadcastImmediate bool
+	CanonicalLocations []alertmodel.LocationReference
 	ExpiresAt          time.Time
 	UpdatedAt          time.Time
 }
@@ -153,6 +154,7 @@ func (h *BannerHub) handleEvent(raw []byte, now time.Time) {
 				AlertText:          fallbackString(packetField(packetFields, "alert_text"), event.Data.AlertText, event.Data.TTSText, event.Data.Text, event.Data.Message, item.AlertText),
 				BannerText:         fallbackString(packetField(packetFields, "banner_text"), event.Data.BannerText, item.BannerText),
 				BroadcastImmediate: packetBool(packetFields, "broadcast_immediate") || event.Data.BroadcastImmediate || item.BroadcastImmediate,
+				CanonicalLocations: bannerPacketLocations(packet, item.AlertPacket),
 				ExpiresAt:          now.Add(30 * time.Minute),
 				UpdatedAt:          now,
 			}
@@ -183,6 +185,19 @@ func (h *BannerHub) handleEvent(raw []byte, now time.Time) {
 			}
 		}
 	}
+}
+
+func bannerPacketLocations(packets ...*alertmodel.Packet) []alertmodel.LocationReference {
+	for _, packet := range packets {
+		if packet == nil {
+			continue
+		}
+		normalized := packet.Normalize()
+		if len(normalized.Areas.Locations) > 0 {
+			return append([]alertmodel.LocationReference(nil), normalized.Areas.Locations...)
+		}
+	}
+	return nil
 }
 
 func (h *BannerHub) queueItem(queueID string, feedID string) sameQueueItem {

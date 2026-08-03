@@ -67,17 +67,18 @@ type PostgresStore struct {
 }
 
 type LocationRecord struct {
-	Source     string
-	LocationID string
-	Kind       string
-	NameEN     string
-	NameFR     string
-	StationID  string
-	CityPageID string
-	CLC        string
-	Latitude   *float64
-	Longitude  *float64
-	Metadata   map[string]any
+	CanonicalID string
+	Source      string
+	LocationID  string
+	Kind        string
+	NameEN      string
+	NameFR      string
+	StationID   string
+	CityPageID  string
+	CLC         string
+	Latitude    *float64
+	Longitude   *float64
+	Metadata    map[string]any
 }
 
 type ObservationRecord struct {
@@ -230,6 +231,9 @@ func (s *PostgresStore) Migrate(ctx context.Context) error {
 	if _, err := s.pool.Exec(ctx, postgresSchemaSQL); err != nil {
 		return fmt.Errorf("migrate postgres datastore: %w", err)
 	}
+	if _, err := s.pool.Exec(ctx, `ALTER TABLE locations.locations ADD COLUMN IF NOT EXISTS canonical_id text`); err != nil {
+		return fmt.Errorf("add canonical location ID column: %w", err)
+	}
 	return nil
 }
 
@@ -248,10 +252,11 @@ func (s *PostgresStore) UpsertLocation(ctx context.Context, record LocationRecor
 	}
 	_, err = s.pool.Exec(ctx, `
 INSERT INTO locations.locations (
-    source, location_id, kind, name_en, name_fr, station_id, citypage_id, clc,
+    canonical_id, source, location_id, kind, name_en, name_fr, station_id, citypage_id, clc,
     latitude, longitude, metadata, last_seen
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb, now())
+) VALUES (NULLIF($1,''),$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb, now())
 ON CONFLICT (source, location_id) DO UPDATE SET
+    canonical_id = COALESCE(EXCLUDED.canonical_id, locations.locations.canonical_id),
     kind = COALESCE(NULLIF(EXCLUDED.kind, ''), locations.locations.kind),
     name_en = COALESCE(NULLIF(EXCLUDED.name_en, ''), locations.locations.name_en),
     name_fr = COALESCE(NULLIF(EXCLUDED.name_fr, ''), locations.locations.name_fr),
@@ -262,6 +267,7 @@ ON CONFLICT (source, location_id) DO UPDATE SET
     longitude = COALESCE(EXCLUDED.longitude, locations.locations.longitude),
     metadata = locations.locations.metadata || EXCLUDED.metadata,
     last_seen = now()`,
+		strings.TrimSpace(record.CanonicalID),
 		source,
 		locationID,
 		clean(record.Kind, "unknown"),

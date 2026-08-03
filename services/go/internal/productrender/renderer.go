@@ -108,6 +108,7 @@ func (r renderer) RenderWxOnDemand(request wxOnDemandRequest) (Product, error) {
 		Inputs:      inputs,
 		GeneratedAt: now,
 		Metadata: map[string]string{
+			"canonical_id":  request.CanonicalID,
 			"location_code": request.Code,
 			"location_name": locationName,
 			"source":        request.Source,
@@ -289,6 +290,9 @@ func productBase(cfg loadedConfig, feed feedXML, pkgID string, language string, 
 	}
 	if telephone {
 		product.Metadata["audience"] = "telephone"
+	}
+	if canonicalIDs := renderFeedCanonicalLocationIDs(feed); len(canonicalIDs) > 0 {
+		product.Metadata["canonical_location_ids"] = strings.Join(canonicalIDs, ",")
 	}
 	return product
 }

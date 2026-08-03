@@ -195,6 +195,7 @@ func (c *ProductCache) GetPrompt(ctx context.Context, menuID string, lineKey str
 		return CachedAudio{}, fmt.Errorf("IVR prompt %s/%s is not configured", menuID, lineKey)
 	}
 	policy := c.cfg.Prompts.TTSForMenu(menuID)
+	policy = promptPolicyLanguage(policy, values)
 	return c.getPromptAudio(ctx, menuID, lineKey, text, policy, force)
 }
 
@@ -203,7 +204,14 @@ func (c *ProductCache) GetPromptWithPolicy(ctx context.Context, menuID string, l
 	if text == "" {
 		return CachedAudio{}, fmt.Errorf("IVR prompt %s/%s is not configured", menuID, lineKey)
 	}
-	return c.getPromptAudio(ctx, menuID, lineKey, text, policy, force)
+	return c.getPromptAudio(ctx, menuID, lineKey, text, promptPolicyLanguage(policy, values), force)
+}
+
+func promptPolicyLanguage(policy TTSProfile, values map[string]string) TTSProfile {
+	if language := firstNonBlank(values["language"], values["lang"]); language != "" {
+		policy.Language = language
+	}
+	return policy
 }
 
 func (c *ProductCache) GetTextPromptWithPolicy(ctx context.Context, menuID string, lineKey string, text string, policy TTSProfile, force bool) (CachedAudio, error) {

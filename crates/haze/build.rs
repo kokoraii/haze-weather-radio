@@ -281,7 +281,7 @@ fn main() {
             || relative.starts_with("audio/") && !relative["audio/".len()..].contains('/')
     }
 
-    fn go_services() -> [(&'static str, &'static str); 7] {
+    fn go_services() -> [(&'static str, &'static str); 8] {
         [
             ("haze-web", "./cmd/haze-web"),
             ("haze-data-ingest", "./cmd/haze-data-ingest"),
@@ -289,6 +289,7 @@ fn main() {
             ("haze-product-render", "./cmd/haze-product-render"),
             ("haze-playlist", "./cmd/haze-playlist"),
             ("haze-webhook", "./cmd/haze-webhook"),
+            ("haze-asr", "./cmd/haze-asr"),
             ("haze-ivr", "./cmd/haze-ivr"),
         ]
     }

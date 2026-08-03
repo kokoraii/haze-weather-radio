@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/meowraii/haze-weather-radio/services/go/internal/alertmodel"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/capmodel"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/locationdb"
 )
@@ -167,29 +168,30 @@ type CAPMessageRequest struct {
 
 // SerializedAlert is a banner/archive friendly alert payload.
 type SerializedAlert struct {
-	Identifier         string   `json:"identifier"`
-	FeedID             string   `json:"feed_id,omitempty"`
-	DisplayID          string   `json:"display_id,omitempty"`
-	Headline           string   `json:"headline"`
-	Issuer             string   `json:"issuer"`
-	Event              string   `json:"event"`
-	Severity           string   `json:"severity"`
-	Urgency            string   `json:"urgency,omitempty"`
-	Certainty          string   `json:"certainty,omitempty"`
-	Areas              []string `json:"areas"`
-	AreaText           string   `json:"area_text"`
-	ReceivedAt         string   `json:"received_at,omitempty"`
-	EffectiveAt        string   `json:"effective_at,omitempty"`
-	OnsetAt            string   `json:"onset_at,omitempty"`
-	ExpiresAt          string   `json:"expires_at,omitempty"`
-	OnsetDisplay       string   `json:"onset_display,omitempty"`
-	ExpiresDisplay     string   `json:"expires_display,omitempty"`
-	Description        string   `json:"description,omitempty"`
-	Instruction        string   `json:"instruction,omitempty"`
-	Message            string   `json:"message"`
-	SourceKind         string   `json:"source_kind,omitempty"`
-	BackgroundColor    string   `json:"background_color"`
-	BackgroundGradient []string `json:"background_gradient"`
+	Identifier         string                         `json:"identifier"`
+	FeedID             string                         `json:"feed_id,omitempty"`
+	DisplayID          string                         `json:"display_id,omitempty"`
+	Headline           string                         `json:"headline"`
+	Issuer             string                         `json:"issuer"`
+	Event              string                         `json:"event"`
+	Severity           string                         `json:"severity"`
+	Urgency            string                         `json:"urgency,omitempty"`
+	Certainty          string                         `json:"certainty,omitempty"`
+	Areas              []string                       `json:"areas"`
+	AreaText           string                         `json:"area_text"`
+	CanonicalLocations []alertmodel.LocationReference `json:"canonical_locations,omitempty"`
+	ReceivedAt         string                         `json:"received_at,omitempty"`
+	EffectiveAt        string                         `json:"effective_at,omitempty"`
+	OnsetAt            string                         `json:"onset_at,omitempty"`
+	ExpiresAt          string                         `json:"expires_at,omitempty"`
+	OnsetDisplay       string                         `json:"onset_display,omitempty"`
+	ExpiresDisplay     string                         `json:"expires_display,omitempty"`
+	Description        string                         `json:"description,omitempty"`
+	Instruction        string                         `json:"instruction,omitempty"`
+	Message            string                         `json:"message"`
+	SourceKind         string                         `json:"source_kind,omitempty"`
+	BackgroundColor    string                         `json:"background_color"`
+	BackgroundGradient []string                       `json:"background_gradient"`
 }
 
 // CleanFragment compacts whitespace and trims a value for spoken text.

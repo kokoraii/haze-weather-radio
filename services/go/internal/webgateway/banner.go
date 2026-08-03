@@ -271,6 +271,9 @@ func buildBannerPayload(configPath string, feedID string, hub *BannerHub) banner
 	for _, record := range records {
 		info := chooseArchiveInfo(record.Alert)
 		areas := archiveAreaNames(info)
+		if canonicalNames := bannerCanonicalLocationNames(record.CanonicalLocations); len(canonicalNames) > 0 {
+			areas = canonicalNames
+		}
 		serialized := alerttext.SerializeCAPAlert(
 			record.Alert,
 			info,
@@ -280,6 +283,7 @@ func buildBannerPayload(configPath string, feedID string, hub *BannerHub) banner
 			"cap",
 			now,
 		)
+		serialized.CanonicalLocations = append([]alertmodel.LocationReference(nil), record.CanonicalLocations...)
 		if text := strings.TrimSpace(fallbackString(record.BannerText, record.AlertText)); text != "" {
 			serialized.Message = text
 		}
@@ -374,6 +378,9 @@ func onAirBannerRecords(configPath string, feedID string, hub *BannerHub, now ti
 		if text := strings.TrimSpace(item.BannerText); text != "" {
 			record.BannerText = text
 		}
+		if len(item.CanonicalLocations) > 0 {
+			record.CanonicalLocations = append([]alertmodel.LocationReference(nil), item.CanonicalLocations...)
+		}
 		if archiveAlertExpired(record.Alert, now) {
 			continue
 		}
@@ -426,10 +433,32 @@ func activeQueueBannerAlerts(configPath string, feedID string, now time.Time) []
 				AlertText:          fallbackString(packetField(packetFields, "alert_text"), item.AlertText),
 				BannerText:         fallbackString(packetField(packetFields, "banner_text"), item.BannerText),
 				BroadcastImmediate: packetBool(packetFields, "broadcast_immediate") || item.BroadcastImmediate,
+				CanonicalLocations: bannerPacketLocations(item.AlertPacket),
 				ExpiresAt:          expires,
 				UpdatedAt:          now,
 			})
 		}
+	}
+	return out
+}
+
+func bannerCanonicalLocationNames(locations []alertmodel.LocationReference) []string {
+	out := make([]string, 0, len(locations))
+	seen := map[string]struct{}{}
+	for _, location := range locations {
+		if !location.Actionable || strings.TrimSpace(location.CanonicalID) == "" || location.Ambiguous {
+			continue
+		}
+		name := strings.TrimSpace(location.Name)
+		if name == "" {
+			continue
+		}
+		key := strings.ToLower(name)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, name)
 	}
 	return out
 }

@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
+use std::env;
 use std::fmt;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -42,11 +44,20 @@ struct ServicesConfig {
 
 #[derive(Debug, Default, Deserialize)]
 struct RustServicesConfig {
+    location: Option<RustLocationConfig>,
     media: Option<RustMediaConfig>,
     playout: Option<RustPlayoutConfig>,
     cgen: Option<RustCgenConfig>,
     cap_ingest: Option<RustCapIngestConfig>,
     easnet: Option<RustEasNetConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RustLocationConfig {
+    enabled: Option<bool>,
+    executable: Option<PathBuf>,
+    config: Option<PathBuf>,
+    scheduler: Option<ServiceSchedulerConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -119,6 +130,7 @@ struct GoServicesConfig {
     product_render: Option<ProductRenderConfig>,
     playlist: Option<PlaylistConfig>,
     webhook: Option<WebhookConfig>,
+    asr: Option<AsrConfig>,
     ivr: Option<IvrConfig>,
 }
 
@@ -134,8 +146,10 @@ struct WebPanelConfig {
     host: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_port")]
     port: Option<u16>,
+    public_port: Option<WebPanelPublicPortConfig>,
     public: Option<WebPanelSurfaceConfig>,
     admin: Option<WebPanelSurfaceConfig>,
+    tls: Option<WebPanelTlsConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -144,6 +158,22 @@ struct WebPanelSurfaceConfig {
     host: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_port")]
     port: Option<u16>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WebPanelPublicPortConfig {
+    enabled: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_optional_port")]
+    http_port: Option<u16>,
+    #[serde(default, deserialize_with = "deserialize_optional_port")]
+    https_port: Option<u16>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WebPanelTlsConfig {
+    enabled: Option<bool>,
+    #[serde(default)]
+    domains: Vec<String>,
 }
 
 fn deserialize_optional_port<'de, D>(deserializer: D) -> std::result::Result<Option<u16>, D::Error>
@@ -295,6 +325,12 @@ struct WebhookConfig {
     executable: Option<PathBuf>,
     webhooks: Option<String>,
     timeout: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AsrConfig {
+    enabled: Option<bool>,
+    executable: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -706,6 +742,32 @@ impl GoServiceSupervisor {
         stopped || started
     }
 
+    pub(crate) fn restart_all(&mut self) -> usize {
+        let indexes = self
+            .services
+            .iter()
+            .enumerate()
+            .filter_map(|(index, service)| {
+                (service.desired == DesiredState::Running).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if indexes.is_empty() {
+            return 0;
+        }
+
+        info!("restarting {} managed services", indexes.len());
+        for index in indexes.iter().copied() {
+            self.services[index].next_restart = None;
+            self.stop_service(index, "restarting", "operator_restart_all");
+        }
+        self.write_status();
+        for index in indexes.iter().copied() {
+            self.start_service(index, "operator_restart_all");
+        }
+        self.write_status();
+        indexes.len()
+    }
+
     fn stop_service(&mut self, index: usize, final_status: &str, reason: &str) -> bool {
         let spec = self.services[index].spec.clone();
         let Some(mut child) = self.services[index].child.take() else {
@@ -932,6 +994,11 @@ impl Drop for GoServiceSupervisor {
 }
 
 fn service_specs(root: &RootConfig, host: &ServiceHostConfig) -> Vec<ServiceSpec> {
+    let rust_location = root
+        .services
+        .as_ref()
+        .and_then(|services| services.rust.as_ref())
+        .and_then(|services| services.location.as_ref());
     let rust_playout = root
         .services
         .as_ref()
@@ -959,6 +1026,32 @@ fn service_specs(root: &RootConfig, host: &ServiceHostConfig) -> Vec<ServiceSpec
         .and_then(|services| services.easnet.as_ref());
     let mut specs = Vec::new();
     let mut deferred_cap_specs = Vec::new();
+
+    if let Some(location) = rust_location.filter(|location| location.enabled.unwrap_or(false)) {
+        specs.push(ServiceSpec {
+            id: "svc:location",
+            kind: "managed",
+            binary: executable_name("haze-location"),
+            configured_executable: location.executable.clone(),
+            args: vec![
+                "--config".to_string(),
+                host.config_path.to_string_lossy().into_owned(),
+                "--locations".to_string(),
+                location
+                    .config
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("managed/configs/locations.xml"))
+                    .to_string_lossy()
+                    .into_owned(),
+                "--bridge".to_string(),
+                std::env::var("HAZE_HOST_BRIDGE_ADDR").unwrap_or_default(),
+            ],
+            scheduler: ProcessScheduler::from_config(
+                location.scheduler.as_ref(),
+                ProcessScheduler::default(),
+            ),
+        });
+    }
 
     if let Some(go) = root
         .services
@@ -1201,6 +1294,24 @@ fn service_specs(root: &RootConfig, host: &ServiceHostConfig) -> Vec<ServiceSpec
                     binary: executable_name("haze-webhook"),
                     configured_executable: webhook.executable.clone(),
                     args,
+                    scheduler: ProcessScheduler::default(),
+                });
+            }
+        }
+
+        if let Some(asr) = &go.asr {
+            if asr.enabled.unwrap_or(false) {
+                specs.push(ServiceSpec {
+                    id: "svc:asr",
+                    kind: "managed",
+                    binary: executable_name("haze-asr"),
+                    configured_executable: asr.executable.clone(),
+                    args: vec![
+                        "--config".to_string(),
+                        host.config_path.to_string_lossy().into_owned(),
+                        "--bridge".to_string(),
+                        std::env::var("HAZE_HOST_BRIDGE_ADDR").unwrap_or_default(),
+                    ],
                     scheduler: ProcessScheduler::default(),
                 });
             }
@@ -1652,6 +1763,138 @@ fn webpanel_addr(
     format!("{host}:{port}")
 }
 
+pub(crate) fn public_panel_url(host: &ServiceHostConfig) -> Result<String> {
+    for name in ["HAZE_PUBLIC_BASE_URL", "WEB_BASE_URL", "WEB_HOSTNAME"] {
+        if let Ok(value) = env::var(name) {
+            if let Some(url) = normalize_public_base_url(&value) {
+                return Ok(url);
+            }
+        }
+    }
+
+    let root = load_config_with_overlay(&host.config_path, &host.app_dir, &host.runtime_dir)?;
+    Ok(public_panel_url_from_config(&root))
+}
+
+fn public_panel_url_from_config(root: &RootConfig) -> String {
+    let Some(panel) = root.webpanel.as_ref() else {
+        let configured_addr = root
+            .services
+            .as_ref()
+            .and_then(|services| services.go.as_ref())
+            .and_then(|services| services.web_gateway.as_ref())
+            .and_then(|web| web.addr.as_deref())
+            .unwrap_or("0.0.0.0:6444");
+        let (host, port) = split_listen_addr(configured_addr, 6444);
+        return format_panel_url("http", &browser_host(&host), port);
+    };
+
+    let tls_enabled = panel
+        .tls
+        .as_ref()
+        .and_then(|tls| tls.enabled)
+        .unwrap_or(false);
+    let public_port = panel.public_port.as_ref();
+    let use_public_port = public_port
+        .and_then(|public_port| public_port.enabled)
+        .unwrap_or(false);
+    let port = if use_public_port {
+        if tls_enabled {
+            public_port
+                .and_then(|public_port| public_port.https_port)
+                .unwrap_or(443)
+        } else {
+            public_port
+                .and_then(|public_port| public_port.http_port)
+                .unwrap_or(80)
+        }
+    } else {
+        panel
+            .public
+            .as_ref()
+            .and_then(|public| public.port)
+            .or(panel.port)
+            .unwrap_or(6444)
+    };
+    let configured_host = panel
+        .public
+        .as_ref()
+        .and_then(|public| public.host.as_deref())
+        .or(panel.host.as_deref())
+        .unwrap_or("0.0.0.0");
+    let tls_domain = tls_enabled.then(|| {
+        panel
+            .tls
+            .as_ref()
+            .and_then(|tls| tls.domains.iter().find(|domain| !domain.trim().is_empty()))
+            .map(String::as_str)
+    });
+    let public_host = tls_domain.flatten().unwrap_or(configured_host);
+    let scheme = if tls_enabled { "https" } else { "http" };
+    format_panel_url(scheme, &browser_host(public_host), port)
+}
+
+fn normalize_public_base_url(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value
+        .split_once("://")
+        .is_some_and(|(scheme, _)| scheme != "http" && scheme != "https")
+    {
+        return None;
+    }
+    let candidate = if value.starts_with("http://") || value.starts_with("https://") {
+        value.to_string()
+    } else {
+        format!("https://{value}")
+    };
+    let (_, remainder) = candidate.split_once("://")?;
+    let authority = remainder.split('/').next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') || authority.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+    Some(candidate.trim_end_matches('/').to_string())
+}
+
+fn browser_host(raw: &str) -> String {
+    let host = raw.trim().trim_start_matches('[').trim_end_matches(']');
+    match host {
+        "" | "0.0.0.0" => "127.0.0.1".to_string(),
+        "::" => "::1".to_string(),
+        _ => host.to_string(),
+    }
+}
+
+fn split_listen_addr(raw: &str, default_port: u16) -> (String, u16) {
+    if let Ok(addr) = raw.trim().parse::<SocketAddr>() {
+        return (addr.ip().to_string(), addr.port());
+    }
+    let Some((host, port)) = raw.trim().rsplit_once(':') else {
+        return (raw.trim().to_string(), default_port);
+    };
+    match port.parse::<u16>() {
+        Ok(port) => (host.trim_matches(['[', ']']).to_string(), port),
+        Err(_) => (raw.trim().to_string(), default_port),
+    }
+}
+
+fn format_panel_url(scheme: &str, host: &str, port: u16) -> String {
+    let formatted_host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let default_port = (scheme == "http" && port == 80) || (scheme == "https" && port == 443);
+    if default_port {
+        format!("{scheme}://{formatted_host}")
+    } else {
+        format!("{scheme}://{formatted_host}:{port}")
+    }
+}
+
 fn executable_name(base: &'static str) -> &'static str {
     #[cfg(windows)]
     {
@@ -1664,6 +1907,8 @@ fn executable_name(base: &'static str) -> &'static str {
             "haze-product-render" => "haze-product-render.exe",
             "haze-playlist" => "haze-playlist.exe",
             "haze-webhook" => "haze-webhook.exe",
+            "haze-location" => "haze-location.exe",
+            "haze-asr" => "haze-asr.exe",
             "haze-ivr" => "haze-ivr.exe",
             "haze-playout-rs" => "haze-playout-rs.exe",
             "haze-cgen" => "haze-cgen.exe",
@@ -1830,13 +2075,17 @@ fn is_known_managed_executable(path: &str) -> bool {
         executable_name("haze-web"),
         executable_name("haze-data-ingest"),
         executable_name("haze-cap-ingest"),
+        executable_name("haze-location"),
         executable_name("haze-tts"),
         executable_name("haze-product-render"),
         executable_name("haze-playlist"),
         executable_name("haze-webhook"),
+        executable_name("haze-asr"),
         executable_name("haze-ivr"),
         executable_name("haze-playout-rs"),
         executable_name("haze-cgen"),
+        executable_name("haze-media"),
+        executable_name("haze-easnet"),
     ]
     .into_iter()
     .any(|known| known.eq_ignore_ascii_case(&file_name))
@@ -1979,6 +2228,7 @@ fn is_go_service_binary(binary: &str) -> bool {
             | "haze-product-render"
             | "haze-playlist"
             | "haze-webhook"
+            | "haze-asr"
             | "haze-ivr"
     )
 }
@@ -1988,7 +2238,9 @@ fn go_memory_limit(id: &str) -> Option<&'static str> {
         "aux:tts" => Some("384MiB"),
         "svc:ivr" => Some("192MiB"),
         "go:web_gateway" | "go:web_public" | "go:web_admin" => Some("192MiB"),
-        "svc:data_ingest" | "svc:product_render" | "svc:playlist" | "svc:webhook" => Some("128MiB"),
+        "svc:data_ingest" | "svc:product_render" | "svc:playlist" | "svc:webhook" | "svc:asr" => {
+            Some("128MiB")
+        }
         _ => Some("128MiB"),
     }
 }
@@ -2255,6 +2507,7 @@ fn service_label(service_id: &str) -> &str {
         "svc:product_render" => "Product render",
         "svc:playlist" => "Playlist",
         "svc:webhook" => "Webhook",
+        "svc:asr" => "Speech recognition",
         "svc:ivr" => "IVR",
         "svc:playout" => "Playout",
         "svc:cgen" => "CG renderer",
@@ -2375,7 +2628,7 @@ fn strip_rust_target_prefix(line: &str) -> &str {
 }
 
 fn strip_redundant_service_prefix(line: &str) -> &str {
-    const PREFIXES: [&str; 14] = [
+    const PREFIXES: [&str; 16] = [
         "haze-web: ",
         "haze-web ",
         "haze-data-ingest: ",
@@ -2388,6 +2641,8 @@ fn strip_redundant_service_prefix(line: &str) -> &str {
         "haze-product-render ",
         "haze-playlist: ",
         "haze-playlist ",
+        "haze-asr: ",
+        "haze-asr ",
         "haze-ivr: ",
         "haze-ivr ",
     ];
@@ -2414,6 +2669,19 @@ mod tests {
             runtime_dir: PathBuf::from("runtime"),
             config_path: PathBuf::from("config.yaml"),
         }
+    }
+
+    #[test]
+    fn location_is_a_known_managed_executable() {
+        assert!(is_known_managed_executable(executable_name(
+            "haze-location"
+        )));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn location_uses_the_windows_executable_suffix() {
+        assert_eq!(executable_name("haze-location"), "haze-location.exe");
     }
 
     #[test]
@@ -2510,6 +2778,84 @@ services:
     }
 
     #[test]
+    fn public_panel_url_uses_loopback_for_a_wildcard_listener() {
+        let root: RootConfig = serde_yaml::from_str(
+            r#"
+webpanel:
+  host: 0.0.0.0
+  port: 18080
+  public:
+    enabled: true
+    host: 0.0.0.0
+    port: 18080
+  tls:
+    enabled: false
+"#,
+        )
+        .expect("config");
+
+        assert_eq!(
+            public_panel_url_from_config(&root),
+            "http://127.0.0.1:18080"
+        );
+    }
+
+    #[test]
+    fn public_panel_url_uses_tls_domain_and_public_https_port() {
+        let root: RootConfig = serde_yaml::from_str(
+            r#"
+webpanel:
+  public_port:
+    enabled: true
+    https_port: 443
+  public:
+    enabled: true
+    host: 0.0.0.0
+    port: 6444
+  tls:
+    enabled: true
+    domains: [weather.example]
+"#,
+        )
+        .expect("config");
+
+        assert_eq!(
+            public_panel_url_from_config(&root),
+            "https://weather.example"
+        );
+    }
+
+    #[test]
+    fn public_panel_url_supports_legacy_ipv6_listener() {
+        let root: RootConfig = serde_yaml::from_str(
+            r#"
+services:
+  go:
+    enabled: true
+    web_gateway:
+      enabled: true
+      addr: "[::]:7444"
+"#,
+        )
+        .expect("config");
+
+        assert_eq!(public_panel_url_from_config(&root), "http://[::1]:7444");
+    }
+
+    #[test]
+    fn configured_public_base_url_rejects_credentials_and_non_http_schemes() {
+        assert_eq!(
+            normalize_public_base_url("radio.example"),
+            Some("https://radio.example".to_string())
+        );
+        assert_eq!(
+            normalize_public_base_url("https://user:pass@example.com"),
+            None
+        );
+        assert_eq!(normalize_public_base_url("ftp://example.com"), None);
+    }
+
+    #[test]
     fn ivr_service_uses_separate_pcm_media_bridge() {
         let root: RootConfig = serde_yaml::from_str(
             r#"
@@ -2529,6 +2875,27 @@ services:
         assert_eq!(specs[0].binary, executable_name("haze-ivr"));
         assert!(specs[0].args.contains(&"--bridge".to_string()));
         assert!(specs[0].args.contains(&"--media-bridge".to_string()));
+    }
+
+    #[test]
+    fn asr_service_uses_host_event_bridge() {
+        let root: RootConfig = serde_yaml::from_str(
+            r#"
+services:
+  go:
+    enabled: true
+    asr:
+      enabled: true
+"#,
+        )
+        .expect("config");
+
+        let specs = service_specs(&root, &test_host());
+
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].id, "svc:asr");
+        assert_eq!(specs[0].binary, executable_name("haze-asr"));
+        assert!(specs[0].args.contains(&"--bridge".to_string()));
     }
 
     #[test]

@@ -28,7 +28,7 @@ const ANCILLARY_DEFAULTS: [(&str, &str); 3] = [
     ("scte104", "drop"),
 ];
 const COMPOSITOR_DEFAULTS: [(&str, &str); 2] =
-    [("alert_scene_id", "Standard_Crawl"), ("engine", "legacy")];
+    [("alert_scene_id", "Standard_Crawl"), ("engine", "scene_v2")];
 fn audio_defaults(force_layout: &str) -> [(&str, &str); 6] {
     [
         ("topology", "force_layout"),

@@ -87,11 +87,14 @@ type adminFeedDescriptionLangXML struct {
 }
 
 type adminFeedLocationsXML struct {
-	Coverage             adminFeedCoverageXML  `xml:"coverage"`
-	ObservationLocations adminFeedLocationList `xml:"observationLocations,omitempty"`
-	AirQualityLocations  adminFeedLocationList `xml:"airQualityLocations,omitempty"`
-	ClimateLocations     adminFeedLocationList `xml:"climateLocations,omitempty"`
-	HydrometricLocations adminFeedLocationList `xml:"hydrometricLocations,omitempty"`
+	Coverage                adminFeedCoverageXML          `xml:"coverage"`
+	ObservationLocations    adminFeedLocationList         `xml:"observationLocations,omitempty"`
+	AviationReportLocations adminFeedLocationList         `xml:"aviationReportLocations,omitempty"`
+	AirQualityLocations     adminFeedLocationList         `xml:"airQualityLocations,omitempty"`
+	ClimateLocations        adminFeedLocationList         `xml:"climateLocations,omitempty"`
+	MarineForecastLocations adminFeedMarineForecastXML    `xml:"marineForecastLocations,omitempty"`
+	MarineConditions        adminFeedLocationList         `xml:"marineConditions,omitempty"`
+	HydrometricLocations    adminFeedHydrometricLocations `xml:"hydrometricLocations,omitempty"`
 }
 
 type adminFeedCoverageXML struct {
@@ -99,15 +102,20 @@ type adminFeedCoverageXML struct {
 }
 
 type adminFeedCoverageRegionXML struct {
-	ID             string                  `xml:"id,attr"`
-	Source         string                  `xml:"source,attr,omitempty"`
-	Name           string                  `xml:"name,attr,omitempty"`
-	DeriveForecast string                  `xml:"derive_forecast,attr,omitempty"`
-	Subregions     []adminFeedSubregionXML `xml:"subregion,omitempty"`
+	ID                  string                  `xml:"id,attr"`
+	Source              string                  `xml:"source,attr,omitempty"`
+	Name                string                  `xml:"name,attr,omitempty"`
+	DeriveForecast      string                  `xml:"derive_forecast,attr,omitempty"`
+	CanonicalID         string                  `xml:"canonical_id,attr,omitempty"`
+	ForecastCanonicalID string                  `xml:"forecast_canonical_id,attr,omitempty"`
+	Subregions          []adminFeedSubregionXML `xml:"subregion,omitempty"`
 }
 
 type adminFeedSubregionXML struct {
-	ID string `xml:"id,attr"`
+	ID          string `xml:"id,attr"`
+	Source      string `xml:"source,attr,omitempty"`
+	Name        string `xml:"name,attr,omitempty"`
+	CanonicalID string `xml:"canonical_id,attr,omitempty"`
 }
 
 type adminFeedLocationList struct {
@@ -119,6 +127,20 @@ type adminFeedLocationXML struct {
 	Source       string `xml:"source,attr,omitempty"`
 	NameOverride string `xml:"name_override,attr,omitempty"`
 	NormalID     string `xml:"normal_id,attr,omitempty"`
+	Latitude     string `xml:"latitude,attr,omitempty"`
+	Longitude    string `xml:"longitude,attr,omitempty"`
+	CanonicalID  string `xml:"canonical_id,attr,omitempty"`
+}
+
+type adminFeedMarineForecastXML struct {
+	Locations  []adminFeedLocationXML `xml:"location,omitempty"`
+	Subregions []adminFeedLocationXML `xml:"subregion,omitempty"`
+}
+
+type adminFeedHydrometricLocations struct {
+	Locations  []adminFeedLocationXML `xml:"location,omitempty"`
+	Upstream   adminFeedLocationList  `xml:"upstream,omitempty"`
+	Downstream adminFeedLocationList  `xml:"downstream,omitempty"`
 }
 
 type adminFeedTransmitterBlock struct {
@@ -295,9 +317,15 @@ func normalizeDescriptionLangs(langs []adminFeedDescriptionLangXML) []adminFeedD
 func normalizeAdminFeedLocations(loc adminFeedLocationsXML) adminFeedLocationsXML {
 	loc.Coverage.Regions = normalizeCoverageRegions(loc.Coverage.Regions)
 	loc.ObservationLocations.Locations = normalizeAdminLocations(loc.ObservationLocations.Locations)
+	loc.AviationReportLocations.Locations = normalizeAdminLocations(loc.AviationReportLocations.Locations)
 	loc.AirQualityLocations.Locations = normalizeAdminLocations(loc.AirQualityLocations.Locations)
 	loc.ClimateLocations.Locations = normalizeAdminLocations(loc.ClimateLocations.Locations)
 	loc.HydrometricLocations.Locations = normalizeAdminLocations(loc.HydrometricLocations.Locations)
+	loc.HydrometricLocations.Upstream.Locations = normalizeAdminLocations(loc.HydrometricLocations.Upstream.Locations)
+	loc.HydrometricLocations.Downstream.Locations = normalizeAdminLocations(loc.HydrometricLocations.Downstream.Locations)
+	loc.MarineForecastLocations.Locations = normalizeAdminLocations(loc.MarineForecastLocations.Locations)
+	loc.MarineForecastLocations.Subregions = normalizeAdminLocations(loc.MarineForecastLocations.Subregions)
+	loc.MarineConditions.Locations = normalizeAdminLocations(loc.MarineConditions.Locations)
 	return loc
 }
 
@@ -311,6 +339,14 @@ func normalizeCoverageRegions(regions []adminFeedCoverageRegionXML) []adminFeedC
 		region.Source = fallbackText(region.Source, "eccc")
 		region.Name = strings.TrimSpace(region.Name)
 		region.DeriveForecast = strings.TrimSpace(region.DeriveForecast)
+		region.CanonicalID = strings.TrimSpace(region.CanonicalID)
+		region.ForecastCanonicalID = strings.TrimSpace(region.ForecastCanonicalID)
+		for index := range region.Subregions {
+			region.Subregions[index].ID = strings.TrimSpace(region.Subregions[index].ID)
+			region.Subregions[index].Source = strings.TrimSpace(region.Subregions[index].Source)
+			region.Subregions[index].Name = strings.TrimSpace(region.Subregions[index].Name)
+			region.Subregions[index].CanonicalID = strings.TrimSpace(region.Subregions[index].CanonicalID)
+		}
 		out = append(out, region)
 	}
 	return out
@@ -326,6 +362,9 @@ func normalizeAdminLocations(items []adminFeedLocationXML) []adminFeedLocationXM
 		item.Source = fallbackText(item.Source, "eccc")
 		item.NameOverride = strings.TrimSpace(item.NameOverride)
 		item.NormalID = strings.TrimSpace(item.NormalID)
+		item.Latitude = strings.TrimSpace(item.Latitude)
+		item.Longitude = strings.TrimSpace(item.Longitude)
+		item.CanonicalID = strings.TrimSpace(item.CanonicalID)
 		out = append(out, item)
 	}
 	return out
@@ -373,9 +412,15 @@ func adminFeedFromMap(raw any) (adminFeedXML, error) {
 	feed.Alerts.NWSCAP = adminAlertSourceFromMap(m, "nws_cap")
 	feed.Locations.Coverage.Regions = coverageRegionsFromText(stringPayload(m, "coverage_regions", ""))
 	feed.Locations.ObservationLocations.Locations = locationsFromText(stringPayload(m, "observation_locations", ""))
+	feed.Locations.AviationReportLocations.Locations = locationsFromText(stringPayload(m, "aviation_report_locations", ""))
 	feed.Locations.AirQualityLocations.Locations = locationsFromText(stringPayload(m, "air_quality_locations", ""))
 	feed.Locations.ClimateLocations.Locations = locationsFromText(stringPayload(m, "climate_locations", ""))
 	feed.Locations.HydrometricLocations.Locations = locationsFromText(stringPayload(m, "hydrometric_locations", ""))
+	feed.Locations.HydrometricLocations.Upstream.Locations = locationsFromText(stringPayload(m, "hydrometric_upstream_locations", ""))
+	feed.Locations.HydrometricLocations.Downstream.Locations = locationsFromText(stringPayload(m, "hydrometric_downstream_locations", ""))
+	feed.Locations.MarineForecastLocations.Locations = locationsFromText(stringPayload(m, "marine_forecast_locations", ""))
+	feed.Locations.MarineForecastLocations.Subregions = locationsFromText(stringPayload(m, "marine_forecast_subregions", ""))
+	feed.Locations.MarineConditions.Locations = locationsFromText(stringPayload(m, "marine_condition_locations", ""))
 	feed.Tx.Transmitters = []adminFeedTransmitterXML{{
 		SiteName:     stringPayload(m, "site_name", feed.ID),
 		Callsign:     stringPayload(m, "callsign", ""),
@@ -421,6 +466,22 @@ func coverageRegionsFromText(text string) []adminFeedCoverageRegionXML {
 		if len(parts) > 2 {
 			region.DeriveForecast = strings.TrimSpace(parts[2])
 		}
+		if len(parts) > 3 {
+			region.Name = strings.TrimSpace(parts[3])
+		}
+		if len(parts) > 4 {
+			region.CanonicalID = strings.TrimSpace(parts[4])
+		}
+		if len(parts) > 5 {
+			region.ForecastCanonicalID = strings.TrimSpace(parts[5])
+		}
+		if len(parts) > 6 {
+			for _, rawSubregion := range strings.Split(parts[6], "+") {
+				if id := strings.TrimSpace(rawSubregion); id != "" {
+					region.Subregions = append(region.Subregions, adminFeedSubregionXML{ID: id})
+				}
+			}
+		}
 		out = append(out, region)
 	}
 	return out
@@ -439,6 +500,15 @@ func locationsFromText(text string) []adminFeedLocationXML {
 		}
 		if len(parts) > 3 {
 			item.NormalID = strings.TrimSpace(parts[3])
+		}
+		if len(parts) > 4 {
+			item.Latitude = strings.TrimSpace(parts[4])
+		}
+		if len(parts) > 5 {
+			item.Longitude = strings.TrimSpace(parts[5])
+		}
+		if len(parts) > 6 {
+			item.CanonicalID = strings.TrimSpace(parts[6])
 		}
 		out = append(out, item)
 	}
@@ -512,35 +582,41 @@ func adminFeedPayload(feed adminFeedXML, runtime map[string]any) map[string]any 
 		desc = feed.Desc.Langs[0]
 	}
 	return map[string]any{
-		"id":                         feed.ID,
-		"enabled":                    xmlBool(feed.Enabled, true),
-		"timezone":                   feed.Timezone,
-		"routine":                    xmlBool(feed.Playout.Routine, true),
-		"same":                       xmlBool(feed.Playout.SAME, true),
-		"same_originator":            feed.Playout.SAMEOriginator,
-		"same_attention_tone":        feed.Playout.SAMEAttentionTone,
-		"cap_cp_enabled":             xmlBool(feed.Alerts.CapCP.Enabled, true),
-		"cap_cp_use_feed_locations":  xmlBool(feed.Alerts.CapCP.Filter.UseFeedLocations, true),
-		"cap_cp_allowlist":           ruleListText(feed.Alerts.CapCP.Filter.Allowlist),
-		"cap_cp_blocklist":           ruleListText(feed.Alerts.CapCP.Filter.Blocklist),
-		"nws_cap_enabled":            xmlBool(feed.Alerts.NWSCAP.Enabled, false),
-		"nws_cap_use_feed_locations": xmlBool(feed.Alerts.NWSCAP.Filter.UseFeedLocations, true),
-		"nws_cap_allowlist":          ruleListText(feed.Alerts.NWSCAP.Filter.Allowlist),
-		"nws_cap_blocklist":          ruleListText(feed.Alerts.NWSCAP.Filter.Blocklist),
-		"languages":                  langListText(feed.Languages.Langs),
-		"description_lang":           fallbackText(desc.Code, "en-CA"),
-		"description_text":           desc.Text,
-		"description_suffix":         desc.Suffix,
-		"coverage_regions":           coverageRegionsText(feed.Locations.Coverage.Regions),
-		"observation_locations":      locationsText(feed.Locations.ObservationLocations.Locations),
-		"air_quality_locations":      locationsText(feed.Locations.AirQualityLocations.Locations),
-		"climate_locations":          locationsText(feed.Locations.ClimateLocations.Locations),
-		"hydrometric_locations":      locationsText(feed.Locations.HydrometricLocations.Locations),
-		"site_name":                  tx.SiteName,
-		"callsign":                   tx.Callsign,
-		"relationship":               tx.Relationship,
-		"frequency_mhz":              tx.FrequencyMHz.Value,
-		"runtime":                    runtime,
+		"id":                               feed.ID,
+		"enabled":                          xmlBool(feed.Enabled, true),
+		"timezone":                         feed.Timezone,
+		"routine":                          xmlBool(feed.Playout.Routine, true),
+		"same":                             xmlBool(feed.Playout.SAME, true),
+		"same_originator":                  feed.Playout.SAMEOriginator,
+		"same_attention_tone":              feed.Playout.SAMEAttentionTone,
+		"cap_cp_enabled":                   xmlBool(feed.Alerts.CapCP.Enabled, true),
+		"cap_cp_use_feed_locations":        xmlBool(feed.Alerts.CapCP.Filter.UseFeedLocations, true),
+		"cap_cp_allowlist":                 ruleListText(feed.Alerts.CapCP.Filter.Allowlist),
+		"cap_cp_blocklist":                 ruleListText(feed.Alerts.CapCP.Filter.Blocklist),
+		"nws_cap_enabled":                  xmlBool(feed.Alerts.NWSCAP.Enabled, false),
+		"nws_cap_use_feed_locations":       xmlBool(feed.Alerts.NWSCAP.Filter.UseFeedLocations, true),
+		"nws_cap_allowlist":                ruleListText(feed.Alerts.NWSCAP.Filter.Allowlist),
+		"nws_cap_blocklist":                ruleListText(feed.Alerts.NWSCAP.Filter.Blocklist),
+		"languages":                        langListText(feed.Languages.Langs),
+		"description_lang":                 fallbackText(desc.Code, "en-CA"),
+		"description_text":                 desc.Text,
+		"description_suffix":               desc.Suffix,
+		"coverage_regions":                 coverageRegionsText(feed.Locations.Coverage.Regions),
+		"observation_locations":            locationsText(feed.Locations.ObservationLocations.Locations),
+		"aviation_report_locations":        locationsText(feed.Locations.AviationReportLocations.Locations),
+		"air_quality_locations":            locationsText(feed.Locations.AirQualityLocations.Locations),
+		"climate_locations":                locationsText(feed.Locations.ClimateLocations.Locations),
+		"hydrometric_locations":            locationsText(feed.Locations.HydrometricLocations.Locations),
+		"hydrometric_upstream_locations":   locationsText(feed.Locations.HydrometricLocations.Upstream.Locations),
+		"hydrometric_downstream_locations": locationsText(feed.Locations.HydrometricLocations.Downstream.Locations),
+		"marine_forecast_locations":        locationsText(feed.Locations.MarineForecastLocations.Locations),
+		"marine_forecast_subregions":       locationsText(feed.Locations.MarineForecastLocations.Subregions),
+		"marine_condition_locations":       locationsText(feed.Locations.MarineConditions.Locations),
+		"site_name":                        tx.SiteName,
+		"callsign":                         tx.Callsign,
+		"relationship":                     tx.Relationship,
+		"frequency_mhz":                    tx.FrequencyMHz.Value,
+		"runtime":                          runtime,
 	}
 }
 
@@ -555,7 +631,19 @@ func langListText(langs []adminFeedLangXML) string {
 func coverageRegionsText(regions []adminFeedCoverageRegionXML) string {
 	lines := []string{}
 	for _, region := range regions {
-		lines = append(lines, strings.Join([]string{region.ID, region.Source, region.DeriveForecast}, "|"))
+		subregions := make([]string, 0, len(region.Subregions))
+		for _, subregion := range region.Subregions {
+			subregions = append(subregions, subregion.ID)
+		}
+		lines = append(lines, strings.Join([]string{
+			region.ID,
+			region.Source,
+			region.DeriveForecast,
+			region.Name,
+			region.CanonicalID,
+			region.ForecastCanonicalID,
+			strings.Join(subregions, "+"),
+		}, "|"))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -563,7 +651,15 @@ func coverageRegionsText(regions []adminFeedCoverageRegionXML) string {
 func locationsText(items []adminFeedLocationXML) string {
 	lines := []string{}
 	for _, item := range items {
-		lines = append(lines, strings.Join([]string{item.ID, item.Source, item.NameOverride, item.NormalID}, "|"))
+		lines = append(lines, strings.Join([]string{
+			item.ID,
+			item.Source,
+			item.NameOverride,
+			item.NormalID,
+			item.Latitude,
+			item.Longitude,
+			item.CanonicalID,
+		}, "|"))
 	}
 	return strings.Join(lines, "\n")
 }

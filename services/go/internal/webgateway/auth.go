@@ -30,7 +30,7 @@ type AuthManager struct {
 	enabled      bool
 	secureCookie bool
 	mode         string
-	hardened     *hardenedAuth
+	accounts     *accountAuth
 	password     []byte
 	passwordHash string
 	ttl          time.Duration
@@ -65,10 +65,10 @@ func NewAuthManagerWithPath(config Config, configPath string) *AuthManager {
 		revoked:      make(map[string]time.Time),
 	}
 	if manager.mode == "accounts" {
-		// Hardened account sessions are always Secure cookies. Account login also
+		// Account sessions are always Secure cookies. Account login also
 		// rejects requests that are not HTTPS or from a trusted HTTPS proxy.
 		manager.secureCookie = true
-		manager.hardened = newHardenedAuth(config, configPath)
+		manager.accounts = newAccountAuth(config, configPath)
 		manager.password = nil
 		manager.passwordHash = ""
 	}
@@ -83,8 +83,8 @@ func (a *AuthManager) Configured() bool {
 	if a == nil || !a.enabled {
 		return true
 	}
-	if a.hardened != nil {
-		return a.hardened.configured
+	if a.accounts != nil {
+		return a.accounts.configured
 	}
 	return len(a.password) > 0 || a.passwordHash != ""
 }
@@ -93,7 +93,7 @@ func (a *AuthManager) Login(password string) (string, error) {
 	if a == nil || !a.enabled {
 		return "", nil
 	}
-	if a.hardened != nil {
+	if a.accounts != nil {
 		return "", errors.New("username and request context are required for account login")
 	}
 	if a.passwordHash != "" {
@@ -144,8 +144,8 @@ func (a *AuthManager) Authenticated(request *http.Request) bool {
 	if a == nil || !a.enabled {
 		return true
 	}
-	if a.hardened != nil {
-		_, err := a.hardened.Authenticate(request)
+	if a.accounts != nil {
+		_, err := a.accounts.Authenticate(request)
 		return err == nil
 	}
 	return a.ValidToken(tokenFromRequest(request))
@@ -158,8 +158,8 @@ func (a *AuthManager) FullyAuthenticated(request *http.Request) bool {
 	if a == nil || !a.enabled {
 		return true
 	}
-	if a.hardened != nil {
-		identity, err := a.hardened.Authenticate(request)
+	if a.accounts != nil {
+		identity, err := a.accounts.Authenticate(request)
 		return err == nil && !identity.PasswordChangeRequired
 	}
 	return a.ValidToken(tokenFromRequest(request))
@@ -169,7 +169,7 @@ func (a *AuthManager) ValidToken(token string) bool {
 	if a == nil || !a.enabled {
 		return true
 	}
-	if a.hardened != nil {
+	if a.accounts != nil {
 		return false
 	}
 	if token == "" {
@@ -221,11 +221,11 @@ func (a *AuthManager) LoginWithRequest(ctx context.Context, input LoginInput) (L
 	if a == nil || !a.enabled {
 		return LoginResult{}, nil
 	}
-	if a.hardened == nil {
+	if a.accounts == nil {
 		token, err := a.Login(input.Password)
 		return LoginResult{Token: token, Persistent: true}, err
 	}
-	return a.hardened.Login(ctx, input)
+	return a.accounts.Login(ctx, input)
 }
 
 // Identity returns the authenticated account principal for a request.
@@ -233,13 +233,13 @@ func (a *AuthManager) Identity(request *http.Request) (Identity, error) {
 	if a == nil || !a.enabled {
 		return Identity{Account: Account{Username: "admin", IsAdmin: true, AllowOrigination: true, AllowedOriginators: []string{"CIV", "EAS", "PEP", "WXR"}}}, nil
 	}
-	if a.hardened == nil {
+	if a.accounts == nil {
 		if !a.ValidToken(tokenFromRequest(request)) {
 			return Identity{}, &AuthError{Code: "unauthorized", Detail: "Authentication is required.", HTTPStatus: http.StatusUnauthorized}
 		}
 		return Identity{Account: Account{Username: "admin", IsAdmin: true, AllowOrigination: true, AllowedOriginators: []string{"CIV", "EAS", "PEP", "WXR"}}}, nil
 	}
-	return a.hardened.Authenticate(request)
+	return a.accounts.Authenticate(request)
 }
 
 // LogoutRequest revokes the request's active session.
@@ -247,8 +247,8 @@ func (a *AuthManager) LogoutRequest(request *http.Request) error {
 	if a == nil {
 		return nil
 	}
-	if a.hardened != nil {
-		return a.hardened.Logout(request)
+	if a.accounts != nil {
+		return a.accounts.Logout(request)
 	}
 	a.Logout(tokenFromRequest(request))
 	return nil
@@ -259,7 +259,7 @@ func (a *AuthManager) SetLoginCookie(writer http.ResponseWriter, request *http.R
 	if a == nil || !a.enabled || result.Token == "" {
 		return
 	}
-	if a.hardened == nil {
+	if a.accounts == nil {
 		a.SetCookieForRequest(writer, request, result.Token)
 		return
 	}
@@ -278,28 +278,28 @@ func (a *AuthManager) SetLoginCookie(writer http.ResponseWriter, request *http.R
 	http.SetCookie(writer, cookie)
 }
 
-// Hardened reports whether account-mode authentication is selected.
-func (a *AuthManager) Hardened() bool {
-	return a != nil && a.hardened != nil
+// AccountMode reports whether account-mode authentication is selected.
+func (a *AuthManager) AccountMode() bool {
+	return a != nil && a.accounts != nil
 }
 
 // Close releases account database and session registry resources.
 func (a *AuthManager) Close() {
-	if a != nil && a.hardened != nil {
-		a.hardened.Close()
+	if a != nil && a.accounts != nil {
+		a.accounts.Close()
 	}
 }
 
 // RecoverLockedAccount performs a local, audited unlock for disaster recovery.
 // It is intended for the haze-web CLI running with the service's private keys.
 func (a *AuthManager) RecoverLockedAccount(ctx context.Context, username string) error {
-	if a == nil || a.hardened == nil {
-		return fmt.Errorf("account recovery requires hardened account mode")
+	if a == nil || a.accounts == nil {
+		return fmt.Errorf("account recovery is unavailable in the current sign-in mode")
 	}
-	if !a.hardened.configured {
-		return fmt.Errorf("hardened authentication is unavailable: %w", a.hardened.initializationError)
+	if !a.accounts.configured {
+		return fmt.Errorf("account sign-in is unavailable: %w", a.accounts.initializationError)
 	}
-	account, err := a.hardened.store.ByUsername(ctx, strings.TrimSpace(username))
+	account, err := a.accounts.store.ByUsername(ctx, strings.TrimSpace(username))
 	if err != nil {
 		return err
 	}
@@ -307,18 +307,18 @@ func (a *AuthManager) RecoverLockedAccount(ctx context.Context, username string)
 		Event: "LOCAL_ACCOUNT_UNLOCK_REQUESTED", ActorID: account.ID, ActorUsername: account.Username,
 		Severity: "critical", Details: map[string]any{"source": "haze-web --unlock-account"},
 	}
-	if err := a.hardened.audit.Append("webpanel", event); err != nil {
+	if err := a.accounts.audit.Append("webpanel", event); err != nil {
 		return fmt.Errorf("write recovery audit request: %w", err)
 	}
-	if err := a.hardened.store.Unlock(ctx, account.ID); err != nil {
+	if err := a.accounts.store.Unlock(ctx, account.ID); err != nil {
 		return err
 	}
-	a.hardened.ResetLoginLimits(ctx, account.Username, account.LastIP)
-	if err := a.hardened.RevokeUser(ctx, account.ID); err != nil {
+	a.accounts.ResetLoginLimits(ctx, account.Username, account.LastIP)
+	if err := a.accounts.RevokeUser(ctx, account.ID); err != nil {
 		return err
 	}
 	event.Event = "LOCAL_ACCOUNT_UNLOCK_COMPLETED"
-	if err := a.hardened.audit.Append("webpanel", event); err != nil {
+	if err := a.accounts.audit.Append("webpanel", event); err != nil {
 		return fmt.Errorf("write recovery audit completion: %w", err)
 	}
 	return nil
@@ -328,7 +328,7 @@ func (a *AuthManager) cookieSecureForRequest(request *http.Request) bool {
 	if a == nil || !a.secureCookie {
 		return false
 	}
-	if a.hardened != nil {
+	if a.accounts != nil {
 		return true
 	}
 	return !requestUsesLocalHost(request)

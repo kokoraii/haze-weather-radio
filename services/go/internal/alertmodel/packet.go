@@ -53,8 +53,37 @@ type Timing struct {
 
 // Areas contains resolved names and raw location codes targeted by the alert.
 type Areas struct {
-	Names []string `json:"names,omitempty"`
-	Codes []string `json:"codes,omitempty"`
+	Names     []string            `json:"names,omitempty"`
+	Codes     []string            `json:"codes,omitempty"`
+	Locations []LocationReference `json:"locations,omitempty"`
+}
+
+// LocationReference keeps an alert's raw targeting identifier beside the
+// confidence-bearing canonical location returned by haze-location.
+type LocationReference struct {
+	CanonicalID          string               `json:"canonical_id,omitempty"`
+	CandidateID          string               `json:"candidate_id,omitempty"`
+	Name                 string               `json:"name,omitempty"`
+	Kind                 string               `json:"kind,omitempty"`
+	Country              string               `json:"country,omitempty"`
+	Region               string               `json:"region,omitempty"`
+	RawIdentifiers       []LocationIdentifier `json:"raw_identifiers,omitempty"`
+	CanonicalIdentifiers []LocationIdentifier `json:"canonical_identifiers,omitempty"`
+	MatchScore           float64              `json:"match_score,omitempty"`
+	MatchConfidence      string               `json:"match_confidence,omitempty"`
+	MatchMethod          string               `json:"match_method,omitempty"`
+	SourceQuality        float64              `json:"source_quality,omitempty"`
+	CatalogGeneration    string               `json:"catalog_generation,omitempty"`
+	Actionable           bool                 `json:"actionable"`
+	Ambiguous            bool                 `json:"ambiguous,omitempty"`
+}
+
+// LocationIdentifier is an original source-qualified code. Leading zeros and
+// source spelling are preserved for exact fallback comparisons.
+type LocationIdentifier struct {
+	Authority string `json:"authority,omitempty"`
+	Scheme    string `json:"scheme"`
+	Value     string `json:"value"`
 }
 
 // SAME contains SAME/EAS generation facts.
@@ -121,6 +150,7 @@ func (p Packet) Normalize() Packet {
 	p.FeedIDs = uniqueClean(p.FeedIDs)
 	p.Areas.Names = uniqueClean(p.Areas.Names)
 	p.Areas.Codes = uniqueClean(p.Areas.Codes)
+	p.Areas.Locations = normalizeLocationReferences(p.Areas.Locations)
 	if p.SAME != nil {
 		p.SAME.Locations = uniqueClean(p.SAME.Locations)
 	}
@@ -191,6 +221,7 @@ func LegacyFromMap(data map[string]any) Packet {
 	if codes := stringList(firstValue(data, "same_locations", "locations")); len(codes) > 0 {
 		packet.Areas.Codes = codes
 	}
+	packet.Areas.Locations = locationReferences(firstValue(data, "canonical_locations"))
 	if hasSAMEFields(data) {
 		packet.SAME = &SAME{
 			Include:          boolValueDefault(firstValue(data, "include_same"), true),
@@ -267,6 +298,9 @@ func LegacyFields(packet Packet) map[string]any {
 	}
 	if len(packet.Areas.Codes) > 0 {
 		out["locations"] = packet.Areas.Codes
+	}
+	if len(packet.Areas.Locations) > 0 {
+		out["canonical_locations"] = packet.Areas.Locations
 	}
 	if packet.Presentation.SpeechText != "" {
 		out["alert_text"] = packet.Presentation.SpeechText
@@ -452,6 +486,102 @@ func stringList(value any) []string {
 		}
 	}
 	return uniqueClean(out)
+}
+
+func locationReferences(value any) []LocationReference {
+	if value == nil {
+		return nil
+	}
+	if typed, ok := value.([]LocationReference); ok {
+		return normalizeLocationReferences(typed)
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return nil
+	}
+	var references []LocationReference
+	if err := json.Unmarshal(raw, &references); err != nil {
+		return nil
+	}
+	return normalizeLocationReferences(references)
+}
+
+func normalizeLocationReferences(values []LocationReference) []LocationReference {
+	out := make([]LocationReference, 0, len(values))
+	seen := map[string]struct{}{}
+	for _, reference := range values {
+		reference.CanonicalID = clean(reference.CanonicalID)
+		reference.CandidateID = clean(reference.CandidateID)
+		reference.Name = clean(reference.Name)
+		reference.Kind = clean(reference.Kind)
+		reference.Country = clean(reference.Country)
+		reference.Region = clean(reference.Region)
+		reference.MatchConfidence = strings.ToLower(clean(reference.MatchConfidence))
+		reference.MatchMethod = clean(reference.MatchMethod)
+		reference.CatalogGeneration = clean(reference.CatalogGeneration)
+		rawIdentifiers := make([]LocationIdentifier, 0, len(reference.RawIdentifiers))
+		identifierSeen := map[string]struct{}{}
+		for _, identifier := range reference.RawIdentifiers {
+			identifier.Authority = clean(identifier.Authority)
+			identifier.Scheme = strings.ToLower(clean(identifier.Scheme))
+			identifier.Value = clean(identifier.Value)
+			if identifier.Scheme == "" || identifier.Value == "" {
+				continue
+			}
+			key := strings.ToLower(identifier.Authority) + "\x00" + identifier.Scheme + "\x00" + identifier.Value
+			if _, exists := identifierSeen[key]; exists {
+				continue
+			}
+			identifierSeen[key] = struct{}{}
+			rawIdentifiers = append(rawIdentifiers, identifier)
+		}
+		reference.RawIdentifiers = rawIdentifiers
+		reference.CanonicalIdentifiers = normalizeLocationIdentifiers(reference.CanonicalIdentifiers)
+		if reference.Ambiguous || (reference.MatchConfidence != "exact" && reference.MatchConfidence != "high") {
+			reference.Actionable = false
+			if reference.CandidateID == "" {
+				reference.CandidateID = reference.CanonicalID
+			}
+			reference.CanonicalID = ""
+		}
+		if reference.CanonicalID == "" {
+			reference.Actionable = false
+		}
+		key := strings.ToLower(reference.CanonicalID)
+		if key == "" && len(reference.RawIdentifiers) > 0 {
+			identifier := reference.RawIdentifiers[0]
+			key = strings.ToLower(identifier.Authority) + "\x00" + identifier.Scheme + "\x00" + identifier.Value
+		}
+		if key == "" {
+			continue
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, reference)
+	}
+	return out
+}
+
+func normalizeLocationIdentifiers(values []LocationIdentifier) []LocationIdentifier {
+	out := make([]LocationIdentifier, 0, len(values))
+	seen := map[string]struct{}{}
+	for _, identifier := range values {
+		identifier.Authority = clean(identifier.Authority)
+		identifier.Scheme = strings.ToLower(clean(identifier.Scheme))
+		identifier.Value = clean(identifier.Value)
+		if identifier.Scheme == "" || identifier.Value == "" {
+			continue
+		}
+		key := strings.ToLower(identifier.Authority) + "\x00" + identifier.Scheme + "\x00" + identifier.Value
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, identifier)
+	}
+	return out
 }
 
 func uniqueClean(values []string) []string {

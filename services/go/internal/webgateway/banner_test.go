@@ -7,8 +7,20 @@ import (
 	"testing"
 	"time"
 
+	"github.com/meowraii/haze-weather-radio/services/go/internal/alertmodel"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/datastore"
 )
+
+func TestBannerCanonicalLocationNamesRequireActionableMatches(t *testing.T) {
+	names := bannerCanonicalLocationNames([]alertmodel.LocationReference{
+		{CanonicalID: "urn:haze:location:exact", Name: "Saskatoon", MatchConfidence: "exact", Actionable: true},
+		{CandidateID: "urn:haze:location:shadow", Name: "Shadow Candidate", MatchConfidence: "high"},
+		{CanonicalID: "urn:haze:location:ambiguous", Name: "Ambiguous Candidate", MatchConfidence: "high", Actionable: true, Ambiguous: true},
+	})
+	if len(names) != 1 || names[0] != "Saskatoon" {
+		t.Fatalf("canonical names = %#v", names)
+	}
+}
 
 func TestBannerPayloadSerializesAcceptedActiveAlerts(t *testing.T) {
 	dir := t.TempDir()

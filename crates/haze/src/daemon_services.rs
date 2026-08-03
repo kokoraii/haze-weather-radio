@@ -1310,6 +1310,7 @@ fn default_runtime_cleanup_rules() -> Vec<RuntimeCleanupRule> {
         ("runtime/audio/playlist", 6 * 60 * MINUTE),
         ("runtime/audio/tts", 24 * 60 * MINUTE),
         ("runtime/ivr/cache", 24 * 60 * MINUTE),
+        ("runtime/ivr/asr", 5 * MINUTE),
         ("runtime/audio/alerts", 7 * 24 * 60 * MINUTE),
         ("runtime/audio/easnet", 7 * 24 * 60 * MINUTE),
     ]

@@ -59,6 +59,12 @@ __pycache__/
 venv/
 scripts/util/csv_merged/
 scripts/util/*.sqlite
+bundle/managed/locations/*.sqlite
+bundle/managed/locations/*.sqlite-*
+bundle/managed/locations/*.sha256
+bundle/managed/.alert-location-*-candidate.sqlite
+bundle/managed/alert_location_map.sqlite-*
+bundle/managed/location-catalog-backups/
 
 # JavaScript scratch if frontend tooling is used locally
 node_modules/

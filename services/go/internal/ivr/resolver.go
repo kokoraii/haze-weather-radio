@@ -6,29 +6,184 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"log"
+	"math"
 	"net/http"
+	"os"
 	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/meowraii/haze-weather-radio/services/go/internal/locationclient"
+	"github.com/meowraii/haze-weather-radio/services/go/internal/locationdb"
 )
 
 // ResolvedLocation is the canonical IVR lookup result for caller-entered digits.
 type ResolvedLocation struct {
-	Input     string `json:"input"`
-	Code      string `json:"code"`
-	Source    string `json:"source"`
-	Name      string `json:"name"`
-	Province  string `json:"province,omitempty"`
-	FeedID    string `json:"feed_id"`
-	Covered   bool   `json:"covered_by_feed"`
-	Language  string `json:"language"`
-	Timezone  string `json:"timezone,omitempty"`
-	Forecast  string `json:"forecast_id,omitempty"`
-	StationID string `json:"station_id,omitempty"`
-	Latitude  string `json:"latitude,omitempty"`
-	Longitude string `json:"longitude,omitempty"`
+	CanonicalID string `json:"canonical_id,omitempty"`
+	Input       string `json:"input"`
+	Code        string `json:"code"`
+	Source      string `json:"source"`
+	Name        string `json:"name"`
+	Province    string `json:"province,omitempty"`
+	Country     string `json:"country,omitempty"`
+	Kind        string `json:"kind,omitempty"`
+	FeedID      string `json:"feed_id"`
+	Covered     bool   `json:"covered_by_feed"`
+	Language    string `json:"language"`
+	Timezone    string `json:"timezone,omitempty"`
+	Forecast    string `json:"forecast_id,omitempty"`
+	StationID   string `json:"station_id,omitempty"`
+	Latitude    string `json:"latitude,omitempty"`
+	Longitude   string `json:"longitude,omitempty"`
+}
+
+// ResolvePlace resolves one source-qualified location database record without
+// falling back to another record that happens to share the same code.
+func (r *Resolver) ResolvePlace(snapshot locationdb.Snapshot, place locationdb.Place) (ResolvedLocation, error) {
+	record, err := r.resolvePlaceRecord(snapshot, place)
+	if err != nil {
+		return ResolvedLocation{}, err
+	}
+	record = r.attachFeed(record)
+	covered := record.FeedID != ""
+	if record.FeedID == "" {
+		record.FeedID = r.defaultFeedID()
+		if record.FeedID == "" {
+			return ResolvedLocation{}, fmt.Errorf("%s is known, but no enabled Haze feed is available as an IVR rendering profile", record.Name)
+		}
+	}
+	return ResolvedLocation{
+		Input:     place.Source + ":" + place.Code,
+		Code:      record.Code,
+		Source:    record.Source,
+		Name:      record.Name,
+		Province:  record.Province,
+		Country:   record.Country,
+		Kind:      record.Kind,
+		FeedID:    record.FeedID,
+		Covered:   covered,
+		Language:  r.feedLanguage(record.FeedID),
+		Timezone:  r.feedTimezone(record.FeedID),
+		Forecast:  record.Forecast,
+		StationID: record.StationID,
+		Latitude:  record.Latitude,
+		Longitude: record.Longitude,
+	}, nil
+}
+
+func (r *Resolver) resolvePlaceRecord(snapshot locationdb.Snapshot, place locationdb.Place) (locationRecord, error) {
+	if r == nil {
+		return locationRecord{}, fmt.Errorf("location resolver is unavailable")
+	}
+	place.Source = strings.ToLower(strings.TrimSpace(place.Source))
+	place.Code = strings.ToUpper(strings.TrimSpace(place.Code))
+	if place.Source == "" || place.Code == "" {
+		return locationRecord{}, fmt.Errorf("location source and code are required")
+	}
+	record := locationRecord{
+		Code:      place.Code,
+		Source:    place.Source,
+		Name:      cleanLocationName(place.Name),
+		Province:  provinceCode(place.Region),
+		Country:   strings.ToUpper(strings.TrimSpace(place.Country)),
+		Kind:      strings.TrimSpace(place.Kind),
+		Latitude:  floatText(place.Lat),
+		Longitude: floatText(place.Lon),
+	}
+	switch place.Source {
+	case "hello_weather":
+		hello, ok := r.cfg.HelloWeather[place.Code]
+		if !ok {
+			hello, ok = deriveHelloWeatherRecord(place.Code)
+		}
+		if ok {
+			hello = r.enrichHelloWeatherRecord(hello)
+			record.Source = hello.Source
+			record.Forecast = hello.Forecast
+			record.StationID = hello.StationID
+			record.Latitude = firstNonBlank(record.Latitude, hello.Latitude)
+			record.Longitude = firstNonBlank(record.Longitude, hello.Longitude)
+		}
+	case "forecast":
+		record.Source = "eccc_forecast"
+		record.Forecast = place.Code
+		if clcCode := linkedCode(snapshot, "forecast", place.Code, "clc"); clcCode != "" {
+			record.StationID = stationForArea(snapshot, "clc", clcCode)
+		}
+	case "clc":
+		if record.Country == "US" {
+			record.Source = "nws"
+		}
+		record.Forecast = reverseLinkedCode(snapshot, "clc", place.Code, "forecast")
+		record.StationID = stationForArea(snapshot, "clc", place.Code)
+	case "sgc":
+		record.Source = "capcp_geocode"
+		clcCode := linkedCode(snapshot, "sgc", place.Code, "clc")
+		if clcCode != "" {
+			record.Forecast = reverseLinkedCode(snapshot, "clc", clcCode, "forecast")
+			record.StationID = stationForArea(snapshot, "clc", clcCode)
+		}
+	case "nws_zone", "nws_marine_zone":
+		record.Forecast = place.Code
+		record.StationID = stationForArea(snapshot, place.Source, place.Code)
+	case "nws_same", "nws_marine_same":
+		zoneSource := "nws_zone"
+		if place.Source == "nws_marine_same" {
+			zoneSource = "nws_marine_zone"
+		}
+		record.Forecast = linkedCode(snapshot, place.Source, place.Code, zoneSource)
+		record.StationID = firstNonBlank(
+			stationForArea(snapshot, place.Source, place.Code),
+			stationForArea(snapshot, zoneSource, record.Forecast),
+		)
+	case "station":
+		record.StationID = place.Code
+		record.Forecast = forecastForStation(snapshot, place.Code)
+	default:
+		return locationRecord{}, fmt.Errorf("unsupported location source %q", place.Source)
+	}
+	if record.Name == "" {
+		record.Name = place.Code
+	}
+	return record, nil
+}
+
+func linkedCode(snapshot locationdb.Snapshot, fromSource string, fromCode string, toSource string) string {
+	return snapshot.LinkedCode(fromSource, fromCode, toSource)
+}
+
+func reverseLinkedCode(snapshot locationdb.Snapshot, toSource string, toCode string, fromSource string) string {
+	return snapshot.ReverseLinkedCode(toSource, toCode, fromSource)
+}
+
+func stationForArea(snapshot locationdb.Snapshot, source string, code string) string {
+	return snapshot.StationForArea(source, code)
+}
+
+func forecastForStation(snapshot locationdb.Snapshot, stationID string) string {
+	stationID = strings.ToUpper(strings.TrimSpace(stationID))
+	bestDistance := math.MaxFloat64
+	bestForecast := ""
+	for _, stationLink := range snapshot.StationAreas(stationID) {
+		forecast := ""
+		switch stationLink.AreaSource {
+		case "clc":
+			forecast = reverseLinkedCode(snapshot, "clc", stationLink.AreaCode, "forecast")
+		case "nws_zone", "nws_marine_zone":
+			forecast = stationLink.AreaCode
+		}
+		if forecast == "" {
+			continue
+		}
+		if stationLink.DistanceKM < bestDistance || stationLink.DistanceKM == bestDistance && forecast < bestForecast {
+			bestDistance = stationLink.DistanceKM
+			bestForecast = forecast
+		}
+	}
+	return bestForecast
 }
 
 type Resolver struct {
@@ -42,6 +197,29 @@ type Resolver struct {
 	lookupHelloWeather helloWeatherLookup
 	geocodeIndexOnce   sync.Once
 	geocodeNameIndex   map[string]locationRecord
+	feedIndexOnce      sync.Once
+	feedIndex          resolverFeedIndex
+}
+
+type resolverFeedAttachment struct {
+	FeedID     string
+	Forecast   string
+	StationID  string
+	RegionName string
+	FeedOrder  int
+	Phase      int
+	ItemOrder  int
+}
+
+type resolverFeedIndex struct {
+	RegionCodes  map[string]resolverFeedAttachment
+	Forecasts    map[string]resolverFeedAttachment
+	Subregions   map[string]resolverFeedAttachment
+	Observations map[string]resolverFeedAttachment
+	Names        map[string]resolverFeedAttachment
+	Languages    map[string]string
+	Timezones    map[string]string
+	DefaultFeed  string
 }
 
 type providerNameLookup func(context.Context, string) (string, bool)
@@ -81,6 +259,30 @@ func NewResolver(cfg loadedConfig) *Resolver {
 }
 
 func (r *Resolver) Resolve(input string) (ResolvedLocation, error) {
+	mode := locationclient.ParseMode(r.cfg.Root.Services.Rust.Location.Mode)
+	if mode == locationclient.ModeLegacy {
+		return r.resolveLegacy(input)
+	}
+	started := time.Now()
+	canonical, canonicalErr := r.resolveCanonical(input)
+	if mode == locationclient.ModeAuthoritative {
+		return canonical, canonicalErr
+	}
+	legacy, legacyErr := r.resolveLegacy(input)
+	log.Printf(
+		"location shadow resolve input=%q legacy=%s canonical=%s canonical_id=%s ambiguous=%t latency_ms=%d error=%v",
+		input,
+		locationIdentity(legacy),
+		locationIdentity(canonical),
+		canonical.CanonicalID,
+		canonicalErr != nil && strings.Contains(strings.ToLower(canonicalErr.Error()), "ambiguous"),
+		time.Since(started).Milliseconds(),
+		canonicalErr,
+	)
+	return legacy, legacyErr
+}
+
+func (r *Resolver) resolveLegacy(input string) (ResolvedLocation, error) {
 	code := normalizeCallerCode(input)
 	if code == "" {
 		return ResolvedLocation{}, fmt.Errorf("enter a location code followed by pound")
@@ -114,6 +316,108 @@ func (r *Resolver) Resolve(input string) (ResolvedLocation, error) {
 	}
 	location = r.withProviderDisplayName(location, attachedToFeed)
 	return location, nil
+}
+
+func (r *Resolver) resolveCanonical(input string) (ResolvedLocation, error) {
+	code := canonicalCallerLocationCode(normalizeCallerCode(input))
+	if code == "" {
+		return ResolvedLocation{}, fmt.Errorf("enter a location code followed by pound")
+	}
+	bridgeAddr := strings.TrimSpace(os.Getenv("HAZE_HOST_BRIDGE_ADDR"))
+	client := locationclient.New(bridgeAddr, "haze-ivr-location")
+	client.Timeout = 4 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), client.Timeout)
+	defer cancel()
+	response, err := client.Query(ctx, locationclient.Request{
+		Operation: "resolve",
+		Input:     &locationclient.Input{Kind: "auto", Text: code},
+		Options: locationclient.Options{
+			Limit:                  4,
+			MinimumConfidence:      "high",
+			StationModeRequirement: "any",
+		},
+	})
+	if err != nil {
+		return ResolvedLocation{}, err
+	}
+	if response.Ambiguous || len(response.Results) > 1 && response.Results[0].Match.Score-response.Results[1].Match.Score < 0.08 {
+		return ResolvedLocation{}, fmt.Errorf("location %q is ambiguous and requires confirmation", input)
+	}
+	if len(response.Results) == 0 {
+		return ResolvedLocation{}, fmt.Errorf("no weather location matched %q", input)
+	}
+	candidate := response.Results[0]
+	entity := candidate.Entity
+	record := locationRecord{
+		Code:      code,
+		Name:      entity.DisplayName(),
+		Province:  provinceCode(entity.Region),
+		Country:   strings.ToUpper(strings.TrimSpace(entity.Country)),
+		Kind:      entity.Kind,
+		Forecast:  entity.Identifier("eccc_citypage", "nws_zone", "nws_marine_zone"),
+		StationID: entity.Identifier("eccc_station", "icao", "msc", "wmo", "ndbc"),
+	}
+	if entity.Geometry != nil {
+		if entity.Geometry.Latitude != nil {
+			record.Latitude = floatText(*entity.Geometry.Latitude)
+		}
+		if entity.Geometry.Longitude != nil {
+			record.Longitude = floatText(*entity.Geometry.Longitude)
+		}
+	}
+	record.Source = canonicalProviderSource(entity)
+	if record.Forecast != "" {
+		record.Code = record.Forecast
+	} else if record.StationID != "" {
+		record.Code = record.StationID
+	}
+	record = r.attachFeed(record)
+	covered := record.FeedID != ""
+	if record.FeedID == "" {
+		record.FeedID = r.defaultFeedID()
+	}
+	if record.FeedID == "" {
+		return ResolvedLocation{}, fmt.Errorf("%s is known, but no enabled Haze feed is available as an IVR rendering profile", record.Name)
+	}
+	return ResolvedLocation{
+		CanonicalID: entity.ID,
+		Input:       input,
+		Code:        record.Code,
+		Source:      record.Source,
+		Name:        record.Name,
+		Province:    record.Province,
+		Country:     record.Country,
+		Kind:        record.Kind,
+		FeedID:      record.FeedID,
+		Covered:     covered,
+		Language:    r.feedLanguage(record.FeedID),
+		Timezone:    r.feedTimezone(record.FeedID),
+		Forecast:    record.Forecast,
+		StationID:   record.StationID,
+		Latitude:    record.Latitude,
+		Longitude:   record.Longitude,
+	}, nil
+}
+
+func canonicalProviderSource(entity locationclient.Entity) string {
+	for _, identifier := range entity.Identifiers {
+		switch strings.ToLower(identifier.Scheme) {
+		case "nws_zone", "nws_marine_zone", "nws_ugc_county", "fips", "same":
+			return "nws"
+		case "eccc_citypage", "clc", "eccc_station", "msc", "wmo", "icao":
+			return "eccc"
+		case "ndbc":
+			return "ndbc"
+		}
+	}
+	return "canonical"
+}
+
+func locationIdentity(location ResolvedLocation) string {
+	if location.Code == "" {
+		return ""
+	}
+	return location.Source + ":" + location.Code
 }
 
 func (r *Resolver) withProviderDisplayName(location ResolvedLocation, attachedToFeed bool) ResolvedLocation {
@@ -194,6 +498,8 @@ func (r *Resolver) candidates(code string) []ResolvedLocation {
 			Source:    record.Source,
 			Name:      fallbackText(record.Name, record.Code),
 			Province:  record.Province,
+			Country:   record.Country,
+			Kind:      record.Kind,
 			FeedID:    record.FeedID,
 			Covered:   record.FeedID != "",
 			Language:  r.feedLanguage(record.FeedID),
@@ -411,45 +717,160 @@ func (r *Resolver) attachFeed(record locationRecord) locationRecord {
 	if record.FeedID != "" {
 		return record
 	}
-	for _, feed := range r.cfg.Feeds {
-		if !xmlBool(feed.EnabledRaw, true) {
-			continue
-		}
-		for _, region := range feed.Locations.Coverage.Regions {
-			if regionMatchesRecord(region, record) || r.regionNameMatchesRecord(region, record) {
-				record.FeedID = feed.ID
-				if strings.TrimSpace(region.DeriveForecast) != "" {
-					record.Forecast = strings.TrimSpace(region.DeriveForecast)
-				}
-				if regionName := r.coverageRegionDisplayName(region); regionName != "" && !locationNameMentioned(regionName, record.Name) {
-					record.Name = regionName
-				}
-				return record
-			}
-			for _, subregion := range region.Subregions {
-				if sameCode(subregion.ID, record.Code) {
-					record.FeedID = feed.ID
-					if strings.TrimSpace(region.DeriveForecast) != "" {
-						record.Forecast = strings.TrimSpace(region.DeriveForecast)
-					}
-					if regionName := r.coverageRegionDisplayName(region); regionName != "" && !locationNameMentioned(regionName, record.Name) {
-						record.Name = regionName
-					}
-					return record
-				}
-			}
-		}
-		for _, loc := range feed.Locations.ObservationLocations.Locations {
-			if sameCode(loc.ID, record.Forecast) || sameCode(loc.ID, record.StationID) || sameCode(loc.ID, record.Code) {
-				record.FeedID = feed.ID
-				if record.StationID == "" {
-					record.StationID = loc.ID
-				}
-				return record
-			}
+	index := r.resolverFeedIndex()
+	candidates := make([]resolverFeedAttachment, 0, 8)
+	appendCandidate := func(values map[string]resolverFeedAttachment, key string) {
+		if candidate, ok := values[resolverCodeKey(key)]; ok {
+			candidates = append(candidates, candidate)
 		}
 	}
+	appendCandidate(index.RegionCodes, record.Code)
+	appendCandidate(index.Forecasts, record.Forecast)
+	appendCandidate(index.Forecasts, record.Code)
+	if nameKey := strings.Join(normalizedNameTokens(record.Name), " "); nameKey != "" {
+		if candidate, ok := index.Names[resolverCodeKey(nameKey)]; ok {
+			candidates = append(candidates, candidate)
+		}
+	}
+	appendCandidate(index.Subregions, record.Code)
+	appendCandidate(index.Observations, record.Forecast)
+	appendCandidate(index.Observations, record.StationID)
+	appendCandidate(index.Observations, record.Code)
+	if len(candidates) == 0 {
+		return record
+	}
+	best := candidates[0]
+	for _, candidate := range candidates[1:] {
+		if resolverFeedAttachmentBefore(candidate, best) {
+			best = candidate
+		}
+	}
+	record.FeedID = best.FeedID
+	if best.Forecast != "" {
+		record.Forecast = best.Forecast
+	}
+	if best.StationID != "" && record.StationID == "" {
+		record.StationID = best.StationID
+	}
+	if best.RegionName != "" && !locationNameMentioned(best.RegionName, record.Name) {
+		record.Name = best.RegionName
+	}
 	return record
+}
+
+func (r *Resolver) resolverFeedIndex() resolverFeedIndex {
+	r.feedIndexOnce.Do(func() {
+		index := resolverFeedIndex{
+			RegionCodes:  make(map[string]resolverFeedAttachment),
+			Forecasts:    make(map[string]resolverFeedAttachment),
+			Subregions:   make(map[string]resolverFeedAttachment),
+			Observations: make(map[string]resolverFeedAttachment),
+			Names:        make(map[string]resolverFeedAttachment),
+			Languages:    make(map[string]string),
+			Timezones:    make(map[string]string),
+		}
+		for feedOrder, feed := range r.cfg.Feeds {
+			feedID := strings.TrimSpace(feed.ID)
+			feedKey := strings.ToLower(feedID)
+			if feedKey != "" {
+				if _, exists := index.Languages[feedKey]; !exists {
+					for _, lang := range feed.Languages.Langs {
+						if code := strings.TrimSpace(lang.Code); code != "" {
+							index.Languages[feedKey] = code
+							break
+						}
+					}
+				}
+				if _, exists := index.Timezones[feedKey]; !exists {
+					index.Timezones[feedKey] = strings.TrimSpace(feed.Timezone)
+				}
+			}
+			if !xmlBool(feed.EnabledRaw, true) {
+				continue
+			}
+			if index.DefaultFeed == "" && feedID != "" {
+				index.DefaultFeed = feedID
+			}
+			coverageOrder := 0
+			for _, region := range feed.Locations.Coverage.Regions {
+				attachment := resolverFeedAttachment{
+					FeedID:     feed.ID,
+					Forecast:   strings.TrimSpace(region.DeriveForecast),
+					RegionName: r.coverageRegionDisplayName(region),
+					FeedOrder:  feedOrder,
+					Phase:      0,
+					ItemOrder:  coverageOrder,
+				}
+				coverageOrder++
+				resolverAddBestAttachment(index.RegionCodes, region.ID, attachment)
+				resolverAddBestAttachment(index.Forecasts, region.DeriveForecast, attachment)
+				for _, candidateName := range []string{
+					region.Name,
+					r.locationRecordName(region.ID),
+					r.forecastDisplayName(region.DeriveForecast),
+				} {
+					for _, key := range resolverNameSubsequenceKeys(candidateName) {
+						resolverAddBestAttachment(index.Names, key, attachment)
+					}
+				}
+				for _, subregion := range region.Subregions {
+					subregionAttachment := attachment
+					subregionAttachment.ItemOrder = coverageOrder
+					coverageOrder++
+					resolverAddBestAttachment(index.Subregions, subregion.ID, subregionAttachment)
+				}
+			}
+			for observationOrder, loc := range feed.Locations.ObservationLocations.Locations {
+				resolverAddBestAttachment(index.Observations, loc.ID, resolverFeedAttachment{
+					FeedID:    feed.ID,
+					StationID: loc.ID,
+					FeedOrder: feedOrder,
+					Phase:     1,
+					ItemOrder: observationOrder,
+				})
+			}
+		}
+		r.feedIndex = index
+	})
+	return r.feedIndex
+}
+
+func resolverAddBestAttachment(index map[string]resolverFeedAttachment, key string, candidate resolverFeedAttachment) {
+	key = resolverCodeKey(key)
+	if key == "" {
+		return
+	}
+	if current, exists := index[key]; !exists || resolverFeedAttachmentBefore(candidate, current) {
+		index[key] = candidate
+	}
+}
+
+func resolverFeedAttachmentBefore(left resolverFeedAttachment, right resolverFeedAttachment) bool {
+	if left.FeedOrder != right.FeedOrder {
+		return left.FeedOrder < right.FeedOrder
+	}
+	if left.Phase != right.Phase {
+		return left.Phase < right.Phase
+	}
+	return left.ItemOrder < right.ItemOrder
+}
+
+func resolverCodeKey(value string) string {
+	return strings.ToUpper(strings.TrimSpace(value))
+}
+
+func resolverNameSubsequenceKeys(value string) []string {
+	tokens := normalizedNameTokens(value)
+	if len(tokens) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(tokens)*(len(tokens)+1)/2)
+	for start := range tokens {
+		for end := start + 1; end <= len(tokens); end++ {
+			keys = append(keys, strings.Join(tokens[start:end], " "))
+		}
+	}
+	return keys
 }
 
 func (r *Resolver) coverageRegionDisplayName(region coverageRegionXML) string {
@@ -555,35 +976,18 @@ func candidatePriority(location ResolvedLocation) int {
 }
 
 func (r *Resolver) feedLanguage(feedID string) string {
-	for _, feed := range r.cfg.Feeds {
-		if !strings.EqualFold(feed.ID, feedID) {
-			continue
-		}
-		for _, lang := range feed.Languages.Langs {
-			if strings.TrimSpace(lang.Code) != "" {
-				return strings.TrimSpace(lang.Code)
-			}
-		}
+	if language := r.resolverFeedIndex().Languages[strings.ToLower(strings.TrimSpace(feedID))]; language != "" {
+		return language
 	}
 	return r.cfg.IVR.DefaultLanguage
 }
 
 func (r *Resolver) feedTimezone(feedID string) string {
-	for _, feed := range r.cfg.Feeds {
-		if strings.EqualFold(feed.ID, feedID) {
-			return strings.TrimSpace(feed.Timezone)
-		}
-	}
-	return ""
+	return r.resolverFeedIndex().Timezones[strings.ToLower(strings.TrimSpace(feedID))]
 }
 
 func (r *Resolver) defaultFeedID() string {
-	for _, feed := range r.cfg.Feeds {
-		if strings.TrimSpace(feed.ID) != "" && xmlBool(feed.EnabledRaw, true) {
-			return strings.TrimSpace(feed.ID)
-		}
-	}
-	return ""
+	return r.resolverFeedIndex().DefaultFeed
 }
 
 func normalizeCallerCode(input string) string {

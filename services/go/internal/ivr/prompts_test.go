@@ -1,6 +1,7 @@
 package ivr
 
 import (
+	"encoding/xml"
 	"os"
 	"path/filepath"
 	"strings"
@@ -75,6 +76,32 @@ func TestStaticPromptLinesExcludeDynamicPrompts(t *testing.T) {
 	}
 }
 
+func TestPromptLineLanguageFallbackOrder(t *testing.T) {
+	raw := strings.Replace(validPromptXML(), `<line key="main">Search.</line>`, `<line key="main">Search default.</line>
+    <line key="main" language="en-US">Search English.</line>
+    <line key="main" language="fr">Recherche française.</line>`, 1)
+	var parsed promptConfigXML
+	if err := xml.Unmarshal([]byte(raw), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := normalizePromptConfig(parsed)
+	if err != nil {
+		t.Fatalf("normalize prompt config: %v", err)
+	}
+	for _, test := range []struct {
+		language string
+		want     string
+	}{
+		{language: "fr-CA", want: "Recherche française."},
+		{language: "en-CA", want: "Search English."},
+		{language: "de-DE", want: "Search default."},
+	} {
+		if got := cfg.MenuLine("location_search", "main", map[string]string{"lang": test.language}); got != test.want {
+			t.Errorf("language %s selected %q, want %q", test.language, got, test.want)
+		}
+	}
+}
+
 func validPromptXML() string {
 	return `<?xml version="1.0" encoding="UTF-8"?>
 <ivr>
@@ -95,6 +122,13 @@ func validPromptXML() string {
   <menu id="location_number">
     <line key="main">Enter location number for {province}.</line>
     <line key="search_unavailable">Search unavailable.</line>
+  </menu>
+  <menu id="location_search">
+    <line key="main">Search.</line>
+    <line key="voice_unavailable">Voice unavailable.</line>
+    <line key="no_match">No match.</line>
+    <line key="more_detail">More detail.</line>
+    <line key="fallback_numeric">Numeric fallback.</line>
   </menu>
   <menu id="location_menu">
     <line key="main">You have reached {location}.</line>

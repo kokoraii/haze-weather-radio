@@ -40,11 +40,63 @@ type Link struct {
 	Components map[string]any
 }
 
-type Snapshot struct {
-	Places []Place
-	Links  []Link
+// StationLink associates a weather area with the observation station selected
+// for that area by the managed location database.
+type StationLink struct {
+	AreaSource  string
+	AreaCode    string
+	StationID   string
+	StationName string
+	DistanceKM  float64
+}
 
-	bySourceCode map[string]map[string]Place
+type Snapshot struct {
+	Places       []Place
+	Links        []Link
+	StationLinks []StationLink
+
+	bySourceCode   map[string]map[string]Place
+	linksFrom      map[string][]Link
+	linksTo        map[string][]Link
+	stationsByArea map[string]StationLink
+	stationsByID   map[string][]StationLink
+}
+
+// Aliases returns the caller-facing aliases stored in attrs_json.
+func (p Place) Aliases() []string {
+	raw, ok := p.Attrs["aliases"]
+	if !ok {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	out := []string{}
+	add := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		key := strings.ToLower(value)
+		if _, exists := seen[key]; exists {
+			return
+		}
+		seen[key] = struct{}{}
+		out = append(out, value)
+	}
+	switch values := raw.(type) {
+	case []any:
+		for _, value := range values {
+			if text, ok := value.(string); ok {
+				add(text)
+			}
+		}
+	case []string:
+		for _, value := range values {
+			add(value)
+		}
+	case string:
+		add(values)
+	}
+	return out
 }
 
 type cachedSnapshot struct {
@@ -117,6 +169,70 @@ func (s Snapshot) PlacesBySource(source string) []Place {
 	return out
 }
 
+// LinkedCode returns the highest-quality source-qualified outgoing link.
+func (s Snapshot) LinkedCode(fromSource string, fromCode string, toSource string) string {
+	s.ensureRelationshipIndexes()
+	key := relationshipKey(fromSource, fromCode)
+	toSource = strings.ToLower(strings.TrimSpace(toSource))
+	bestCode := ""
+	bestScore := -1.0
+	for _, link := range s.linksFrom[key] {
+		if link.ToSource == toSource && (link.Score > bestScore || link.Score == bestScore && link.ToCode < bestCode) {
+			bestCode, bestScore = link.ToCode, link.Score
+		}
+	}
+	return bestCode
+}
+
+// ReverseLinkedCode returns the highest-quality incoming link from a source.
+func (s Snapshot) ReverseLinkedCode(toSource string, toCode string, fromSource string) string {
+	s.ensureRelationshipIndexes()
+	key := relationshipKey(toSource, toCode)
+	fromSource = strings.ToLower(strings.TrimSpace(fromSource))
+	bestCode := ""
+	bestScore := -1.0
+	for _, link := range s.linksTo[key] {
+		if link.FromSource == fromSource && (link.Score > bestScore || link.Score == bestScore && link.FromCode < bestCode) {
+			bestCode, bestScore = link.FromCode, link.Score
+		}
+	}
+	return bestCode
+}
+
+// StationForArea returns the observation station linked to one qualified area.
+func (s Snapshot) StationForArea(source string, code string) string {
+	s.ensureRelationshipIndexes()
+	return s.stationsByArea[relationshipKey(source, code)].StationID
+}
+
+// StationAreas returns the small set of areas served by a station.
+func (s Snapshot) StationAreas(stationID string) []StationLink {
+	s.ensureRelationshipIndexes()
+	return s.stationsByID[strings.ToUpper(strings.TrimSpace(stationID))]
+}
+
+func (s *Snapshot) ensureRelationshipIndexes() {
+	if s.linksFrom != nil && s.linksTo != nil && s.stationsByArea != nil && s.stationsByID != nil {
+		return
+	}
+	s.linksFrom = map[string][]Link{}
+	s.linksTo = map[string][]Link{}
+	for _, link := range s.Links {
+		s.linksFrom[relationshipKey(link.FromSource, link.FromCode)] = append(s.linksFrom[relationshipKey(link.FromSource, link.FromCode)], link)
+		s.linksTo[relationshipKey(link.ToSource, link.ToCode)] = append(s.linksTo[relationshipKey(link.ToSource, link.ToCode)], link)
+	}
+	s.stationsByArea = map[string]StationLink{}
+	s.stationsByID = map[string][]StationLink{}
+	for _, link := range s.StationLinks {
+		s.stationsByArea[relationshipKey(link.AreaSource, link.AreaCode)] = link
+		s.stationsByID[link.StationID] = append(s.stationsByID[link.StationID], link)
+	}
+}
+
+func relationshipKey(source string, code string) string {
+	return strings.ToLower(strings.TrimSpace(source)) + "\x00" + strings.ToUpper(strings.TrimSpace(code))
+}
+
 func (s Snapshot) Labels() map[string]string {
 	out := map[string]string{}
 	for _, source := range []string{"forecast", "clc", "sgc", "hello_weather", "nws_same", "nws_zone", "nws_marine_same", "nws_marine_zone"} {
@@ -147,11 +263,18 @@ func readSnapshot(path string) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, err
 	}
-	return Snapshot{
+	stationLinks, err := readStationLinks(db)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	snapshot := Snapshot{
 		Places:       places,
 		Links:        links,
+		StationLinks: stationLinks,
 		bySourceCode: indexPlaces(places),
-	}, nil
+	}
+	snapshot.ensureRelationshipIndexes()
+	return snapshot, nil
 }
 
 func sqliteReadOnlyDSN(path string) string {
@@ -216,6 +339,33 @@ func readLinks(db *sql.DB) ([]Link, error) {
 		link.ToCode = strings.ToUpper(strings.TrimSpace(link.ToCode))
 		link.Components = map[string]any{}
 		_ = json.Unmarshal([]byte(componentsRaw), &link.Components)
+		out = append(out, link)
+	}
+	return out, rows.Err()
+}
+
+func readStationLinks(db *sql.DB) ([]StationLink, error) {
+	rows, err := db.Query(`
+		SELECT area_source, area_code, station_id, station_name, distance_km
+		FROM station_links
+	`)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "no such table") {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer rows.Close()
+	out := []StationLink{}
+	for rows.Next() {
+		var link StationLink
+		if err := rows.Scan(&link.AreaSource, &link.AreaCode, &link.StationID, &link.StationName, &link.DistanceKM); err != nil {
+			return nil, err
+		}
+		link.AreaSource = strings.ToLower(strings.TrimSpace(link.AreaSource))
+		link.AreaCode = strings.ToUpper(strings.TrimSpace(link.AreaCode))
+		link.StationID = strings.ToUpper(strings.TrimSpace(link.StationID))
+		link.StationName = strings.TrimSpace(link.StationName)
 		out = append(out, link)
 	}
 	return out, rows.Err()

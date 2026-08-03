@@ -8,6 +8,7 @@ CREATE SCHEMA IF NOT EXISTS products;
 CREATE SCHEMA IF NOT EXISTS archive;
 
 CREATE TABLE IF NOT EXISTS locations.locations (
+    canonical_id text,
     source text NOT NULL,
     location_id text NOT NULL,
     kind text NOT NULL DEFAULT 'unknown',
@@ -31,6 +32,12 @@ CREATE INDEX IF NOT EXISTS idx_locations_clc
 CREATE INDEX IF NOT EXISTS idx_locations_station_id
     ON locations.locations (station_id)
     WHERE station_id IS NOT NULL AND station_id <> '';
+
+ALTER TABLE locations.locations ADD COLUMN IF NOT EXISTS canonical_id text;
+
+CREATE INDEX IF NOT EXISTS idx_locations_canonical_id
+    ON locations.locations (canonical_id)
+    WHERE canonical_id IS NOT NULL AND canonical_id <> '';
 
 CREATE TABLE IF NOT EXISTS observations.current (
     source text NOT NULL,
@@ -122,6 +129,7 @@ CREATE INDEX IF NOT EXISTS idx_archive_cap_xml_expires
 
 const sqliteSchemaSQL = `
 CREATE TABLE IF NOT EXISTS locations_locations (
+    canonical_id TEXT,
     source TEXT NOT NULL,
     location_id TEXT NOT NULL,
     kind TEXT NOT NULL DEFAULT 'unknown',

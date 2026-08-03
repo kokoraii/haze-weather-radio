@@ -1,0 +1,86 @@
+{
+  "api_version": 1,
+  "request_id": "contract-query-001",
+  "operation": "nearest",
+  "status": "resolved",
+  "ambiguous": false,
+  "score_margin": 0.42,
+  "catalog_generation": "contract-fixture-1",
+  "catalog_packs": ["ca-weather"],
+  "truncated": false,
+  "results": [
+    {
+      "entity": {
+        "id": "urn:haze:location:9d025ce5-5c50-5276-9050-c261885356e8",
+        "kind": "weather_station",
+        "capabilities": ["observations"],
+        "country": "CA",
+        "region": "SK",
+        "lifecycle_status": "active",
+        "reporting_status": "recent",
+        "source_quality": 0.98,
+        "identifiers": [
+          {
+            "authority": "eccc",
+            "scheme": "msc",
+            "value": "4057165",
+            "normalized_value": "4057165",
+            "primary": true,
+            "confidence": "exact",
+            "source_id": "eccc-swob-land"
+          }
+        ],
+        "names": [
+          {
+            "locale": "en-CA",
+            "value": "SASKATOON RCS",
+            "normalized_value": "saskatoon rcs",
+            "name_kind": "canonical",
+            "primary": true,
+            "source_id": "eccc-swob-land"
+          }
+        ],
+        "geometry": {
+          "geometry_type": "Point",
+          "latitude": 52.1579,
+          "longitude": -106.6702,
+          "bbox": [-106.6702, 52.1579, -106.6702, 52.1579],
+          "accuracy_m": 10.0,
+          "source_id": "eccc-swob-land"
+        },
+        "deployments": [
+          {
+            "provider_deployment_id": "4057165",
+            "owner": "ECCC",
+            "platform_type": "land",
+            "latitude": 52.1579,
+            "longitude": -106.6702,
+            "reporting_status": "recent",
+            "source_id": "eccc-swob-land",
+            "attributes": {"station_mode_original": "AUTO-minute"}
+          }
+        ],
+        "attributes": {"station_mode": "auto"}
+      },
+      "match": {
+        "score": 0.98,
+        "confidence": "high",
+        "method": "geodesic",
+        "algorithm": "location-v1",
+        "evidence": {"source_quality": 0.98}
+      },
+      "facet": "station",
+      "distance_m": 0.0,
+      "grouping": {
+        "group_id": "urn:haze:location-group:contract",
+        "representative_id": "urn:haze:location:9d025ce5-5c50-5276-9050-c261885356e8",
+        "mode": "similar_name",
+        "algorithm": "similar-name-v1",
+        "confidence": 0.96,
+        "member_ids": ["urn:haze:location:9d025ce5-5c50-5276-9050-c261885356e8"],
+        "member_count": 1,
+        "evidence": {"rule": "normalized_locality_stem"}
+      }
+    }
+  ]
+}

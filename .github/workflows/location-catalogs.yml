@@ -1,0 +1,66 @@
+name: Location Catalogs
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 8 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: location-catalogs
+  cancel-in-progress: false
+
+jobs:
+  build-pack:
+    name: Build ${{ matrix.pack }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        pack: [global-core, ca-weather, us-weather]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/util/requirements-location-catalog.txt
+
+      - name: Install catalog dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sqlite3
+          python -m pip install -r scripts/util/requirements-location-catalog.txt
+
+      - name: Build and validate pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/location-catalogs
+          retrieved_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          python scripts/util/build_location_catalog.py \
+            --manifest scripts/util/location-catalog-sources.json \
+            --pack "${{ matrix.pack }}" \
+            --output "dist/location-catalogs/${{ matrix.pack }}.sqlite" \
+            --retrieved-at "$retrieved_at" \
+            --allow-downloads
+          cd dist/location-catalogs
+          sha256sum -c "${{ matrix.pack }}.sqlite.sha256"
+          sqlite3 "${{ matrix.pack }}.sqlite" "PRAGMA integrity_check; SELECT rtreecheck('entity_rtree');"
+
+      - name: Upload checksummed pack
+        uses: actions/upload-artifact@v4
+        with:
+          name: haze-location-${{ matrix.pack }}-${{ github.run_id }}
+          path: |
+            dist/location-catalogs/${{ matrix.pack }}.sqlite
+            dist/location-catalogs/${{ matrix.pack }}.sqlite.sha256
+          if-no-files-found: error
+          retention-days: 30

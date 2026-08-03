@@ -15,6 +15,7 @@ import { initTTSView } from './tts.js';
 import { initFeedsView } from './feeds.js';
 import { initAccountsView } from './accounts.js?v=accounts-20260717-2';
 import { initLogsView } from './logs.js';
+import { initUtilitiesView } from './utilities.js';
 
 const authPill = document.getElementById('authPill');
 const healthPill = document.getElementById('healthPill');
@@ -27,7 +28,7 @@ const refreshButton = document.getElementById('refreshButton');
 let healthState = { auth_required: true, auth_enabled: true };
 let dashboardInitialized = false;
 let allowedViews = null;
-const viewInit = { same: false, automations: false, wx: false, feeds: false, tts: false, daemon: false, breakin: false, cgen: false, bulletins: false, alerts: false, dictionary: false, accounts: false, logs: false };
+const viewInit = { same: false, automations: false, wx: false, feeds: false, tts: false, daemon: false, breakin: false, cgen: false, bulletins: false, alerts: false, dictionary: false, utilities: false, accounts: false, logs: false };
 
 session.importUrlToken();
 initTheme(themeToggle);
@@ -201,6 +202,10 @@ function navigate(view) {
     if (view === 'dictionary' && !viewInit.dictionary) {
         viewInit.dictionary = true;
         initDictionaryView();
+    }
+    if (view === 'utilities' && !viewInit.utilities) {
+        viewInit.utilities = true;
+        initUtilitiesView();
     }
     if (view === 'accounts' && !viewInit.accounts) {
         viewInit.accounts = true;

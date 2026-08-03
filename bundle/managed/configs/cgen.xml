@@ -2,28 +2,28 @@
 <cgen schema_version="2" enabled="true">
   <feed id="CFSP-CAP" name="CFSP/CAP CGEN" enabled="true" updated_at="2026-07-03T17:43:17Z">
     <program>
-      <input url="udp://172.16.1.30:9098?fifo_size=2000000&amp;overrun_nonfatal=1&amp;reuse=1&amp;buffer_size=1048576" format="mpegts" deinterlace_algorithm="yadif" deinterlace_backend="software" deinterlace_cadence="field" deinterlace_parity="tff"></input>
-      <output url="${MIST_RTMP_SSPWXR01}" format="rtmp" vcodec="x264enc" acodec="avenc_aac" video_bitrate_kbps="8000" audio_bitrate_kbps="192" service_id="1" transport_stream_id="1"></output>
+      <input url="udp://172.16.1.30:9098?fifo_size=2000000&amp;overrun_nonfatal=1&amp;reuse=1&amp;buffer_size=1048576" format="mpegts" deinterlace_enabled="true" deinterlace_algorithm="yadif" deinterlace_backend="software" deinterlace_cadence="frame" deinterlace_parity="tff"></input>
+      <output url="${MIST_RTMP_SSPWXR01}" format="rtmp" vcodec="x264enc" acodec="avenc_aac" video_bitrate_kbps="4000" audio_bitrate_kbps="192" service_id="1" transport_stream_id="1"></output>
     </program>
     <priority>
       <input feed_id="CFSP-CAP" audio_source="both" format="priority-audio"></input>
     </priority>
     <alert feed_id="CFSP-CAP"></alert>
     <ancillary captions="drop" scte35="drop" scte104="drop"></ancillary>
-    <compositor alert_scene_id="Standard_Crawl" engine="legacy"></compositor>
+    <compositor alert_scene_id="Standard_Crawl" engine="scene_v2"></compositor>
     <media>
-      <video width="1920" height="1080" fps="60000/1001" interlaced="false" field_order="tff" standard="atsc"></video>
+      <video width="1920" height="1080" fps="30000/1001" interlaced="false" field_order="tff" standard="atsc"></video>
       <audio idle="source" alert_mode="replace" mute_standby_routine="true" topology="force_layout" force_layout="stereo" idle_program_gain_db="0" alert_program_gain_db="muted" alert_gain_db="0" transition_ms="20"></audio>
     </media>
     <ladder>
-      <video id="hd" enabled="true" width="720" height="540" fps="60000/1001" interlaced="false" field_order="tff" standard="atsc" vcodec="x264enc" bitrate_kbps="8000" program="1" video_pid="256" pmt_pid="4096"></video>
+      <video id="hd" enabled="true" width="720" height="540" fps="30000/1001" interlaced="false" field_order="tff" standard="atsc" vcodec="x264enc" bitrate_kbps="4000" program="1" video_pid="256" pmt_pid="4096"></video>
       <video id="p720" enabled="false" width="1280" height="720" fps="60000/1001" interlaced="false" field_order="tff" standard="atsc" vcodec="x264enc" bitrate_kbps="8000" program="2" video_pid="288" pmt_pid="4097"></video>
       <video id="sd" enabled="false" width="720" height="480" fps="60000/1001" interlaced="true" field_order="tff" standard="atsc" vcodec="x264enc" bitrate_kbps="10000" program="3" video_pid="320" pmt_pid="4098"></video>
       <audio id="stereo" enabled="true" channels="2" acodec="avenc_aac" bitrate_kbps="192" language="eng" program="1" audio_pid="257" pmt_pid="4096"></audio>
       <audio id="surround_51" enabled="false" channels="6" acodec="avenc_aac" bitrate_kbps="384" language="eng" program="1" audio_pid="258" pmt_pid="4096"></audio>
     </ladder>
     <outputs>
-      <output id="primary" enabled="true" destination="rtmp" url="${MIST_RTMP_SSPWXR01}" video_codec="h264" rate_control="cbr" video_bitrate_kbps="8000" video_max_bitrate_kbps="8000" gop_frames="120" audio_codec="aac" audio_bitrate_kbps="192" sample_rate="48000"></output>
+      <output id="primary" enabled="true" destination="rtmp" url="${MIST_RTMP_SSPWXR01}" video_codec="h264" rate_control="cbr" video_bitrate_kbps="4000" video_max_bitrate_kbps="4000" gop_frames="60" audio_codec="aac" audio_bitrate_kbps="192" sample_rate="48000"></output>
     </outputs>
     <presentation>
       <banner mode="ticker" background_enabled="true">

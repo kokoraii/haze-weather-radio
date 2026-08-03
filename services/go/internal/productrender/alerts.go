@@ -21,6 +21,7 @@ import (
 	"github.com/meowraii/haze-weather-radio/services/go/internal/capmodel"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/capsame"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/datastore"
+	"github.com/meowraii/haze-weather-radio/services/go/internal/locationclient"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/locationdb"
 )
 
@@ -37,15 +38,16 @@ type capRegistryEntry struct {
 }
 
 type capArchiveRecord struct {
-	ID        string         `json:"id"`
-	FeedID    string         `json:"feed_id,omitempty"`
-	Status    string         `json:"status"`
-	Reason    string         `json:"reason,omitempty"`
-	UpdatedAt time.Time      `json:"updated_at"`
-	Alert     capmodel.Alert `json:"alert"`
-	RawXML    string         `json:"raw_xml,omitempty"`
-	Locations []string       `json:"locations,omitempty"`
-	Lineage   []string       `json:"lineage,omitempty"`
+	ID                 string                         `json:"id"`
+	FeedID             string                         `json:"feed_id,omitempty"`
+	Status             string                         `json:"status"`
+	Reason             string                         `json:"reason,omitempty"`
+	UpdatedAt          time.Time                      `json:"updated_at"`
+	Alert              capmodel.Alert                 `json:"alert"`
+	RawXML             string                         `json:"raw_xml,omitempty"`
+	Locations          []string                       `json:"locations,omitempty"`
+	CanonicalLocations []alertmodel.LocationReference `json:"canonical_locations,omitempty"`
+	Lineage            []string                       `json:"lineage,omitempty"`
 }
 
 func (s *Service) handleCAPAlert(event map[string]any) {
@@ -492,6 +494,7 @@ func (s *Service) recordCAPAlert(alert capmodel.Alert, now time.Time) ([]capRegi
 	if alert.Identifier == "" || strings.TrimSpace(alert.RawXML) == "" {
 		return nil, nil
 	}
+	canonicalLocations := s.canonicalCAPLocations(alert)
 
 	activeByFeed := loadActiveCAPEntriesByFeed(s.cfg.Store, now)
 	operatorSuppressedFeeds := capOperatorSuppressedFeeds(s.cfg.Store, alert, now)
@@ -667,14 +670,15 @@ func (s *Service) recordCAPAlert(alert capmodel.Alert, now time.Time) ([]capRegi
 			continue
 		}
 		storeCAPArchiveRecord(s.cfg.Store, "accepted", capArchiveRecord{
-			ID:        alert.Identifier,
-			FeedID:    feed.ID,
-			Status:    "accepted",
-			UpdatedAt: nextEntry.UpdatedAt,
-			Alert:     alert,
-			RawXML:    alert.RawXML,
-			Locations: currentLocations,
-			Lineage:   lineage,
+			ID:                 alert.Identifier,
+			FeedID:             feed.ID,
+			Status:             "accepted",
+			UpdatedAt:          nextEntry.UpdatedAt,
+			Alert:              alert,
+			RawXML:             alert.RawXML,
+			Locations:          currentLocations,
+			CanonicalLocations: canonicalLocations,
+			Lineage:            lineage,
 		})
 		info := chooseAlertInfo(alert, feedLanguage(feed))
 		alertText := ""
@@ -717,12 +721,18 @@ func (s *Service) recordCAPAlert(alert capmodel.Alert, now time.Time) ([]capRegi
 			broadcast = false
 		}
 		samePayload := capSAMEPayload(alert, feed, s.cfg.BaseDir, now)
+		if locationclient.ParseMode(s.cfg.Root.Services.Rust.Location.Mode) == locationclient.ModeAuthoritative {
+			if locations := canonicalSAMELocations(canonicalLocations); len(locations) > 0 {
+				samePayload["same_locations"] = locations
+				samePayload["same_location_source"] = "haze-location"
+			}
+		}
 		if broadcast {
 			if locations := sameLocationsForAssignments(*info, feed, s.cfg.BaseDir, addedLocations); len(locations) > 0 {
 				samePayload["same_locations"] = locations
 			}
 		}
-		packet := capAlertPacket(alert, feed, headline, eventName, severity, urgency, certainty, description, instruction, backgroundColor, broadcastImmediate, alertText, audio, samePayload)
+		packet := capAlertPacket(alert, feed, headline, eventName, severity, urgency, certainty, description, instruction, backgroundColor, broadcastImmediate, alertText, audio, samePayload, canonicalLocations)
 		updates = append(updates, capRegistryUpdate{
 			FeedID:             feed.ID,
 			Renderable:         hasRenderableCAPEntries(entries, now),
@@ -754,7 +764,7 @@ func (s *Service) recordCAPAlert(alert capmodel.Alert, now time.Time) ([]capRegi
 	return updates, nil
 }
 
-func capAlertPacket(alert capmodel.Alert, feed feedXML, headline string, eventName string, severity string, urgency string, certainty string, description string, instruction string, backgroundColor string, broadcastImmediate bool, alertText string, audio capBroadcastAudio, samePayload map[string]any) alertmodel.Packet {
+func capAlertPacket(alert capmodel.Alert, feed feedXML, headline string, eventName string, severity string, urgency string, certainty string, description string, instruction string, backgroundColor string, broadcastImmediate bool, alertText string, audio capBroadcastAudio, samePayload map[string]any, canonicalLocations []alertmodel.LocationReference) alertmodel.Packet {
 	data := map[string]any{
 		"feed_id":             feed.ID,
 		"alert_id":            alert.Identifier,
@@ -786,6 +796,12 @@ func capAlertPacket(alert capmodel.Alert, feed feedXML, headline string, eventNa
 	}
 	packet, _ := alertmodel.FromMap(data)
 	packet.Presentation.SpeechText = strings.TrimSpace(alertText)
+	packet.Areas.Locations = append([]alertmodel.LocationReference(nil), canonicalLocations...)
+	for _, location := range canonicalLocations {
+		if location.Actionable && strings.TrimSpace(location.CanonicalID) != "" && location.Name != "" {
+			packet.Areas.Names = append(packet.Areas.Names, location.Name)
+		}
+	}
 	return packet
 }
 
@@ -1986,6 +2002,9 @@ func storeCAPArchiveRecord(store datastore.Store, bucket string, record capArchi
 	}
 	if len(record.Lineage) > 0 {
 		metadata["alert_lineage"] = sortedUniqueFolded(record.Lineage)
+	}
+	if len(record.CanonicalLocations) > 0 {
+		metadata["canonical_locations"] = record.CanonicalLocations
 	}
 	archiveRecord := datastore.CAPArchiveRecord{
 		AlertID:      fallbackText(record.ID, record.Alert.Identifier),

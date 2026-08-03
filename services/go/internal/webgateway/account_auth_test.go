@@ -17,8 +17,8 @@ import (
 	"github.com/pquerna/otp/totp"
 )
 
-func TestHardenedLoginIssuesPASETOAndPinsClientIP(t *testing.T) {
-	manager, configPath := newTestHardenedAuthManager(t, false)
+func TestAccountLoginIssuesPASETOAndPinsClientIP(t *testing.T) {
+	manager, configPath := newTestAccountAuthManager(t, false)
 	defer manager.Close()
 	request := testLoginRequest("24.120.53.11:41000")
 	result, err := manager.LoginWithRequest(context.Background(), LoginInput{
@@ -59,8 +59,8 @@ func TestHardenedLoginIssuesPASETOAndPinsClientIP(t *testing.T) {
 	}
 }
 
-func TestHardenedBrowserCloseCookieHasNoPersistentExpiry(t *testing.T) {
-	manager, _ := newTestHardenedAuthManager(t, false)
+func TestAccountBrowserCloseCookieHasNoPersistentExpiry(t *testing.T) {
+	manager, _ := newTestAccountAuthManager(t, false)
 	defer manager.Close()
 	request := testLoginRequest("192.0.2.20:5000")
 	result, err := manager.LoginWithRequest(context.Background(), LoginInput{
@@ -79,15 +79,15 @@ func TestHardenedBrowserCloseCookieHasNoPersistentExpiry(t *testing.T) {
 		t.Fatalf("browser-close cookie unexpectedly persisted: %#v", cookies[0])
 	}
 	if !cookies[0].HttpOnly || cookies[0].SameSite != http.SameSiteStrictMode {
-		t.Fatalf("cookie is not hardened: %#v", cookies[0])
+		t.Fatalf("cookie is missing required protections: %#v", cookies[0])
 	}
 	if !cookies[0].Secure {
-		t.Fatalf("hardened cookie is not Secure: %#v", cookies[0])
+		t.Fatalf("account cookie is not Secure: %#v", cookies[0])
 	}
 }
 
-func TestHardenedLoginRejectsPlainHTTP(t *testing.T) {
-	manager, _ := newTestHardenedAuthManager(t, false)
+func TestAccountLoginRejectsPlainHTTP(t *testing.T) {
+	manager, _ := newTestAccountAuthManager(t, false)
 	defer manager.Close()
 	request := httptest.NewRequest(http.MethodPost, "http://example.test/api/v1/auth/login", nil)
 	request.RemoteAddr = "192.0.2.44:5000"
@@ -98,12 +98,42 @@ func TestHardenedLoginRejectsPlainHTTP(t *testing.T) {
 	if !errors.As(err, &authErr) || authErr.Code != "https_required" {
 		t.Fatalf("plain HTTP login error = %#v", err)
 	}
+	if authErr.Detail != "Sign in requires HTTPS." {
+		t.Fatalf("unexpected user-facing detail: %q", authErr.Detail)
+	}
 }
 
-func TestHardenedPasswordHashUsesRequiredPepperedProfile(t *testing.T) {
-	manager, _ := newTestHardenedAuthManager(t, false)
+func TestUnavailableAuthErrorsUsePlainUserFacingLanguage(t *testing.T) {
+	tests := []struct {
+		name string
+		auth *accountAuth
+		want string
+	}{
+		{name: "not configured", auth: &accountAuth{}, want: "Sign-in is not configured."},
+		{
+			name: "initialization failed",
+			auth: &accountAuth{initializationError: errors.New("private initialization detail")},
+			want: "Sign-in is unavailable. Check the server configuration.",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var authErr *AuthError
+			if err := test.auth.unavailableError(); !errors.As(err, &authErr) {
+				t.Fatalf("expected AuthError, got %T", err)
+			}
+			if authErr.Detail != test.want {
+				t.Fatalf("detail = %q, want %q", authErr.Detail, test.want)
+			}
+		})
+	}
+}
+
+func TestAccountPasswordHashUsesRequiredPepperedProfile(t *testing.T) {
+	manager, _ := newTestAccountAuthManager(t, false)
 	defer manager.Close()
-	hash, err := manager.hardened.hashPassword("another correct battery staple")
+	hash, err := manager.accounts.hashPassword("another correct battery staple")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,18 +143,18 @@ func TestHardenedPasswordHashUsesRequiredPepperedProfile(t *testing.T) {
 	if !strings.Contains(hash, "$m=65536,t=3,p=4$") {
 		t.Fatalf("hash profile = %q", hash)
 	}
-	ok, err := manager.hardened.verifyPassword(context.Background(), hash, "another correct battery staple")
+	ok, err := manager.accounts.verifyPassword(context.Background(), hash, "another correct battery staple")
 	if err != nil || !ok {
 		t.Fatalf("verify correct password: ok=%v err=%v", ok, err)
 	}
-	ok, err = manager.hardened.verifyPassword(context.Background(), hash, "wrong password")
+	ok, err = manager.accounts.verifyPassword(context.Background(), hash, "wrong password")
 	if err != nil || ok {
 		t.Fatalf("verify wrong password: ok=%v err=%v", ok, err)
 	}
 }
 
-func TestHardenedLoginLocksAccountAfterFiveFailures(t *testing.T) {
-	manager, _ := newTestHardenedAuthManager(t, false)
+func TestAccountLoginLocksAccountAfterFiveFailures(t *testing.T) {
+	manager, _ := newTestAccountAuthManager(t, false)
 	defer manager.Close()
 	for attempt := 0; attempt < 5; attempt++ {
 		request := testLoginRequest("198.51.100.9:44000")
@@ -132,7 +162,7 @@ func TestHardenedLoginLocksAccountAfterFiveFailures(t *testing.T) {
 			Username: "admin", Password: "incorrect password value", Request: request,
 		})
 	}
-	account, err := manager.hardened.store.ByUsername(context.Background(), "admin")
+	account, err := manager.accounts.store.ByUsername(context.Background(), "admin")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,8 +177,8 @@ func TestHardenedLoginLocksAccountAfterFiveFailures(t *testing.T) {
 	}
 }
 
-func TestHardenedMFAEnrollmentAndReplayProtection(t *testing.T) {
-	manager, _ := newTestHardenedAuthManager(t, true)
+func TestAccountMFAEnrollmentAndReplayProtection(t *testing.T) {
+	manager, _ := newTestAccountAuthManager(t, true)
 	defer manager.Close()
 	request := testLoginRequest("203.0.113.20:55000")
 	challenge, err := manager.LoginWithRequest(context.Background(), LoginInput{
@@ -167,7 +197,7 @@ func TestHardenedMFAEnrollmentAndReplayProtection(t *testing.T) {
 	if err != nil || result.Token == "" {
 		t.Fatalf("MFA login: result=%#v err=%v", result, err)
 	}
-	manager.hardened.Logout(authenticatedRequest(result.Token, request.RemoteAddr))
+	manager.accounts.Logout(authenticatedRequest(result.Token, request.RemoteAddr))
 	if _, err := manager.LoginWithRequest(context.Background(), LoginInput{
 		Username: "admin", Password: "correct horse battery staple", TOTP: code, Request: request,
 	}); err == nil {
@@ -176,18 +206,18 @@ func TestHardenedMFAEnrollmentAndReplayProtection(t *testing.T) {
 }
 
 func TestOptionalMFADoesNotEnforcePendingEnrollment(t *testing.T) {
-	manager, _ := newTestHardenedAuthManager(t, false)
+	manager, _ := newTestAccountAuthManager(t, false)
 	defer manager.Close()
 	ctx := context.Background()
-	account, err := manager.hardened.store.ByUsername(ctx, "admin")
+	account, err := manager.accounts.store.ByUsername(ctx, "admin")
 	if err != nil {
 		t.Fatal(err)
 	}
-	encrypted, err := manager.hardened.encryptMFASecret(account.ID, "JBSWY3DPEHPK3PXP")
+	encrypted, err := manager.accounts.encryptMFASecret(account.ID, "JBSWY3DPEHPK3PXP")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.hardened.store.SetMFA(ctx, account.ID, encrypted, false); err != nil {
+	if err := manager.accounts.store.SetMFA(ctx, account.ID, encrypted, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -197,7 +227,7 @@ func TestOptionalMFADoesNotEnforcePendingEnrollment(t *testing.T) {
 	if err != nil || result.Token == "" {
 		t.Fatalf("optional MFA login: result=%#v err=%v", result, err)
 	}
-	stored, err := manager.hardened.store.ByUsername(ctx, "admin")
+	stored, err := manager.accounts.store.ByUsername(ctx, "admin")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,8 +281,8 @@ func TestAuditLoggerDetectsModifiedCheckpoint(t *testing.T) {
 	}
 }
 
-func TestHardenedAuthVersionRevokesRacingSession(t *testing.T) {
-	manager, _ := newTestHardenedAuthManager(t, false)
+func TestAccountAuthVersionRevokesRacingSession(t *testing.T) {
+	manager, _ := newTestAccountAuthManager(t, false)
 	defer manager.Close()
 	loginRequest := testLoginRequest("203.0.113.31:51000")
 	result, err := manager.LoginWithRequest(context.Background(), LoginInput{
@@ -261,7 +291,7 @@ func TestHardenedAuthVersionRevokesRacingSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.hardened.store.BumpAuthVersion(context.Background(), result.Identity.Account.ID); err != nil {
+	if err := manager.accounts.store.BumpAuthVersion(context.Background(), result.Identity.Account.ID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := manager.Identity(authenticatedRequest(result.Token, loginRequest.RemoteAddr)); err == nil {
@@ -270,64 +300,64 @@ func TestHardenedAuthVersionRevokesRacingSession(t *testing.T) {
 }
 
 func TestConditionalSelfPasswordChangeCannotOverwriteAdminReset(t *testing.T) {
-	manager, _ := newTestHardenedAuthManager(t, false)
+	manager, _ := newTestAccountAuthManager(t, false)
 	defer manager.Close()
-	account, err := manager.hardened.store.ByUsername(context.Background(), "admin")
+	account, err := manager.accounts.store.ByUsername(context.Background(), "admin")
 	if err != nil {
 		t.Fatal(err)
 	}
-	adminHash, err := manager.hardened.hashPassword("administrator replacement password")
+	adminHash, err := manager.accounts.hashPassword("administrator replacement password")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.hardened.store.SetPassword(context.Background(), account.ID, adminHash); err != nil {
+	if err := manager.accounts.store.SetPassword(context.Background(), account.ID, adminHash); err != nil {
 		t.Fatal(err)
 	}
-	staleUserHash, err := manager.hardened.hashPassword("stale user replacement password")
+	staleUserHash, err := manager.accounts.hashPassword("stale user replacement password")
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = manager.hardened.store.SetPasswordIfAuthVersion(context.Background(), account.ID, staleUserHash, account.authVersion)
+	err = manager.accounts.store.SetPasswordIfAuthVersion(context.Background(), account.ID, staleUserHash, account.authVersion)
 	if !errors.Is(err, errAccountVersionChanged) {
 		t.Fatalf("stale password update error = %v", err)
 	}
-	stored, err := manager.hardened.store.ByID(context.Background(), account.ID)
+	stored, err := manager.accounts.store.ByID(context.Background(), account.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	adminOK, err := manager.hardened.verifyPassword(context.Background(), stored.passwordHash, "administrator replacement password")
+	adminOK, err := manager.accounts.verifyPassword(context.Background(), stored.passwordHash, "administrator replacement password")
 	if err != nil || !adminOK {
 		t.Fatalf("administrator password was not preserved: ok=%v err=%v", adminOK, err)
 	}
-	staleOK, err := manager.hardened.verifyPassword(context.Background(), stored.passwordHash, "stale user replacement password")
+	staleOK, err := manager.accounts.verifyPassword(context.Background(), stored.passwordHash, "stale user replacement password")
 	if err != nil || staleOK {
 		t.Fatalf("stale user password replaced administrator password: ok=%v err=%v", staleOK, err)
 	}
 }
 
 func TestConditionalMFAEnrollmentCannotSurviveCredentialReset(t *testing.T) {
-	manager, _ := newTestHardenedAuthManager(t, false)
+	manager, _ := newTestAccountAuthManager(t, false)
 	defer manager.Close()
-	account, err := manager.hardened.store.ByUsername(context.Background(), "admin")
+	account, err := manager.accounts.store.ByUsername(context.Background(), "admin")
 	if err != nil {
 		t.Fatal(err)
 	}
-	replacementHash, err := manager.hardened.hashPassword("administrator replacement password")
+	replacementHash, err := manager.accounts.hashPassword("administrator replacement password")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.hardened.store.SetPassword(context.Background(), account.ID, replacementHash); err != nil {
+	if err := manager.accounts.store.SetPassword(context.Background(), account.ID, replacementHash); err != nil {
 		t.Fatal(err)
 	}
-	encrypted, err := manager.hardened.encryptMFASecret(account.ID, "JBSWY3DPEHPK3PXP")
+	encrypted, err := manager.accounts.encryptMFASecret(account.ID, "JBSWY3DPEHPK3PXP")
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = manager.hardened.store.SetMFAIfAuthVersion(context.Background(), account.ID, encrypted, account.authVersion)
+	err = manager.accounts.store.SetMFAIfAuthVersion(context.Background(), account.ID, encrypted, account.authVersion)
 	if !errors.Is(err, errAccountVersionChanged) {
 		t.Fatalf("stale MFA enrollment error = %v", err)
 	}
-	stored, err := manager.hardened.store.ByID(context.Background(), account.ID)
+	stored, err := manager.accounts.store.ByID(context.Background(), account.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -337,7 +367,7 @@ func TestConditionalMFAEnrollmentCannotSurviveCredentialReset(t *testing.T) {
 }
 
 func TestAccountPolicySaveRevokesExistingSessionByVersion(t *testing.T) {
-	manager, _ := newTestHardenedAuthManager(t, false)
+	manager, _ := newTestAccountAuthManager(t, false)
 	defer manager.Close()
 	request := testLoginRequest("203.0.113.48:51000")
 	result, err := manager.LoginWithRequest(context.Background(), LoginInput{
@@ -346,16 +376,16 @@ func TestAccountPolicySaveRevokesExistingSessionByVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	account, err := manager.hardened.store.ByID(context.Background(), result.Identity.Account.ID)
+	account, err := manager.accounts.store.ByID(context.Background(), result.Identity.Account.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	account.CanViewLogs = !account.CanViewLogs
 	account.BlockedEventCodes = []string{"EAN", "NPT"}
-	if err := manager.hardened.store.Save(context.Background(), account); err != nil {
+	if err := manager.accounts.store.Save(context.Background(), account); err != nil {
 		t.Fatal(err)
 	}
-	stored, err := manager.hardened.store.ByID(context.Background(), account.ID)
+	stored, err := manager.accounts.store.ByID(context.Background(), account.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -368,7 +398,7 @@ func TestAccountPolicySaveRevokesExistingSessionByVersion(t *testing.T) {
 }
 
 func TestAccountStoreOutageDoesNotDeleteSessionLease(t *testing.T) {
-	manager, _ := newTestHardenedAuthManager(t, false)
+	manager, _ := newTestAccountAuthManager(t, false)
 	defer manager.Close()
 	loginRequest := testLoginRequest("203.0.113.47:51000")
 	result, err := manager.LoginWithRequest(context.Background(), LoginInput{
@@ -377,7 +407,7 @@ func TestAccountStoreOutageDoesNotDeleteSessionLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.hardened.store.db.Close(); err != nil {
+	if err := manager.accounts.store.db.Close(); err != nil {
 		t.Fatal(err)
 	}
 	_, err = manager.Identity(authenticatedRequest(result.Token, loginRequest.RemoteAddr))
@@ -385,13 +415,13 @@ func TestAccountStoreOutageDoesNotDeleteSessionLease(t *testing.T) {
 	if !errors.As(err, &authErr) || authErr.Code != "session_unavailable" {
 		t.Fatalf("database outage authentication error = %#v", err)
 	}
-	if _, err := manager.hardened.sessions.Get(context.Background(), result.Identity.RawSessionID); err != nil {
+	if _, err := manager.accounts.sessions.Get(context.Background(), result.Identity.RawSessionID); err != nil {
 		t.Fatalf("database outage revoked the session lease: %v", err)
 	}
 }
 
 func TestLoginAttemptAdmissionIsAtomicInMemory(t *testing.T) {
-	manager, _ := newTestHardenedAuthManager(t, false)
+	manager, _ := newTestAccountAuthManager(t, false)
 	defer manager.Close()
 	const attempts = 40
 	var allowed atomic.Int32
@@ -401,7 +431,7 @@ func TestLoginAttemptAdmissionIsAtomicInMemory(t *testing.T) {
 	for index := 0; index < attempts; index++ {
 		go func() {
 			defer wait.Done()
-			pairAllowed, ipAllowed, err := manager.hardened.admitLoginAttempt(context.Background(), "admin", "admin|198.51.100.77", "198.51.100.77", 100, now)
+			pairAllowed, ipAllowed, err := manager.accounts.admitLoginAttempt(context.Background(), "admin", "admin|198.51.100.77", "198.51.100.77", 100, now)
 			if err != nil {
 				t.Errorf("admit login attempt: %v", err)
 				return
@@ -418,23 +448,23 @@ func TestLoginAttemptAdmissionIsAtomicInMemory(t *testing.T) {
 }
 
 func TestMFASecretCiphertextIsBoundToAccount(t *testing.T) {
-	manager, _ := newTestHardenedAuthManager(t, false)
+	manager, _ := newTestAccountAuthManager(t, false)
 	defer manager.Close()
-	encrypted, err := manager.hardened.encryptMFASecret("account-one", "JBSWY3DPEHPK3PXP")
+	encrypted, err := manager.accounts.encryptMFASecret("account-one", "JBSWY3DPEHPK3PXP")
 	if err != nil {
 		t.Fatal(err)
 	}
-	secret, err := manager.hardened.decryptMFASecret("account-one", encrypted)
+	secret, err := manager.accounts.decryptMFASecret("account-one", encrypted)
 	if err != nil || secret != "JBSWY3DPEHPK3PXP" {
 		t.Fatalf("decrypt bound MFA secret: secret=%q err=%v", secret, err)
 	}
-	if _, err := manager.hardened.decryptMFASecret("account-two", encrypted); err == nil {
+	if _, err := manager.accounts.decryptMFASecret("account-two", encrypted); err == nil {
 		t.Fatal("MFA secret ciphertext was accepted for a different account")
 	}
 }
 
 func TestPasswordExpiryIsRecomputedForExistingSession(t *testing.T) {
-	manager, _ := newTestHardenedAuthManager(t, false)
+	manager, _ := newTestAccountAuthManager(t, false)
 	defer manager.Close()
 	loginRequest := testLoginRequest("203.0.113.32:51000")
 	result, err := manager.LoginWithRequest(context.Background(), LoginInput{
@@ -444,7 +474,7 @@ func TestPasswordExpiryIsRecomputedForExistingSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	old := time.Now().UTC().Add(-91 * 24 * time.Hour).Format(time.RFC3339Nano)
-	if _, err := manager.hardened.store.db.Exec(`UPDATE users SET password_changed_at=? WHERE id=?`, old, result.Identity.Account.ID); err != nil {
+	if _, err := manager.accounts.store.db.Exec(`UPDATE users SET password_changed_at=? WHERE id=?`, old, result.Identity.Account.ID); err != nil {
 		t.Fatal(err)
 	}
 	authRequest := authenticatedRequest(result.Token, loginRequest.RemoteAddr)
@@ -464,19 +494,19 @@ func TestPasswordExpiryIsRecomputedForExistingSession(t *testing.T) {
 }
 
 func TestLoginFailureWindowExpires(t *testing.T) {
-	manager, _ := newTestHardenedAuthManager(t, false)
+	manager, _ := newTestAccountAuthManager(t, false)
 	defer manager.Close()
-	account, err := manager.hardened.store.ByUsername(context.Background(), "admin")
+	account, err := manager.accounts.store.ByUsername(context.Background(), "admin")
 	if err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
 	for attempt := 0; attempt < 4; attempt++ {
-		if _, err := manager.hardened.store.RecordLoginFailure(context.Background(), account.ID, 5, 15*time.Minute, now.Add(-time.Hour)); err != nil {
+		if _, err := manager.accounts.store.RecordLoginFailure(context.Background(), account.ID, 5, 15*time.Minute, now.Add(-time.Hour)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	updated, err := manager.hardened.store.RecordLoginFailure(context.Background(), account.ID, 5, 15*time.Minute, now)
+	updated, err := manager.accounts.store.RecordLoginFailure(context.Background(), account.ID, 5, 15*time.Minute, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -573,14 +603,14 @@ func TestNonAdminArchiveRBACAllowsOnlyOriginationActions(t *testing.T) {
 }
 
 func TestExpiredPasswordWithoutSelfChangeRequiresAdminReset(t *testing.T) {
-	manager, _ := newTestHardenedAuthManager(t, false)
+	manager, _ := newTestAccountAuthManager(t, false)
 	defer manager.Close()
-	account, err := manager.hardened.store.ByUsername(context.Background(), "admin")
+	account, err := manager.accounts.store.ByUsername(context.Background(), "admin")
 	if err != nil {
 		t.Fatal(err)
 	}
 	changedAt := time.Now().UTC().Add(-2 * 24 * time.Hour).Format(time.RFC3339Nano)
-	if _, err := manager.hardened.store.db.Exec(`UPDATE users SET allow_user_pw_change=false, password_expiry_days=1, password_changed_at=? WHERE id=?`, changedAt, account.ID); err != nil {
+	if _, err := manager.accounts.store.db.Exec(`UPDATE users SET allow_user_pw_change=false, password_expiry_days=1, password_changed_at=? WHERE id=?`, changedAt, account.ID); err != nil {
 		t.Fatal(err)
 	}
 	_, err = manager.LoginWithRequest(context.Background(), LoginInput{
@@ -593,17 +623,17 @@ func TestExpiredPasswordWithoutSelfChangeRequiresAdminReset(t *testing.T) {
 }
 
 func TestAccountStorePreventsDemotingLastUnlockedAdministrator(t *testing.T) {
-	manager, _ := newTestHardenedAuthManager(t, false)
+	manager, _ := newTestAccountAuthManager(t, false)
 	defer manager.Close()
-	account, err := manager.hardened.store.ByUsername(context.Background(), "admin")
+	account, err := manager.accounts.store.ByUsername(context.Background(), "admin")
 	if err != nil {
 		t.Fatal(err)
 	}
 	account.IsAdmin = false
-	if err := manager.hardened.store.Save(context.Background(), account); err == nil {
+	if err := manager.accounts.store.Save(context.Background(), account); err == nil {
 		t.Fatal("last unlocked administrator was demoted")
 	}
-	stored, err := manager.hardened.store.ByID(context.Background(), account.ID)
+	stored, err := manager.accounts.store.ByID(context.Background(), account.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -637,7 +667,7 @@ func TestAuditLoggerRenamePreflightDoesNotPartiallyMoveCategories(t *testing.T) 
 	}
 }
 
-func newTestHardenedAuthManager(t *testing.T, enforceMFA bool) (*AuthManager, string) {
+func newTestAccountAuthManager(t *testing.T, enforceMFA bool) (*AuthManager, string) {
 	t.Helper()
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")
@@ -660,7 +690,7 @@ func newTestHardenedAuthManager(t *testing.T, enforceMFA bool) (*AuthManager, st
 	t.Setenv("ADMIN_PASSWD", "")
 	manager := NewAuthManagerWithPath(config, configPath)
 	if !manager.Configured() {
-		t.Fatalf("hardened auth was not configured: %v", manager.hardened.initializationError)
+		t.Fatalf("account authentication was not configured: %v", manager.accounts.initializationError)
 	}
 	return manager, configPath
 }

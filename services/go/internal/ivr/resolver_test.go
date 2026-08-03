@@ -5,7 +5,100 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/meowraii/haze-weather-radio/services/go/internal/locationdb"
 )
+
+func TestResolvePlaceKeepsOverlappingCodesSourceQualified(t *testing.T) {
+	t.Parallel()
+	snapshot := locationdb.Snapshot{Places: []locationdb.Place{
+		{Source: "forecast", Code: "SAME1", Name: "Canadian Place", Region: "SK", Country: "CA"},
+		{Source: "nws_zone", Code: "SAME1", Name: "American Place", Region: "MT", Country: "US"},
+	}}
+	resolver := NewResolver(loadedConfig{Feeds: []feedXML{{ID: "render", EnabledRaw: "true"}}})
+	canadian, err := resolver.ResolvePlace(snapshot, snapshot.Places[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	american, err := resolver.ResolvePlace(snapshot, snapshot.Places[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canadian.Source != "eccc_forecast" || canadian.Name != "Canadian Place" || american.Source != "nws_zone" || american.Name != "American Place" {
+		t.Fatalf("source-qualified results crossed providers: Canadian=%#v American=%#v", canadian, american)
+	}
+}
+
+func TestResolverFeedIndexPreservesLegacyPrecedence(t *testing.T) {
+	first := feedXML{ID: "first", EnabledRaw: "true"}
+	first.Locations.Coverage.Regions = []coverageRegionXML{
+		{ID: "EARLY", Name: "Greater Alpha District", DeriveForecast: "forecast-early", Subregions: []coverageSubregionXML{{ID: "SHARED"}}},
+		{ID: "SHARED", Name: "Later direct region", DeriveForecast: "forecast-late"},
+	}
+	first.Locations.ObservationLocations.Locations = []feedLocationXML{{ID: "OBS"}}
+	second := feedXML{ID: "second", EnabledRaw: "true"}
+	second.Locations.Coverage.Regions = []coverageRegionXML{
+		{ID: "OBS", Name: "Second feed coverage", DeriveForecast: "forecast-second"},
+	}
+
+	resolver := NewResolver(loadedConfig{Feeds: []feedXML{first, second}})
+	for _, record := range []locationRecord{
+		{Code: "SHARED", Name: "Unrelated"},
+		{Code: "OTHER", Name: "Alpha"},
+		{Code: "OTHER", Name: "Unrelated", Forecast: "OBS"},
+	} {
+		got := resolver.attachFeed(record)
+		want := legacyAttachFeedForTest(resolver, record)
+		if got != want {
+			t.Fatalf("indexed feed attachment changed legacy precedence for %#v: got %#v, want %#v", record, got, want)
+		}
+	}
+}
+
+func legacyAttachFeedForTest(resolver *Resolver, record locationRecord) locationRecord {
+	if record.FeedID != "" {
+		return record
+	}
+	for _, feed := range resolver.cfg.Feeds {
+		if !xmlBool(feed.EnabledRaw, true) {
+			continue
+		}
+		for _, region := range feed.Locations.Coverage.Regions {
+			if regionMatchesRecord(region, record) || resolver.regionNameMatchesRecord(region, record) {
+				record.FeedID = feed.ID
+				if strings.TrimSpace(region.DeriveForecast) != "" {
+					record.Forecast = strings.TrimSpace(region.DeriveForecast)
+				}
+				if regionName := resolver.coverageRegionDisplayName(region); regionName != "" && !locationNameMentioned(regionName, record.Name) {
+					record.Name = regionName
+				}
+				return record
+			}
+			for _, subregion := range region.Subregions {
+				if sameCode(subregion.ID, record.Code) {
+					record.FeedID = feed.ID
+					if strings.TrimSpace(region.DeriveForecast) != "" {
+						record.Forecast = strings.TrimSpace(region.DeriveForecast)
+					}
+					if regionName := resolver.coverageRegionDisplayName(region); regionName != "" && !locationNameMentioned(regionName, record.Name) {
+						record.Name = regionName
+					}
+					return record
+				}
+			}
+		}
+		for _, loc := range feed.Locations.ObservationLocations.Locations {
+			if sameCode(loc.ID, record.Forecast) || sameCode(loc.ID, record.StationID) || sameCode(loc.ID, record.Code) {
+				record.FeedID = feed.ID
+				if record.StationID == "" {
+					record.StationID = loc.ID
+				}
+				return record
+			}
+		}
+	}
+	return record
+}
 
 func TestResolverMapsHelloWeatherCodeToCoveredFeed(t *testing.T) {
 	cfg := loadedConfig{

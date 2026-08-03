@@ -18,6 +18,16 @@ storage:
 
 services:
   rust:
+    location:
+      enabled: true
+      executable: "bin/haze-location"
+      config: "managed/configs/locations.xml"
+      mode: "legacy" # legacy, shadow, or authoritative
+      workers: 4
+      queue_size: 128
+      scheduler:
+        windows_priority: normal
+        nice: 0
     media:
       enabled: true
       addr: "127.0.0.1:8097"
@@ -118,9 +128,24 @@ services:
       webhooks: "managed/configs/webhooks.xml"
       listen_base_url: "" # or set HAZE_PUBLIC_BASE_URL in .env for Discord-visible links
       timeout: "15s"
+    asr:
+      enabled: true
+      provider: local_whisper
+      model: base-q5_1
+      model_path: "runtime/models/whisper/ggml-base-q5_1.bin"
+      model_sha256: "422f1ae452ade6f30a004d7e5c6a43195e4433bc370bf23fac9cc591f01a8898"
+      runtime_executable: "bin/whisper-server"
+      runtime_threads: 4
+      runtime_use_gpu: false
+      runtime_startup_timeout: "60s"
+      spool_dir: "runtime/ivr/asr"
+      workers: 4
+      queue_size: 32
+      timeout: "15s"
+      max_audio_bytes: 614400
     ivr:
       enabled: true
-      mode: sip-edge # sip-edge or provider-webhook
+      mode: hybrid # hybrid, sip-edge, or provider-webhook
       prompts_file: "managed/configs/ivr.xml"
       extensions:
         - extension: "haze"
@@ -217,6 +242,27 @@ services:
           supported_path: false
           expires: 120
           retry_seconds: 30
+      search:
+        enabled: true
+        voice_enabled: true
+        spool_dir: "runtime/ivr/asr"
+        multitap_window: "700ms"
+        idle_submit: "2.5s"
+        asr_timeout: "18s"
+        max_attempts: 2
+        vad_preroll_ms: 300
+        vad_trailing_ms: 900
+        min_voice_ms: 2000
+        max_voice_ms: 8000
+      twilio:
+        enabled: false
+        external_url: ""
+        account_sid_env: HAZE_TWILIO_ACCOUNT_SID
+        auth_token_env: HAZE_TWILIO_AUTH_TOKEN
+        signing_key_env: HAZE_IVR_SIGNING_KEY
+        session_ttl: "2m"
+        max_message_bytes: 65536
+        max_concurrent_streams: 256
       rtp:
         port_min: 30000
         port_max: 39999
@@ -264,6 +310,8 @@ services:
           max_age_minutes: 1440
         - path: runtime/ivr/cache
           max_age_minutes: 1440
+        - path: runtime/ivr/asr
+          max_age_minutes: 5
         - path: runtime/audio/alerts
           max_age_minutes: 10080
         - path: runtime/audio/easnet

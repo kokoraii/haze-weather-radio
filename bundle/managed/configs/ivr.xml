@@ -33,7 +33,29 @@
 
   <menu id="location_number" timeout="8s" retries="2">
     <line key="main">Enter your location number. Press star to search for a location.</line>
-    <line key="search_unavailable">Location search is not available yet.</line>
+    <line key="search_unavailable">Location search is temporarily unavailable. Enter your location number.</line>
+    <line key="search_unavailable" language="fr-CA">La recherche de lieux est temporairement indisponible. Entrez votre numéro de lieu.</line>
+  </menu>
+
+  <menu id="location_search" timeout="10s" retries="2">
+    <line key="main">Say a location, or type its name. Haze detects predictive T9 or repeated-key spelling automatically. Press 0 between words, pound to finish, or star to erase.</line>
+    <line key="main" language="fr-CA">Dites un lieu ou tapez son nom. Haze détecte automatiquement le mode T9 prédictif ou les touches répétées. Appuyez sur 0 entre les mots, sur carré pour terminer ou sur étoile pour effacer.</line>
+    <line key="voice_unavailable">Voice search is unavailable. Please use the keypad.</line>
+    <line key="voice_unavailable" language="fr-CA">La recherche vocale est indisponible. Utilisez le clavier.</line>
+    <line key="retry">Try again. Say a location, or type more of its name and region.</line>
+    <line key="retry" language="fr-CA">Réessayez. Dites un lieu ou tapez davantage de son nom et de sa région.</line>
+    <line key="no_match">No matching location was found. Try again.</line>
+    <line key="no_match" language="fr-CA">Aucun lieu correspondant n'a été trouvé. Réessayez.</line>
+    <line key="confirmation">Confirm the location with 1 for yes or 2 for no.</line>
+    <line key="confirmation" language="fr-CA">Confirmez le lieu avec 1 pour oui ou 2 pour non.</line>
+    <line key="ambiguity">Several locations match. Choose one of the three choices.</line>
+    <line key="ambiguity" language="fr-CA">Plusieurs lieux correspondent. Choisissez une des trois options.</line>
+    <line key="more_detail">Several locations match. Enter more of the name, or include a province or state.</line>
+    <line key="more_detail" language="fr-CA">Plusieurs lieux correspondent. Entrez davantage du nom ou ajoutez une province ou un État.</line>
+    <line key="unavailable">Location search is temporarily unavailable. Please use the keypad.</line>
+    <line key="unavailable" language="fr-CA">La recherche de lieux est temporairement indisponible. Utilisez le clavier.</line>
+    <line key="fallback_numeric">Returning to numeric location entry.</line>
+    <line key="fallback_numeric" language="fr-CA">Retour à la saisie du numéro de lieu.</line>
   </menu>
 
   <menu id="location_menu" timeout="8s" retries="2">

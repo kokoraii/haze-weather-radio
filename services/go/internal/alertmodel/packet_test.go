@@ -66,3 +66,31 @@ func TestWithLegacyFieldsMirrorsPacket(t *testing.T) {
 		t.Fatalf("alert_packet missing or wrong type: %#v", fields["alert_packet"])
 	}
 }
+
+func TestLocationReferencesKeepRawIdentifiersButRejectWeakAuthority(t *testing.T) {
+	packet := (Packet{
+		Areas: Areas{
+			Locations: []LocationReference{{
+				CanonicalID:     "urn:haze:location:weak",
+				Name:            "Possible Place",
+				MatchConfidence: "medium",
+				Actionable:      true,
+				RawIdentifiers: []LocationIdentifier{{
+					Authority: "nws",
+					Scheme:    "same",
+					Value:     "001001",
+				}},
+			}},
+		},
+	}).Normalize()
+	if len(packet.Areas.Locations) != 1 {
+		t.Fatalf("locations = %#v", packet.Areas.Locations)
+	}
+	location := packet.Areas.Locations[0]
+	if location.Actionable || location.CanonicalID != "" || location.CandidateID != "urn:haze:location:weak" {
+		t.Fatalf("weak candidate became authoritative: %#v", location)
+	}
+	if len(location.RawIdentifiers) != 1 || location.RawIdentifiers[0].Value != "001001" {
+		t.Fatalf("raw identifier was not preserved: %#v", location.RawIdentifiers)
+	}
+}

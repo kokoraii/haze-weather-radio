@@ -33,7 +33,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg g++ libasound2-dev libopus-dev pkg-config \
+          sudo apt-get install -y cmake git ffmpeg g++ libasound2-dev libopus-dev pkg-config \
             libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev \
             libswresample-dev libswscale-dev \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
@@ -53,6 +53,8 @@ jobs:
           path-type: inherit
           install: >-
             mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-cmake
+            mingw-w64-clang-x86_64-ninja
             mingw-w64-clang-x86_64-ffmpeg
             mingw-w64-clang-x86_64-gstreamer
             mingw-w64-clang-x86_64-gst-libav
@@ -180,6 +182,8 @@ jobs:
           update: true
           install: >-
             mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-cmake
+            mingw-w64-clang-x86_64-ninja
             mingw-w64-clang-x86_64-ffmpeg
             mingw-w64-clang-x86_64-gstreamer
             mingw-w64-clang-x86_64-gst-libav
@@ -262,7 +266,7 @@ jobs:
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg g++ libasound2-dev libopus-dev pkg-config \
+          sudo apt-get install -y cmake git ffmpeg g++ libasound2-dev libopus-dev pkg-config \
             libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev \
             libswresample-dev libswscale-dev \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
@@ -330,7 +334,7 @@ jobs:
             pkg update -f
             LLVM_PACKAGE="$(pkg search -q -x '^llvm[0-9]+-[0-9].*' | sort -V | tail -n 1)"
             test -n "${LLVM_PACKAGE}" || { echo "No versioned LLVM package is available" >&2; exit 1; }
-            pkg install -y bash ca_root_nss curl rust pkgconf ffmpeg opus gstreamer1 gstreamer1-plugins gstreamer1-plugins-x264 gstreamer1-libav "${LLVM_PACKAGE}"
+            pkg install -y bash ca_root_nss cmake curl git gmake rust pkgconf ffmpeg opus gstreamer1 gstreamer1-plugins gstreamer1-plugins-x264 gstreamer1-libav "${LLVM_PACKAGE}"
             pkg info -l "${LLVM_PACKAGE}" | grep -Eq '/libclang\.so([.]|$)' || { echo "${LLVM_PACKAGE} does not provide libclang" >&2; exit 1; }
             pkgconf --exists libavcodec opus gstreamer-1.0 gstreamer-app-1.0
             GO_VERSION="$(awk '/^go / { print $2; exit }' services/go/go.mod)"

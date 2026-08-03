@@ -57,12 +57,31 @@ type feedXML struct {
 		ObservationLocations struct {
 			Locations []locationXML `xml:"location"`
 		} `xml:"observationLocations"`
+		AviationReportLocations struct {
+			Locations []locationXML `xml:"location"`
+		} `xml:"aviationReportLocations"`
 		AirQualityLocations struct {
 			Locations []locationXML `xml:"location"`
 		} `xml:"airQualityLocations"`
 		ClimateLocations struct {
 			Locations []locationXML `xml:"location"`
 		} `xml:"climateLocations"`
+		MarineForecastLocations struct {
+			Locations  []locationXML `xml:"location"`
+			Subregions []locationXML `xml:"subregion"`
+		} `xml:"marineForecastLocations"`
+		MarineConditions struct {
+			Locations []locationXML `xml:"location"`
+		} `xml:"marineConditions"`
+		HydrometricLocations struct {
+			Locations []locationXML `xml:"location"`
+			Upstream  struct {
+				Locations []locationXML `xml:"location"`
+			} `xml:"upstream"`
+			Downstream struct {
+				Locations []locationXML `xml:"location"`
+			} `xml:"downstream"`
+		} `xml:"hydrometricLocations"`
 	} `xml:"locations"`
 	Transmitter struct {
 		Transmitters []transmitterXML `xml:"transmitter"`
@@ -70,21 +89,28 @@ type feedXML struct {
 }
 
 type coverageRegionXML struct {
-	ID             string                 `xml:"id,attr"`
-	Source         string                 `xml:"source,attr"`
-	Name           string                 `xml:"name,attr"`
-	DeriveForecast string                 `xml:"derive_forecast,attr"`
-	Subregions     []coverageSubregionXML `xml:"subregion"`
+	ID                  string                 `xml:"id,attr"`
+	Source              string                 `xml:"source,attr"`
+	Name                string                 `xml:"name,attr"`
+	DeriveForecast      string                 `xml:"derive_forecast,attr"`
+	CanonicalID         string                 `xml:"canonical_id,attr"`
+	ForecastCanonicalID string                 `xml:"forecast_canonical_id,attr"`
+	Subregions          []coverageSubregionXML `xml:"subregion"`
 }
 
 type coverageSubregionXML struct {
-	ID string `xml:"id,attr"`
+	ID          string `xml:"id,attr"`
+	CanonicalID string `xml:"canonical_id,attr"`
 }
 
 type locationXML struct {
 	ID           string `xml:"id,attr"`
 	Source       string `xml:"source,attr"`
 	NameOverride string `xml:"name_override,attr"`
+	NormalID     string `xml:"normal_id,attr"`
+	Latitude     string `xml:"latitude,attr"`
+	Longitude    string `xml:"longitude,attr"`
+	CanonicalID  string `xml:"canonical_id,attr"`
 }
 
 type transmitterXML struct {
@@ -487,6 +513,7 @@ func feedSummary(configPath string, feed feedXML, outputs outputXML, forecastNam
 		"timezone":            fallbackText(feed.Timezone, "Local"),
 		"languages":           feedLanguages(feed),
 		"location_count":      feedLocationCount(feed),
+		"canonical_locations": feedCanonicalLocationIDs(feed),
 		"clc_codes":           sortedKeys(clcCodes),
 		"same_locations":      sameLocations,
 		"same_all_locations":  allLocations,
@@ -937,11 +964,13 @@ func coverageRegionPayloads(feed feedXML, forecastNames map[string]string, clcNa
 			})
 		}
 		out = append(out, map[string]any{
-			"id":              id,
-			"name":            name,
-			"source":          strings.TrimSpace(region.Source),
-			"derive_forecast": strings.TrimSpace(region.DeriveForecast),
-			"subregions":      subregions,
+			"id":                    id,
+			"name":                  name,
+			"source":                strings.TrimSpace(region.Source),
+			"derive_forecast":       strings.TrimSpace(region.DeriveForecast),
+			"canonical_id":          strings.TrimSpace(region.CanonicalID),
+			"forecast_canonical_id": strings.TrimSpace(region.ForecastCanonicalID),
+			"subregions":            subregions,
 		})
 	}
 	return out
@@ -1111,8 +1140,43 @@ func feedLanguages(feed feedXML) []string {
 
 func feedLocationCount(feed feedXML) int {
 	return len(feed.Locations.ObservationLocations.Locations) +
+		len(feed.Locations.AviationReportLocations.Locations) +
 		len(feed.Locations.AirQualityLocations.Locations) +
-		len(feed.Locations.ClimateLocations.Locations)
+		len(feed.Locations.ClimateLocations.Locations) +
+		len(feed.Locations.MarineForecastLocations.Locations) +
+		len(feed.Locations.MarineForecastLocations.Subregions) +
+		len(feed.Locations.MarineConditions.Locations) +
+		len(feed.Locations.HydrometricLocations.Locations) +
+		len(feed.Locations.HydrometricLocations.Upstream.Locations) +
+		len(feed.Locations.HydrometricLocations.Downstream.Locations)
+}
+
+func feedCanonicalLocationIDs(feed feedXML) []string {
+	ids := []string{}
+	for _, region := range feed.Locations.Coverage.Regions {
+		ids = append(ids, region.CanonicalID, region.ForecastCanonicalID)
+		for _, subregion := range region.Subregions {
+			ids = append(ids, subregion.CanonicalID)
+		}
+	}
+	groups := [][]locationXML{
+		feed.Locations.ObservationLocations.Locations,
+		feed.Locations.AviationReportLocations.Locations,
+		feed.Locations.AirQualityLocations.Locations,
+		feed.Locations.ClimateLocations.Locations,
+		feed.Locations.MarineForecastLocations.Locations,
+		feed.Locations.MarineForecastLocations.Subregions,
+		feed.Locations.MarineConditions.Locations,
+		feed.Locations.HydrometricLocations.Locations,
+		feed.Locations.HydrometricLocations.Upstream.Locations,
+		feed.Locations.HydrometricLocations.Downstream.Locations,
+	}
+	for _, group := range groups {
+		for _, location := range group {
+			ids = append(ids, location.CanonicalID)
+		}
+	}
+	return uniqueStrings(ids)
 }
 
 func loadForecastRegionNames(path string) map[string]string {

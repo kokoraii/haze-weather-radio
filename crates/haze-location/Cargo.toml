@@ -1,0 +1,35 @@
+[package]
+name = "haze-location"
+description = "Offline canonical location resolver for Haze Weather Radio"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "haze-location"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+crossbeam-channel = "0.5"
+quick-xml = { version = "0.38", features = ["serialize"] }
+rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
+roxmltree = "0.20"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+sha2 = "0.10"
+strsim = "0.11"
+thiserror = "2.0"
+tokio = { version = "1.48", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+unicode-normalization = "0.1"
+uuid = { version = "1.18", features = ["serde", "v4", "v5"] }
+
+[dev-dependencies]
+tempfile = "3.23"

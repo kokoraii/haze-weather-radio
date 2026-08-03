@@ -1,0 +1,35 @@
+{
+  "api_version": 1,
+  "request_id": "contract-query-001",
+  "operation": "nearest",
+  "input": {
+    "kind": "point",
+    "latitude": 0.0,
+    "longitude": 0.0
+  },
+  "filters": {
+    "kinds": ["weather_station", "marine_buoy"],
+    "capabilities": ["observations"],
+    "country": "CA",
+    "roles": ["station"]
+  },
+  "options": {
+    "limit": 25,
+    "max_distance_km": 100.0,
+    "minimum_confidence": "high",
+    "include_inactive": false,
+    "dedupe_mode": "similar_name",
+    "expand_members": true,
+    "station_mode_preference": "auto",
+    "station_mode_requirement": "any",
+    "locale": "en-CA",
+    "geographic_bias": {
+      "latitude": 52.1579,
+      "longitude": -106.6702
+    },
+    "as_of": "2026-08-02T00:00:00Z",
+    "input_mode": "text",
+    "max_depth": 1,
+    "max_visited": 10000
+  }
+}

@@ -4,6 +4,7 @@ members = [
     "crates/haze-cap",
     "crates/haze-cgen",
     "crates/haze-easnet",
+    "crates/haze-location",
     "crates/haze-media",
     "crates/haze-playout",
 ]

@@ -7,7 +7,7 @@ import (
 )
 
 func (s *wsSession) auditOrigination(identity Identity, command string, event string, payload map[string]any, result map[string]any) error {
-	if s == nil || s.auth == nil || s.auth.hardened == nil || s.auth.hardened.audit == nil || !identity.Account.LoggingEnabled {
+	if s == nil || s.auth == nil || s.auth.accounts == nil || s.auth.accounts.audit == nil || !identity.Account.LoggingEnabled {
 		return nil
 	}
 	details := map[string]any{
@@ -31,7 +31,7 @@ func (s *wsSession) auditOrigination(identity Identity, command string, event st
 			details["error"] = value
 		}
 	}
-	if err := s.auth.hardened.audit.Append("alerts", AuditEvent{
+	if err := s.auth.accounts.audit.Append("alerts", AuditEvent{
 		Timestamp: time.Now().UTC(), Event: event,
 		ActorID: identity.Account.ID, ActorUsername: identity.Account.Username,
 		SessionID: identity.Session.ID, IP: identity.Session.IP, UserAgent: identity.Session.UserAgent,

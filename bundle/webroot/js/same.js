@@ -577,7 +577,7 @@ function safeStorageSet(key, value) {
     try {
         window.localStorage.setItem(key, value);
     } catch {
-        // Storage can be unavailable in hardened/private contexts.
+        // Storage can be unavailable in restricted or private contexts.
     }
 }
 

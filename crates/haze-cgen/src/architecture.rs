@@ -382,6 +382,7 @@ impl DeinterlaceParity {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DeinterlaceSpec {
+    pub(crate) enabled: bool,
     pub(crate) algorithm: DeinterlaceAlgorithm,
     pub(crate) backend: DeinterlaceBackend,
     pub(crate) cadence: DeinterlaceCadence,
@@ -391,6 +392,7 @@ pub(crate) struct DeinterlaceSpec {
 impl Default for DeinterlaceSpec {
     fn default() -> Self {
         Self {
+            enabled: true,
             algorithm: DeinterlaceAlgorithm::Yadif,
             backend: DeinterlaceBackend::Software,
             cadence: DeinterlaceCadence::Field,
@@ -401,6 +403,9 @@ impl Default for DeinterlaceSpec {
 
 impl DeinterlaceSpec {
     fn validate(self) -> Result<(), PipelineSpecError> {
+        if !self.enabled {
+            return Ok(());
+        }
         if self.backend != DeinterlaceBackend::Auto
             && self.backend != DeinterlaceBackend::Software
             && self.parity != DeinterlaceParity::Auto
@@ -1050,6 +1055,7 @@ pub(crate) struct VideoEncoderSpec {
     pub(crate) codec: VideoCodec,
     pub(crate) rate_control: RateControl,
     pub(crate) gop_frames: NonZeroU32,
+    pub(crate) scan: ScanMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1316,6 +1322,14 @@ mod tests {
             invalid_parity.validate(),
             Err(PipelineSpecError::InvalidDeinterlaceCombination)
         );
+        assert_eq!(
+            DeinterlaceSpec {
+                enabled: false,
+                ..invalid_parity
+            }
+            .validate(),
+            Ok(())
+        );
     }
 
     #[test]
@@ -1463,6 +1477,7 @@ mod tests {
                     bitrate_kbps: NonZeroU32::new(4_000).expect("non-zero"),
                 },
                 gop_frames: NonZeroU32::new(60).expect("non-zero"),
+                scan: ScanMode::Progressive,
             },
             audio: AudioEncoderSpec {
                 codec: AudioCodecPolicy::Encode(AudioCodec::Ac3),
@@ -1491,6 +1506,7 @@ mod tests {
                     bitrate_kbps: NonZeroU32::new(4_000).expect("non-zero"),
                 },
                 gop_frames: NonZeroU32::new(60).expect("non-zero"),
+                scan: ScanMode::Progressive,
             },
             audio: AudioEncoderSpec {
                 codec: AudioCodecPolicy::Encode(AudioCodec::Aac),
@@ -1521,6 +1537,7 @@ mod tests {
                     bitrate_kbps: NonZeroU32::new(4_000).expect("non-zero"),
                 },
                 gop_frames: NonZeroU32::new(60).expect("non-zero"),
+                scan: ScanMode::Progressive,
             },
             audio: AudioEncoderSpec {
                 codec: AudioCodecPolicy::Encode(AudioCodec::Ac3),
@@ -1594,6 +1611,7 @@ mod tests {
                     bitrate_kbps: NonZeroU32::new(4_000).expect("non-zero"),
                 },
                 gop_frames: NonZeroU32::new(60).expect("non-zero"),
+                scan: ScanMode::Progressive,
             },
             audio: AudioEncoderSpec {
                 codec: AudioCodecPolicy::MatchInput,

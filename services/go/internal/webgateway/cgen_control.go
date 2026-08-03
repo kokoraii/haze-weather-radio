@@ -67,6 +67,7 @@ type cgenEndpointXML struct {
 	AudioBitrateKbps     string `xml:"audio_bitrate_kbps,attr,omitempty"`
 	HardwareDecoder      string `xml:"hardware_decoder,attr,omitempty"`
 	HardwareDecoderOn    string `xml:"hardware_decoder_enabled,attr,omitempty"`
+	DeinterlaceEnabled   string `xml:"deinterlace_enabled,attr,omitempty"`
 	DeinterlaceAlgorithm string `xml:"deinterlace_algorithm,attr,omitempty"`
 	DeinterlaceBackend   string `xml:"deinterlace_backend,attr,omitempty"`
 	DeinterlaceCadence   string `xml:"deinterlace_cadence,attr,omitempty"`
@@ -325,6 +326,8 @@ type cgenOutputXML struct {
 	VideoBitrateKbps    string `xml:"video_bitrate_kbps,attr,omitempty"`
 	VideoMaxBitrateKbps string `xml:"video_max_bitrate_kbps,attr,omitempty"`
 	GOPFrames           string `xml:"gop_frames,attr,omitempty"`
+	Interlaced          string `xml:"interlaced,attr,omitempty"`
+	FieldOrder          string `xml:"field_order,attr,omitempty"`
 	AudioCodec          string `xml:"audio_codec,attr,omitempty"`
 	AudioBitrateKbps    string `xml:"audio_bitrate_kbps,attr,omitempty"`
 	SampleRate          string `xml:"sample_rate,attr,omitempty"`
@@ -534,6 +537,18 @@ func saveCgenPayload(configPath string, payload map[string]any) (map[string]any,
 	}
 	config := cgenXML{SchemaVersion: "2", Enabled: boolText(boolFromAny(payload["enabled"], true))}
 	encoders := cgenEncodersXML{SchemaVersion: "2", UpdatedAt: time.Now().UTC().Format(time.RFC3339)}
+	existingFeeds := map[string]cgenFeedXML{}
+	if _, statErr := os.Stat(path); statErr == nil {
+		existing, readErr := readCgenXML(path)
+		if readErr != nil {
+			return nil, readErr
+		}
+		for _, feed := range existing.Feeds {
+			existingFeeds[strings.ToLower(feed.ID)] = feed
+		}
+	} else if !os.IsNotExist(statErr) {
+		return nil, fmt.Errorf("inspect cgen config: %w", statErr)
+	}
 	for _, raw := range rawFeeds {
 		feed, err := cgenFeedFromMap(raw)
 		if err != nil {
@@ -541,6 +556,11 @@ func saveCgenPayload(configPath string, payload map[string]any) (map[string]any,
 		}
 		if normalizeCgenAudioTopology(feed.Audio.Topology) == "preserve_native_tracks" && !cgenPreserveNativeTracksAvailable {
 			return nil, fmt.Errorf("cgen feed %q preserve-native audio is unavailable in the current media backend; select force_layout", feed.ID)
+		}
+		source := raw
+		originalID := fallbackText(stringFromAny(source["original_id"]), feed.ID)
+		if previous, exists := existingFeeds[strings.ToLower(originalID)]; exists {
+			preserveCgenUnownedSections(&feed, previous, source)
 		}
 		config.Feeds = append(config.Feeds, feed)
 		encoderFeed, err := cgenEncoderFeedFromMap(raw, feed)
@@ -561,6 +581,61 @@ func saveCgenPayload(configPath string, payload map[string]any) (map[string]any,
 		return nil, err
 	}
 	return loadCgenPayloadUnlocked(configPath)
+}
+
+func preserveCgenUnownedSections(feed *cgenFeedXML, previous cgenFeedXML, source map[string]any) {
+	if len(feed.Outputs.Outputs) == 0 && !hasAnyCgenPayloadKey(source,
+		"program_output_url", "program_output_format", "vcodec", "acodec",
+		"video_bitrate_kbps", "audio_bitrate_kbps", "service_id") {
+		feed.ProgramOutput = previous.ProgramOutput
+	}
+	if !hasAnyCgenPayloadKey(source, "width", "height", "fps", "interlaced", "field_order", "standard") {
+		feed.Video = previous.Video
+	}
+	if !hasAnyCgenPayloadKey(source,
+		"hd_enabled", "hd_bitrate_kbps", "hd_program", "hd_video_pid", "hd_pmt_pid",
+		"p720_enabled", "p720_bitrate_kbps", "p720_program", "p720_video_pid", "p720_pmt_pid",
+		"sd_enabled", "sd_bitrate_kbps", "sd_program", "sd_video_pid", "sd_pmt_pid",
+		"stereo_enabled", "stereo_bitrate_kbps", "stereo_program", "stereo_audio_pid", "stereo_pmt_pid",
+		"surround_enabled", "surround_bitrate_kbps", "surround_program", "surround_audio_pid", "surround_pmt_pid") {
+		feed.Ladder = previous.Ladder
+	}
+	if !hasAnyCgenPayloadKey(source,
+		"banner_mode", "ticker_height", "scroll_speed", "scroll_repeat_mode",
+		"after_eom_repeats", "fixed_repeats", "banner_background_enabled") {
+		feed.Banner = previous.Banner
+	}
+	if !hasAnyCgenPayloadKey(source, "font", "font_weight", "font_size", "banner_height") {
+		feed.Graphics = previous.Graphics
+	}
+	if !hasAnyCgenPayloadKey(source,
+		"clock_enabled", "clock_format", "clock_x", "clock_y", "clock_font_size", "clock_color") {
+		feed.Clock = previous.Clock
+	}
+	if !hasAnyCgenPayloadKey(source, "text_enabled", "text", "text_font_size", "text_color") {
+		feed.Text = previous.Text
+	}
+	if !hasAnyCgenPayloadKey(source, "mode", "smpte_bars", "sunny_cat") {
+		feed.State = previous.State
+	}
+	if !hasAnyCgenPayloadKey(source,
+		"standby_mode", "standby_text", "standby_font_size", "standby_y_percent") {
+		feed.Standby = previous.Standby
+	}
+	if !hasAnyCgenPayloadKey(source,
+		"sync_hard_reset_ms", "sync_max_audio_frames_per_video", "sync_source_buffer_ms",
+		"sync_reconnect_initial_ms", "sync_reconnect_max_ms", "sync_status_interval_ms") {
+		feed.Sync = previous.Sync
+	}
+}
+
+func hasAnyCgenPayloadKey(source map[string]any, keys ...string) bool {
+	for _, key := range keys {
+		if _, exists := source[key]; exists {
+			return true
+		}
+	}
+	return false
 }
 
 func cgenActionPayload(configPath string, payload map[string]any) (map[string]any, error) {
@@ -975,25 +1050,30 @@ func normalizeCgen(config cgenXML) (cgenXML, error) {
 		if !validCgenInputTypeToken(rawInput.Type) {
 			return cgenXML{}, fmt.Errorf("cgen feed %q input type is unsupported", feed.ID)
 		}
-		if !validCgenDeinterlaceAlgorithm(rawInput.DeinterlaceAlgorithm) {
+		if !validCgenBoolToken(rawInput.DeinterlaceEnabled) {
+			return cgenXML{}, fmt.Errorf("cgen feed %q deinterlace enabled value is invalid", feed.ID)
+		}
+		deinterlaceEnabled := xmlBool(rawInput.DeinterlaceEnabled, true)
+		if deinterlaceEnabled && !validCgenDeinterlaceAlgorithm(rawInput.DeinterlaceAlgorithm) {
 			return cgenXML{}, fmt.Errorf("cgen feed %q deinterlace algorithm is unsupported", feed.ID)
 		}
-		if !validCgenDeinterlaceBackend(rawInput.DeinterlaceBackend) {
+		if deinterlaceEnabled && !validCgenDeinterlaceBackend(rawInput.DeinterlaceBackend) {
 			return cgenXML{}, fmt.Errorf("cgen feed %q deinterlace backend is unsupported", feed.ID)
 		}
-		if !validCgenDeinterlaceCadence(rawInput.DeinterlaceCadence) {
+		if deinterlaceEnabled && !validCgenDeinterlaceCadence(rawInput.DeinterlaceCadence) {
 			return cgenXML{}, fmt.Errorf("cgen feed %q deinterlace cadence is unsupported", feed.ID)
 		}
-		if !validCgenDeinterlaceParity(rawInput.DeinterlaceParity) {
+		if deinterlaceEnabled && !validCgenDeinterlaceParity(rawInput.DeinterlaceParity) {
 			return cgenXML{}, fmt.Errorf("cgen feed %q deinterlace parity is unsupported", feed.ID)
 		}
 		feed.ProgramInput = cleanCgenEndpoint(feed.ProgramInput)
 		feed.ProgramOutput = cleanCgenEndpoint(feed.ProgramOutput)
+		feed.ProgramInput.DeinterlaceEnabled = boolText(deinterlaceEnabled)
 		feed.ProgramInput.DeinterlaceAlgorithm = fallbackText(feed.ProgramInput.DeinterlaceAlgorithm, "yadif")
 		feed.ProgramInput.DeinterlaceBackend = fallbackText(feed.ProgramInput.DeinterlaceBackend, "software")
 		feed.ProgramInput.DeinterlaceCadence = fallbackText(feed.ProgramInput.DeinterlaceCadence, "field")
 		feed.ProgramInput.DeinterlaceParity = fallbackText(feed.ProgramInput.DeinterlaceParity, "auto")
-		if !validCgenDeinterlaceCombination(feed.ProgramInput) {
+		if deinterlaceEnabled && !validCgenDeinterlaceCombination(feed.ProgramInput) {
 			return cgenXML{}, fmt.Errorf(
 				"cgen feed %q deinterlace algorithm, backend, and parity combination is unsupported",
 				feed.ID,
@@ -1316,10 +1396,12 @@ func validPassPolicyToken(value string) bool {
 
 func normalizeCgenCompositorEngine(value string) string {
 	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "legacy":
+		return "legacy"
 	case "scene_v2", "scene", "wgpu":
 		return "scene_v2"
 	default:
-		return "legacy"
+		return "scene_v2"
 	}
 }
 
@@ -1509,6 +1591,11 @@ func normalizeCgenOutputs(feed *cgenFeedXML) error {
 		if output.GOPFrames == "" {
 			return fmt.Errorf("output %q GOP interval is invalid", output.ID)
 		}
+		if !validCgenBoolToken(output.Interlaced) {
+			return fmt.Errorf("output %q interlaced value is invalid", output.ID)
+		}
+		output.Interlaced = boolText(xmlBool(output.Interlaced, false))
+		output.FieldOrder = normalizeCgenFieldOrder(output.FieldOrder)
 		output.AudioCodec = normalizeCgenAudioCodec(output.AudioCodec)
 		if output.AudioCodec == "" {
 			return fmt.Errorf("output %q audio codec is unsupported", output.ID)
@@ -2057,6 +2144,8 @@ func cgenOutputsFromAny(raw any) ([]cgenOutputXML, error) {
 			VideoBitrateKbps:    fallbackText(stringFromAny(source["video_bitrate_kbps"]), stringFromAny(video["bitrate_kbps"])),
 			VideoMaxBitrateKbps: fallbackText(stringFromAny(source["video_max_bitrate_kbps"]), stringFromAny(video["max_bitrate_kbps"])),
 			GOPFrames:           fallbackText(stringFromAny(source["gop_frames"]), stringFromAny(video["gop_frames"])),
+			Interlaced:          boolText(firstNestedBool(source, video, "interlaced", "interlaced", false)),
+			FieldOrder:          firstNestedString(source, video, "field_order", "field_order"),
 			AudioCodec:          fallbackText(stringFromAny(source["audio_codec"]), stringFromAny(audio["codec"])),
 			AudioBitrateKbps:    fallbackText(stringFromAny(source["audio_bitrate_kbps"]), stringFromAny(audio["bitrate_kbps"])),
 			SampleRate:          fallbackText(stringFromAny(source["sample_rate"]), stringFromAny(audio["sample_rate"])),
@@ -2138,6 +2227,7 @@ func cgenFeedFromMap(raw any) (cgenFeedXML, error) {
 			HardwareDecoderOn: boolText(
 				firstNestedBool(source, input, "hardware_decoder_enabled", "hardware_decoder_enabled", false),
 			),
+			DeinterlaceEnabled:   firstNestedString(source, input, "deinterlace_enabled", "deinterlace_enabled"),
 			DeinterlaceAlgorithm: firstNestedString(source, input, "deinterlace_algorithm", "deinterlace_algorithm"),
 			DeinterlaceBackend:   firstNestedString(source, input, "deinterlace_backend", "deinterlace_backend"),
 			DeinterlaceCadence:   firstNestedString(source, input, "deinterlace_cadence", "deinterlace_cadence"),
@@ -2152,9 +2242,9 @@ func cgenFeedFromMap(raw any) (cgenFeedXML, error) {
 			Background:           firstNestedString(source, input, "dummy_background", "background"),
 		},
 		PriorityInput: cgenPriorityInputXML{
-			FeedID:      stringFromAny(source["priority_feed_id"]),
-			AudioSource: stringFromAny(source["audio_source"]),
-			Format:      stringFromAny(source["priority_input_format"]),
+			FeedID:      firstNestedString(source, alert, "priority_feed_id", "feed_id"),
+			AudioSource: firstNestedString(source, alert, "audio_source", "audio_source"),
+			Format:      firstNestedString(source, alert, "priority_input_format", "format"),
 		},
 		ProgramOutput: cgenEndpointXML{
 			URL:               stringFromAny(source["program_output_url"]),
@@ -2177,9 +2267,9 @@ func cgenFeedFromMap(raw any) (cgenFeedXML, error) {
 			Standard:   stringFromAny(source["standard"]),
 		},
 		Audio: cgenAudioXML{
-			Idle:               stringFromAny(source["audio_idle"]),
-			AlertMode:          stringFromAny(source["audio_alert_mode"]),
-			MuteStandbyRoutine: boolText(boolFromAny(source["mute_standby_routine"], true)),
+			Idle:               firstNestedString(source, audio, "audio_idle", "idle_source"),
+			AlertMode:          firstNestedString(source, audio, "audio_alert_mode", "alert_mode"),
+			MuteStandbyRoutine: boolText(firstNestedBool(source, audio, "mute_standby_routine", "mute_standby_routine", true)),
 			Topology:           firstNestedString(source, audio, "audio_topology", "topology"),
 			ForceLayout:        firstNestedString(source, audio, "audio_force_layout", "force_layout"),
 			IdleProgramGainDB:  firstNestedString(source, audio, "idle_program_gain_db", "idle_program_gain_db"),
@@ -2312,7 +2402,7 @@ func cgenFeedFromMap(raw any) (cgenFeedXML, error) {
 			StatusIntervalMS:       stringFromAny(source["sync_status_interval_ms"]),
 		},
 		Alert: cgenAlertXML{
-			FeedID: fallbackText(firstNestedString(source, alert, "alert_feed_id", "feed_id"), stringFromAny(source["priority_feed_id"])),
+			FeedID: firstNestedString(source, alert, "alert_feed_id", "feed_id"),
 		},
 		Ancillary: cgenAncillaryXML{
 			Captions: firstNestedString(source, ancillary, "ancillary_captions", "captions"),
@@ -2464,6 +2554,7 @@ func cgenPayload(configPath string, path string, config cgenXML, encoderPath str
 			"dummy_background":         feed.ProgramInput.Background,
 			"hardware_decoder_enabled": xmlBool(feed.ProgramInput.HardwareDecoderOn, false),
 			"hardware_decoder":         feed.ProgramInput.HardwareDecoder,
+			"deinterlace_enabled":      xmlBool(feed.ProgramInput.DeinterlaceEnabled, true),
 			"deinterlace_algorithm":    feed.ProgramInput.DeinterlaceAlgorithm,
 			"deinterlace_backend":      feed.ProgramInput.DeinterlaceBackend,
 			"deinterlace_cadence":      feed.ProgramInput.DeinterlaceCadence,
@@ -2528,13 +2619,20 @@ func cgenPayload(configPath string, path string, config cgenXML, encoderPath str
 			"alert_scene_id":           feed.Compositor.AlertSceneID,
 			"compositor_engine":        feed.Compositor.Engine,
 			"program_input":            cgenProgramInputPayload(feed.ProgramInput),
-			"alert":                    map[string]any{"feed_id": feed.Alert.FeedID},
+			"alert": map[string]any{
+				"feed_id":      feed.Alert.FeedID,
+				"audio_source": feed.PriorityInput.AudioSource,
+				"format":       feed.PriorityInput.Format,
+			},
 			"ancillary": map[string]any{
 				"captions": feed.Ancillary.Captions,
 				"scte35":   feed.Ancillary.SCTE35,
 				"scte104":  feed.Ancillary.SCTE104,
 			},
 			"audio_routing": map[string]any{
+				"idle_source":           feed.Audio.Idle,
+				"alert_mode":            feed.Audio.AlertMode,
+				"mute_standby_routine":  xmlBool(feed.Audio.MuteStandbyRoutine, true),
 				"topology":              feed.Audio.Topology,
 				"force_layout":          feed.Audio.ForceLayout,
 				"idle_program_gain_db":  feed.Audio.IdleProgramGainDB,
@@ -2627,6 +2725,7 @@ func cgenProgramInputPayload(input cgenEndpointXML) map[string]any {
 		"format":                   input.Format,
 		"hardware_decoder_enabled": xmlBool(input.HardwareDecoderOn, false),
 		"hardware_decoder":         input.HardwareDecoder,
+		"deinterlace_enabled":      xmlBool(input.DeinterlaceEnabled, true),
 		"deinterlace_algorithm":    input.DeinterlaceAlgorithm,
 		"deinterlace_backend":      input.DeinterlaceBackend,
 		"deinterlace_cadence":      input.DeinterlaceCadence,
@@ -2693,6 +2792,8 @@ func cgenOutputsPayload(outputs []cgenOutputXML, encoders cgenEncodersXML) []map
 			"video_bitrate_kbps":     output.VideoBitrateKbps,
 			"video_max_bitrate_kbps": output.VideoMaxBitrateKbps,
 			"gop_frames":             output.GOPFrames,
+			"interlaced":             xmlBool(output.Interlaced, false),
+			"field_order":            output.FieldOrder,
 			"audio_codec":            output.AudioCodec,
 			"audio_bitrate_kbps":     output.AudioBitrateKbps,
 			"sample_rate":            output.SampleRate,
@@ -2889,6 +2990,15 @@ func normalizeCgenDeinterlaceAlgorithm(value string) string {
 
 func validCgenDeinterlaceAlgorithm(value string) bool {
 	return strings.TrimSpace(value) == "" || normalizeCgenDeinterlaceAlgorithm(value) != ""
+}
+
+func validCgenBoolToken(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "1", "true", "yes", "on", "enabled", "0", "false", "no", "off", "disabled":
+		return true
+	default:
+		return false
+	}
 }
 
 func normalizeCgenDeinterlaceBackend(value string) string {

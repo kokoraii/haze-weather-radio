@@ -16,7 +16,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/pion/rtp"
 )
 
 const (
@@ -88,6 +91,7 @@ type sipMediaOffer struct {
 type sipCall struct {
 	service       *Service
 	line          extensionConfig
+	directFeedID  string
 	ctx           context.Context
 	cancel        context.CancelFunc
 	callID        string
@@ -102,6 +106,8 @@ type sipCall struct {
 	audioPayload  int
 	dtmfPayload   int
 	digits        chan string
+	audioFrames   chan pcmFrame
+	captureActive atomic.Bool
 	done          chan struct{}
 	sendMu        sync.Mutex
 	byeOnce       sync.Once
@@ -110,6 +116,12 @@ type sipCall struct {
 	ssrc          uint32
 	sentRTPLog    bool
 	recvRTPLog    bool
+}
+
+type sipDirectFeedTarget struct {
+	ID      string
+	Matched bool
+	Enabled bool
 }
 
 func (s *Service) runSIP(ctx context.Context) error {
@@ -276,7 +288,17 @@ func (s *Service) runSIPListener(ctx context.Context, binding sipListenBinding, 
 
 func (s *Service) acceptSIPInvite(ctx context.Context, request sipRequest, remote *net.UDPAddr, conn *net.UDPConn, local net.Addr) (*sipCall, string) {
 	line, matched := s.sipRequestLine(request)
-	if !line.enabled() {
+	directFeed := s.sipRequestDirectFeed(request)
+	if _, extensionMatched := s.cfg.IVR.extensionLine(sipURIUser(request.URI)); extensionMatched {
+		directFeed = sipDirectFeedTarget{}
+	}
+	if directFeed.Matched && !directFeed.Enabled {
+		return nil, sipReply("480 Temporarily Unavailable", request.Headers, "Warning: 399 haze \"live feed is disabled\"\r\n")
+	}
+	if directFeed.Matched && !s.broadcastAvailable(directFeed.ID) {
+		return nil, sipReply("480 Temporarily Unavailable", request.Headers, "Warning: 399 haze \"live feed is unavailable\"\r\n")
+	}
+	if !directFeed.Matched && !line.enabled() {
 		status := "404 Not Found"
 		if matched {
 			status = "480 Temporarily Unavailable"
@@ -295,14 +317,18 @@ func (s *Service) acceptSIPInvite(ctx context.Context, request sipRequest, remot
 		s.sipDebugf("reject INVITE from=%s reason=no RTP ports: %v", remote, err)
 		return nil, sipReply("503 Service Unavailable", request.Headers, "Warning: 399 haze \"no RTP ports available\"\r\n")
 	}
-	callCtx, cancel := context.WithCancel(ctx)
-	if s.cfg.IVR.MaxCallSeconds > 0 {
+	var callCtx context.Context
+	var cancel context.CancelFunc
+	if directFeed.Matched || s.cfg.IVR.MaxCallSeconds <= 0 {
+		callCtx, cancel = context.WithCancel(ctx)
+	} else {
 		callCtx, cancel = context.WithTimeout(ctx, time.Duration(s.cfg.IVR.MaxCallSeconds)*time.Second)
 	}
 	audioCodec, audioPayload := s.selectSIPAudioCodec(offer)
 	call := &sipCall{
 		service:       s,
 		line:          line,
+		directFeedID:  directFeed.ID,
 		ctx:           callCtx,
 		cancel:        cancel,
 		callID:        sipHeader(request.Headers, "call-id"),
@@ -317,6 +343,7 @@ func (s *Service) acceptSIPInvite(ctx context.Context, request sipRequest, remot
 		audioPayload:  audioPayload,
 		dtmfPayload:   offer.DTMFPayload,
 		digits:        make(chan string, 16),
+		audioFrames:   make(chan pcmFrame, 64),
 		done:          make(chan struct{}),
 		seq:           uint16(time.Now().UnixNano()),
 		timestamp:     uint32(time.Now().UnixNano()),
@@ -579,16 +606,22 @@ func (s *Service) sipLocalAdvertiseHost(remote *net.UDPAddr, local net.Addr) str
 			return ip.String()
 		}
 	}
-	if host := firstConnectedInterfaceIPv4(); host != "" {
-		return host
-	}
 	if remote != nil {
-		if conn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: remote.IP, Port: 9}); err == nil {
+		port := remote.Port
+		if port <= 0 {
+			port = 9
+		}
+		if conn, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: remote.IP, Port: port}); err == nil {
 			defer conn.Close()
 			if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok && addr.IP != nil && !addr.IP.IsUnspecified() {
-				return addr.IP.String()
+				if ip := addr.IP.To4(); ip != nil {
+					return ip.String()
+				}
 			}
 		}
+	}
+	if host := firstConnectedInterfaceIPv4(); host != "" {
+		return host
 	}
 	if udp, ok := local.(*net.UDPAddr); ok && udp.IP != nil && !udp.IP.IsUnspecified() {
 		return udp.IP.String()
@@ -677,6 +710,11 @@ func isPrivateIPv4(ip net.IP) bool {
 func (c *sipCall) run() {
 	defer c.close()
 	go c.readRTP()
+	if c.directFeedID != "" {
+		for c.ctx.Err() == nil && c.playLiveBroadcast(c.directFeedID) {
+		}
+		return
+	}
 	c.menuLoop()
 }
 
@@ -884,7 +922,9 @@ func (c *sipCall) collectLocationNumber(language string, province string) (Resol
 			return ResolvedLocation{}, false
 		}
 		if search {
-			c.playPrompt("location_number", "search_unavailable", nil)
+			if location, found := c.searchLocation(language, province); found {
+				return location, true
+			}
 			continue
 		}
 		code, codeOK := c.service.resolver.helloWeatherCodeForProvinceNumber(province, number)
@@ -1259,6 +1299,8 @@ func (codec sipAudioCodec) timestampStep(_ []byte) uint32 {
 func (c *sipCall) readRTP() {
 	buffer := make([]byte, 1500)
 	var lastEvent string
+	var decoder *sipInboundDecoder
+	wasCapturing := false
 	for {
 		n, remote, err := c.rtpConn.ReadFromUDP(buffer)
 		if err != nil {
@@ -1270,11 +1312,65 @@ func (c *sipCall) readRTP() {
 			c.service.sipDebugf("received first RTP call=%s local=%s remote=%s bytes=%d", c.callID, c.rtpConn.LocalAddr(), remote, n)
 		}
 		digit, key := rtpDTMFDigit(buffer[:n], c.dtmfPayload)
-		if digit == "" || key == lastEvent {
+		if digit != "" && key != lastEvent {
+			lastEvent = key
+			c.pushDigit(digit)
+		}
+		capturing := c.captureActive.Load()
+		if !capturing {
+			wasCapturing = false
 			continue
 		}
-		lastEvent = key
-		c.pushDigit(digit)
+		if !wasCapturing || decoder == nil {
+			decoder = newSIPInboundDecoder(c.audioCodec, c.audioPayload, c.dtmfPayload)
+			wasCapturing = true
+		}
+		frames, _, _, ok := decoder.Decode(buffer[:n], time.Now())
+		if !ok {
+			continue
+		}
+		for _, frame := range frames {
+			c.pushPCMFrame(frame)
+		}
+	}
+}
+
+func (c *sipCall) beginVoiceCapture() <-chan pcmFrame {
+	if c == nil {
+		return nil
+	}
+	for {
+		select {
+		case <-c.audioFrames:
+		default:
+			c.captureActive.Store(true)
+			return c.audioFrames
+		}
+	}
+}
+
+func (c *sipCall) endVoiceCapture() {
+	if c != nil {
+		c.captureActive.Store(false)
+	}
+}
+
+func (c *sipCall) pushPCMFrame(frame pcmFrame) {
+	if c == nil || !c.captureActive.Load() || len(frame.Samples) == 0 {
+		return
+	}
+	select {
+	case c.audioFrames <- frame:
+		return
+	default:
+	}
+	select {
+	case <-c.audioFrames:
+	default:
+	}
+	select {
+	case c.audioFrames <- frame:
+	default:
 	}
 }
 
@@ -1789,6 +1885,42 @@ func (s *Service) sipRequestLine(request sipRequest) (extensionConfig, bool) {
 		return canadaLine, true
 	}
 	return s.cfg.IVR.extensionLine("")
+}
+
+func (s *Service) sipRequestDirectFeed(request sipRequest) sipDirectFeedTarget {
+	candidate := sipURIUser(request.URI)
+	if !validSIPDirectFeedID(candidate) {
+		return sipDirectFeedTarget{}
+	}
+	for _, feed := range s.cfg.Feeds {
+		feedID := strings.TrimSpace(feed.ID)
+		if !strings.EqualFold(feedID, candidate) {
+			continue
+		}
+		return sipDirectFeedTarget{
+			ID:      feedID,
+			Matched: true,
+			Enabled: xmlBool(feed.EnabledRaw, true),
+		}
+	}
+	return sipDirectFeedTarget{}
+}
+
+func validSIPDirectFeedID(value string) bool {
+	if value == "" || len(value) > 128 {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		if character >= 'a' && character <= 'z' ||
+			character >= 'A' && character <= 'Z' ||
+			character >= '0' && character <= '9' ||
+			character == '-' || character == '_' || character == '.' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func sipURIUser(value string) string {
@@ -2326,24 +2458,16 @@ func sipInfoDigit(body string) string {
 }
 
 func rtpDTMFDigit(packet []byte, payloadType int) (string, string) {
-	if len(packet) < 16 {
+	var decoded rtp.Packet
+	if decoded.Unmarshal(packet) != nil || int(decoded.PayloadType) != payloadType || len(decoded.Payload) < 4 {
 		return "", ""
 	}
-	if int(packet[1]&0x7F) != payloadType {
-		return "", ""
-	}
-	cc := int(packet[0] & 0x0F)
-	offset := 12 + cc*4
-	if len(packet) < offset+4 {
-		return "", ""
-	}
-	event := int(packet[offset])
-	timestamp := binary.BigEndian.Uint32(packet[4:8])
+	event := int(decoded.Payload[0])
 	digit := normalizeDTMFDigit(strconv.Itoa(event))
 	if digit == "" {
 		return "", ""
 	}
-	return digit, fmt.Sprintf("%d:%d", event, timestamp)
+	return digit, fmt.Sprintf("%d:%d", event, decoded.Timestamp)
 }
 
 func normalizeDTMFDigit(value string) string {

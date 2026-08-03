@@ -2445,7 +2445,7 @@ fn ticker_x_absolute(
     text: &str,
     started_at: Instant,
 ) -> (f64, bool) {
-    if snapshot.visual_mode == "fullscreen_alert" || snapshot.visual_mode == "overlay" {
+    if fixed_text_overlay_mode(&snapshot.visual_mode) {
         return (0.5, false);
     }
     let frame_width = f64::from(feed.video.width.max(1));
@@ -2463,6 +2463,12 @@ fn ticker_x_absolute(
         return (-1.0, true);
     }
     (x_px / frame_width, done)
+}
+
+fn fixed_text_overlay_mode(mode: &str) -> bool {
+    mode.eq_ignore_ascii_case("fullscreen_alert")
+        || mode.eq_ignore_ascii_case("overlay")
+        || mode.eq_ignore_ascii_case("banner")
 }
 
 fn ticker_exit_width_px(text_width_px: f64, frame_width_px: f64) -> f64 {
@@ -2493,7 +2499,7 @@ fn ticker_overlay_window(
     if done {
         return (String::new(), -1.0, true);
     }
-    if snapshot.visual_mode == "fullscreen_alert" || snapshot.visual_mode == "overlay" {
+    if fixed_text_overlay_mode(&snapshot.visual_mode) {
         return (text.to_string(), x_absolute, false);
     }
 
@@ -2961,20 +2967,24 @@ fn apply_effective_source_caps(
     feed.video.width = caps.width();
     feed.video.height = caps.height();
     let source_is_interlaced = caps.scan_mode() == SourceScanMode::Interlaced;
-    let frame_rate_numerator =
-        if source_is_interlaced && deinterlace.cadence == DeinterlaceCadence::Field {
-            caps.frame_rate()
-                .numerator()
-                .checked_mul(2)
-                .context("field-rate deinterlacing frame rate exceeds the supported range")?
-        } else {
-            caps.frame_rate().numerator()
-        };
+    let frame_rate_numerator = if deinterlace.enabled
+        && source_is_interlaced
+        && deinterlace.cadence == DeinterlaceCadence::Field
+    {
+        caps.frame_rate()
+            .numerator()
+            .checked_mul(2)
+            .context("field-rate deinterlacing frame rate exceeds the supported range")?
+    } else {
+        caps.frame_rate().numerator()
+    };
     feed.video.fps = format!(
         "{}/{}",
         frame_rate_numerator,
         caps.frame_rate().denominator()
     );
+    // With filtering disabled, decoded fields remain woven in each base-rate frame. Treat the
+    // compositor surface as progressive so downstream workers do not interlace it a second time.
     feed.video.interlaced = false;
     feed.video.field_order = match caps.field_order() {
         SourceFieldOrder::BottomFieldFirst => "bff",
@@ -4117,6 +4127,16 @@ struct GstDeinterlacePlan {
 
 impl GstDeinterlacePlan {
     fn from_spec(spec: DeinterlaceSpec) -> Result<Self> {
+        if !spec.enabled {
+            return Ok(Self {
+                requested: spec,
+                effective_backend: DeinterlaceBackend::Software,
+                implementation: "gstreamer_deinterlace_weave",
+                fragment: "deinterlace method=weave mode=auto-strict fields=auto locking=passive"
+                    .to_string(),
+                required_elements: vec!["deinterlace".to_string()],
+            });
+        }
         let backend = match (spec.algorithm, spec.backend) {
             (DeinterlaceAlgorithm::Yadif, DeinterlaceBackend::Auto) => DeinterlaceBackend::Software,
             (DeinterlaceAlgorithm::MotionAdaptive, DeinterlaceBackend::Auto) => {
@@ -4284,13 +4304,16 @@ impl GstDeinterlacePlan {
 
     fn status_value(&self) -> Value {
         json!({
+            "enabled": self.requested.enabled,
             "algorithm": self.requested.algorithm.as_str(),
             "requested_backend": self.requested.backend.as_str(),
             "effective_backend": self.effective_backend.as_str(),
             "cadence": self.requested.cadence.as_str(),
             "parity": self.requested.parity.as_str(),
             "implementation": self.implementation,
-            "field_rate_output": self.requested.cadence == DeinterlaceCadence::Field,
+            "bypass_mode": (!self.requested.enabled).then_some("woven_progressive"),
+            "field_rate_output": self.requested.enabled
+                && self.requested.cadence == DeinterlaceCadence::Field,
         })
     }
 }
@@ -4416,10 +4439,10 @@ impl GstPipelinePlan {
         let (video_branches, audio_branches, output_tail) = if sink.mux_kind == MuxKind::Fanout {
             (
                 format!(
-                    "video_tee. ! {video_live_queue} ! videoconvert ! videoscale method=lanczos add-borders=true ! videorate ! {standby_caps},format=BGRx ! identity name=cgen_overlay_master silent=true ! appsink name=master_video_sink emit-signals=false sync=false max-buffers=1 drop=true"
+                    "video_tee. ! {video_live_queue} ! videoconvert ! videoscale method=lanczos add-borders=true ! videorate ! {standby_caps},format=BGRx ! identity name=cgen_overlay_master silent=true ! appsink name=master_video_sink emit-signals=false sync=true max-buffers=1 drop=true"
                 ),
                 format!(
-                    "audio_tee. ! {audio_live_queue} ! audioconvert ! audioresample ! {audio_mix_caps} ! appsink name=master_audio_sink emit-signals=false sync=false max-buffers=32 drop=true"
+                    "audio_tee. ! {queue} ! audioconvert ! audioresample ! {audio_mix_caps} ! appsink name=master_audio_sink emit-signals=false sync=true max-buffers=32 drop=false"
                 ),
                 String::new(),
             )
@@ -5669,6 +5692,7 @@ mod tests {
         }];
 
         let plan = GstPipelinePlan::from_feed(&feed).expect("fanout plan");
+        let non_leaky_queue = queue_fragment(&feed, QueueLeak::None);
 
         assert!(plan.uses_output_fanout());
         assert_eq!(plan.videos.len(), 1);
@@ -5677,8 +5701,15 @@ mod tests {
         assert!(plan
             .description
             .contains("identity name=cgen_overlay_master"));
-        assert!(plan.description.contains("appsink name=master_video_sink"));
-        assert!(plan.description.contains("appsink name=master_audio_sink"));
+        assert!(plan
+            .description
+            .contains("appsink name=master_video_sink emit-signals=false sync=true"));
+        assert!(plan.description.contains(
+            "appsink name=master_audio_sink emit-signals=false sync=true max-buffers=32 drop=false"
+        ));
+        assert!(plan
+            .description
+            .contains(&format!("audio_tee. ! {non_leaky_queue} ! audioconvert")));
         assert!(!plan.description.contains("mpegtsmux name=mux"));
         assert!(plan.required_elements.contains(&"appsink".to_string()));
         assert!(!plan.required_elements.contains(&"x264enc".to_string()));
@@ -5946,6 +5977,43 @@ mod tests {
     }
 
     #[test]
+    fn disabled_deinterlacing_weaves_fields_without_adaptive_filtering() {
+        let mut feed = test_feed();
+        feed.program_input.deinterlace_enabled = "false".to_string();
+        feed.program_input.deinterlace_algorithm = "not-a-filter".to_string();
+        let caps = SourceCaps::new(
+            720,
+            480,
+            30_000,
+            1_001,
+            SourceScanMode::Interlaced,
+            SourceFieldOrder::TopFieldFirst,
+            8,
+            9,
+            "bt601",
+        )
+        .expect("source caps");
+        let deinterlace = feed.deinterlace_spec().expect("disabled deinterlace spec");
+        apply_effective_source_caps(&mut feed, &caps, deinterlace).expect("effective caps");
+
+        let plan = GstPipelinePlan::from_feed(&feed).expect("disabled deinterlace plan");
+
+        assert!(plan
+            .description
+            .contains("deinterlace method=weave mode=auto-strict fields=auto locking=passive"));
+        assert!(!plan.description.contains(" ! interlace field-pattern"));
+        assert_eq!(plan.status_value()["deinterlace"]["enabled"], false);
+        assert_eq!(
+            plan.status_value()["deinterlace"]["implementation"],
+            "gstreamer_deinterlace_weave"
+        );
+        assert_eq!(
+            plan.status_value()["deinterlace"]["field_rate_output"],
+            false
+        );
+    }
+
+    #[test]
     fn unavailable_bwdif_is_rejected_instead_of_falling_back() {
         let mut feed = test_feed();
         feed.program_input.deinterlace_algorithm = "bwdif".to_string();
@@ -5988,6 +6056,46 @@ mod tests {
             .expect("automatic rendition");
         assert_eq!(automatic.fps, "60000/1001");
         assert!(!automatic.interlaced);
+    }
+
+    #[test]
+    fn disabled_deinterlacing_keeps_base_rate_without_reinterlacing() {
+        let mut feed = test_feed();
+        let caps = SourceCaps::new(
+            720,
+            480,
+            30_000,
+            1_001,
+            SourceScanMode::Interlaced,
+            SourceFieldOrder::BottomFieldFirst,
+            8,
+            9,
+            "bt601",
+        )
+        .expect("source caps");
+
+        apply_effective_source_caps(
+            &mut feed,
+            &caps,
+            DeinterlaceSpec {
+                enabled: false,
+                ..DeinterlaceSpec::default()
+            },
+        )
+        .expect("effective caps");
+
+        assert_eq!(feed.video.fps, "30000/1001");
+        assert!(!feed.video.interlaced);
+        assert_eq!(feed.video.field_order, "bff");
+        let automatic = feed
+            .ladder
+            .videos
+            .iter()
+            .find(|rendition| rendition.enabled.eq_ignore_ascii_case("auto"))
+            .expect("automatic rendition");
+        assert_eq!(automatic.fps, "30000/1001");
+        assert!(!automatic.interlaced);
+        assert_eq!(automatic.field_order, "bff");
     }
 
     #[test]
@@ -7258,6 +7366,25 @@ mod tests {
 
         assert_eq!((x1, silent1), (-1.0, true));
         assert_eq!((x2, silent2), (-1.0, true));
+    }
+
+    #[test]
+    fn standby_banner_text_is_fixed() {
+        let mut feed = test_feed();
+        feed.standby.mode = "banner".to_string();
+        feed.standby.text = "Emergency Alert Details Channel".to_string();
+        let state = RuntimeState::default();
+        let snapshot = crate::graphics::presentation_snapshot(&feed, &state, true);
+        let started_at = Instant::now() - Duration::from_secs(120);
+
+        assert_eq!(
+            ticker_x_absolute(&feed, &snapshot, &snapshot.overlay_text, started_at),
+            (0.5, false)
+        );
+        assert_eq!(
+            ticker_overlay_window(&feed, &snapshot, &snapshot.overlay_text, started_at),
+            ("Emergency Alert Details Channel".to_string(), 0.5, false)
+        );
     }
 
     #[test]

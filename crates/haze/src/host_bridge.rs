@@ -21,11 +21,17 @@ struct BridgeClientHandle {
     id: usize,
     sender: SyncSender<Vec<u8>>,
     receive_events: bool,
+    client_id: Option<String>,
+    subscriptions: Vec<String>,
 }
 
 enum ClientMessage {
     Event(Value),
-    SetReceiveEvents(bool),
+    Configure {
+        receive_events: bool,
+        client_id: Option<String>,
+        subscriptions: Vec<String>,
+    },
     Consumed,
 }
 
@@ -73,7 +79,7 @@ impl HostBridge {
                 match envelope_receiver.recv() {
                     Ok(envelope) => {
                         drain_new_clients(&client_receiver, &mut clients, &mut cap_replay);
-                        match handle_client_message(envelope.value) {
+                        match handle_client_message(envelope.value.clone()) {
                             ClientMessage::Event(message) => {
                                 let _ = event_sender.send(message.clone());
                                 let Ok(mut raw) = serde_json::to_vec(&message) else {
@@ -87,27 +93,19 @@ impl HostBridge {
                                         cap_replay.pop_front();
                                     }
                                 }
-                                clients.retain(|client| {
-                                    if !client.receive_events
-                                        || envelope.origin.is_some_and(|id| id == client.id)
-                                    {
-                                        return true;
-                                    }
-                                    match client.sender.try_send(raw.clone()) {
-                                        Ok(()) => true,
-                                        Err(TrySendError::Full(_)) => {
-                                            warn!("dropped slow host bridge client");
-                                            false
-                                        }
-                                        Err(TrySendError::Disconnected(_)) => false,
-                                    }
-                                });
+                                deliver_event(&mut clients, &envelope, &message, &raw);
                             }
-                            ClientMessage::SetReceiveEvents(receive_events) => {
+                            ClientMessage::Configure {
+                                receive_events,
+                                client_id,
+                                subscriptions,
+                            } => {
                                 if let Some(origin) = envelope.origin {
                                     for client in &mut clients {
                                         if client.id == origin {
                                             client.receive_events = receive_events;
+                                            client.client_id = client_id;
+                                            client.subscriptions = subscriptions;
                                             break;
                                         }
                                     }
@@ -145,6 +143,8 @@ impl HostBridge {
                                             id: client_id,
                                             sender: tx,
                                             receive_events: true,
+                                            client_id: None,
+                                            subscriptions: Vec::new(),
                                         })
                                         .is_err()
                                     {
@@ -194,7 +194,9 @@ fn drain_new_clients(
 ) {
     while let Ok(client) = client_receiver.try_recv() {
         prune_replay(cap_replay);
-        if client.receive_events {
+        if client.receive_events
+            && subscription_matches(&client.subscriptions, "cap.alert.received")
+        {
             for (_, raw) in cap_replay.iter() {
                 let _ = client.sender.try_send(raw.clone());
             }
@@ -247,7 +249,31 @@ fn handle_client_message(value: Value) -> ClientMessage {
             .and_then(Value::as_bool)
             .or_else(|| value.get("receive_events").and_then(Value::as_bool))
             .unwrap_or(true);
-        return ClientMessage::SetReceiveEvents(receive_events);
+        let client_id = value
+            .get("data")
+            .and_then(|data| data.get("client_id"))
+            .and_then(Value::as_str)
+            .or_else(|| value.get("client_id").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let subscriptions = value
+            .get("data")
+            .and_then(|data| data.get("subscriptions"))
+            .or_else(|| value.get("subscriptions"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+        return ClientMessage::Configure {
+            receive_events,
+            client_id,
+            subscriptions,
+        };
     }
     if msg_type == "log_record" {
         let level = value
@@ -269,6 +295,60 @@ fn handle_client_message(value: Value) -> ClientMessage {
         return ClientMessage::Consumed;
     }
     ClientMessage::Event(value)
+}
+
+fn deliver_event(
+    clients: &mut Vec<BridgeClientHandle>,
+    envelope: &BridgeEnvelope,
+    message: &Value,
+    raw: &[u8],
+) {
+    let event_type = message
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let target = message
+        .get("target")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mut delivered = false;
+    clients.retain(|client| {
+        if envelope.origin.is_some_and(|id| id == client.id) || !client.receive_events {
+            return true;
+        }
+        if target.is_some_and(|target| client.client_id.as_deref() != Some(target)) {
+            return true;
+        }
+        if target.is_none() && !subscription_matches(&client.subscriptions, event_type) {
+            return true;
+        }
+        match client.sender.try_send(raw.to_vec()) {
+            Ok(()) => {
+                delivered = true;
+                true
+            }
+            Err(TrySendError::Full(_)) => {
+                warn!(client_id = ?client.client_id, "dropped slow host bridge client");
+                false
+            }
+            Err(TrySendError::Disconnected(_)) => false,
+        }
+    });
+    if let Some(target) = target.filter(|_| !delivered) {
+        warn!(target, event_type, "host bridge target is unavailable");
+    }
+}
+
+fn subscription_matches(subscriptions: &[String], event_type: &str) -> bool {
+    subscriptions.is_empty()
+        || subscriptions.iter().any(|subscription| {
+            subscription == "*"
+                || subscription == event_type
+                || subscription
+                    .strip_suffix('*')
+                    .is_some_and(|prefix| event_type.starts_with(prefix))
+        })
 }
 
 fn logger_label(logger: &str) -> &str {
@@ -336,6 +416,89 @@ mod tests {
             },
         }));
 
-        assert!(matches!(result, ClientMessage::SetReceiveEvents(false)));
+        assert!(matches!(
+            result,
+            ClientMessage::Configure {
+                receive_events: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn client_identity_and_subscriptions_are_parsed() {
+        let result = handle_client_message(json!({
+            "type": "bridge.client",
+            "data": {
+                "client_id": "haze-location",
+                "subscriptions": ["location.query.request"],
+            },
+        }));
+        match result {
+            ClientMessage::Configure {
+                client_id,
+                subscriptions,
+                ..
+            } => {
+                assert_eq!(client_id.as_deref(), Some("haze-location"));
+                assert_eq!(subscriptions, vec!["location.query.request"]);
+            }
+            _ => panic!("expected client configuration"),
+        }
+    }
+
+    #[test]
+    fn subscriptions_support_exact_and_prefix_matches() {
+        assert!(subscription_matches(&[], "anything"));
+        assert!(subscription_matches(
+            &["location.query.request".to_string()],
+            "location.query.request"
+        ));
+        assert!(subscription_matches(
+            &["location.*".to_string()],
+            "location.catalog.ready"
+        ));
+        assert!(!subscription_matches(
+            &["cap.alert.received".to_string()],
+            "location.query.request"
+        ));
+    }
+
+    #[test]
+    fn targeted_events_only_reach_the_named_client() {
+        let (location_sender, location_receiver) = mpsc::sync_channel(1);
+        let (requester_sender, requester_receiver) = mpsc::sync_channel(1);
+        let mut clients = vec![
+            BridgeClientHandle {
+                id: 1,
+                sender: location_sender,
+                receive_events: true,
+                client_id: Some("haze-location".to_string()),
+                subscriptions: vec!["location.*".to_string()],
+            },
+            BridgeClientHandle {
+                id: 2,
+                sender: requester_sender,
+                receive_events: true,
+                client_id: Some("haze-ivr-1".to_string()),
+                subscriptions: vec!["location.query.completed".to_string()],
+            },
+        ];
+        let message = json!({
+            "type": "location.query.completed",
+            "target": "haze-ivr-1",
+        });
+        let envelope = BridgeEnvelope {
+            origin: Some(3),
+            value: message.clone(),
+        };
+
+        deliver_event(&mut clients, &envelope, &message, b"response\n");
+
+        assert!(location_receiver.try_recv().is_err());
+        assert_eq!(
+            requester_receiver.try_recv().expect("targeted response"),
+            b"response\n"
+        );
     }
 }

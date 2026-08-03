@@ -8,6 +8,7 @@ use serde_json::Value;
 const PRIORITY_AUDIO_EXPIRE_GRACE_MS: i64 = 2_000;
 const MAX_BANNER_ALERTS: usize = 8;
 const MAX_BANNER_TEXT_CHARS: usize = 1_800;
+const MAX_CANONICAL_LOCATIONS: usize = 64;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct RuntimeState {
@@ -371,8 +372,62 @@ fn compact_banner_payload(payload: &mut BannerPayload) {
                 );
             }
         }
+        if let Some(locations) = alert
+            .fields
+            .get("canonical_locations")
+            .and_then(compact_canonical_locations)
+        {
+            fields.insert("canonical_locations".to_string(), locations);
+        }
         alert.fields = fields;
     }
+}
+
+fn compact_canonical_locations(value: &Value) -> Option<Value> {
+    let locations = value.as_array()?;
+    let mut compact = Vec::with_capacity(locations.len().min(MAX_CANONICAL_LOCATIONS));
+    for location in locations.iter().take(MAX_CANONICAL_LOCATIONS) {
+        let Some(source) = location.as_object() else {
+            continue;
+        };
+        let mut target = serde_json::Map::new();
+        for key in [
+            "canonical_id",
+            "candidate_id",
+            "name",
+            "kind",
+            "country",
+            "region",
+            "match_confidence",
+            "match_method",
+            "catalog_generation",
+        ] {
+            if let Some(text) = source
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+            {
+                target.insert(key.to_string(), Value::String(limit_chars(text, 256)));
+            }
+        }
+        for key in ["match_score", "source_quality"] {
+            if let Some(number) = source.get(key).and_then(Value::as_f64) {
+                if number.is_finite() {
+                    target.insert(key.to_string(), serde_json::json!(number));
+                }
+            }
+        }
+        for key in ["actionable", "ambiguous"] {
+            if let Some(flag) = source.get(key).and_then(Value::as_bool) {
+                target.insert(key.to_string(), Value::Bool(flag));
+            }
+        }
+        if !target.is_empty() {
+            compact.push(Value::Object(target));
+        }
+    }
+    (!compact.is_empty()).then_some(Value::Array(compact))
 }
 
 fn limit_chars(value: &str, max_chars: usize) -> String {

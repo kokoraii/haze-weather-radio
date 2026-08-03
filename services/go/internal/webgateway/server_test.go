@@ -187,6 +187,24 @@ func TestPublicContentSecurityPolicyUsesLocalScripts(t *testing.T) {
 		if !strings.Contains(csp, "style-src 'self' https://fonts.googleapis.com") {
 			t.Fatalf("public CSP for %s does not restrict style sources: %s", path, csp)
 		}
+		if !strings.Contains(csp, "worker-src 'self'") {
+			t.Fatalf("public CSP for %s does not allow the bundled MapLibre worker: %s", path, csp)
+		}
+	}
+}
+
+func TestPublicContentSecurityPolicyAllowsOnlyTheConfiguredBasemapProvider(t *testing.T) {
+	csp := contentSecurityPolicy("/listen")
+	for _, directive := range []string{
+		"img-src 'self' data: https://tiles.openfreemap.org https://server.arcgisonline.com",
+		"connect-src 'self' https://tiles.openfreemap.org https://server.arcgisonline.com ws: wss: stun: stuns: turn: turns:",
+	} {
+		if !strings.Contains(csp, directive) {
+			t.Fatalf("public CSP misses %q: %s", directive, csp)
+		}
+	}
+	if strings.Contains(csp, "connect-src 'self' https: ") || strings.Contains(csp, "img-src 'self' data: https:;") {
+		t.Fatalf("public CSP allows arbitrary HTTPS basemap endpoints: %s", csp)
 	}
 }
 
@@ -625,6 +643,56 @@ webpanel:
 	}
 	if publicFeeds[0]["webrtc_enabled"] != false || publicFeeds[0]["http_stream_enabled"] != true {
 		t.Fatalf("HTTP-only public feed flags = %#v", publicFeeds[0])
+	}
+}
+
+func TestPublicFeedPagesRemainAvailableWithoutStreamingOutputs(t *testing.T) {
+	dir := t.TempDir()
+	writePublicFixture(t, dir, "public")
+	mustWrite(t, filepath.Join(dir, "index.html"), "<!doctype html><title>feed information</title>")
+	mustWrite(t, filepath.Join(dir, "managed", "configs", "output.xml"), `<?xml version="1.0" encoding="UTF-8"?>
+<outputs>
+  <feed id="sk-0001"><webrtc enabled="false"/><stream enabled="false"/></feed>
+</outputs>
+`)
+	configPath := filepath.Join(dir, "config.yaml")
+	config, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := NewServerWithConfigPath(config, configPath, dir)
+
+	for _, path := range []string{"/feeds", "/listen?feed=sk-0001"} {
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, want %d", path, response.Code, http.StatusOK)
+		}
+		if !strings.Contains(response.Body.String(), "feed information") {
+			t.Fatalf("%s body = %q", path, response.Body.String())
+		}
+	}
+
+	feeds, err := loadBasicFeedSummaries(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !publicFeedPagesAvailable(config, feeds) {
+		t.Fatal("enabled feed should remain browsable without streaming output")
+	}
+}
+
+func TestPublicFeedPagesRequireAnEnabledFeed(t *testing.T) {
+	config := Config{}
+	config.Webpanel.Public.Feeds.Access = "public"
+	feeds := []map[string]any{{
+		"id":                  "sk-0001",
+		"enabled":             false,
+		"webrtc_enabled":      true,
+		"http_stream_enabled": true,
+	}}
+	if publicFeedPagesAvailable(config, feeds) {
+		t.Fatal("disabled feeds should not expose public feed pages")
 	}
 }
 
@@ -1187,7 +1255,7 @@ func TestWebSocketLoginTokenOpensAdminAndAuthenticatedStream(t *testing.T) {
 		t.Fatalf("admin did not set session cookie: %#v", response.Cookies())
 	}
 	if !cookies[0].HttpOnly || cookies[0].SameSite != http.SameSiteStrictMode {
-		t.Fatalf("admin session cookie was not hardened: %#v", cookies[0])
+		t.Fatalf("admin session cookie is missing required protections: %#v", cookies[0])
 	}
 
 	adminRequest, err := http.NewRequest(http.MethodGet, httpServer.URL+"/admin", nil)

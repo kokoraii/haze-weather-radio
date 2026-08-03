@@ -450,11 +450,12 @@ try {
             cargo build @CargoProfileArgs @CargoTargetArgs -p haze
             cargo build @CargoProfileArgs @CargoTargetArgs -p haze-cap
             cargo build @CargoProfileArgs @CargoTargetArgs -p haze-easnet
+            cargo build @CargoProfileArgs @CargoTargetArgs -p haze-location
             cargo build @CargoProfileArgs @CargoTargetArgs -p haze-playout --features ffmpeg-runtime
             cargo build @CargoProfileArgs @CargoTargetArgs -p haze-media --features gstreamer-backend
             cargo build @CargoProfileArgs @CargoTargetArgs -p haze-cgen --features "gpu-wgpu"
         } else {
-            cargo build @CargoProfileArgs @CargoTargetArgs -p haze -p haze-cap -p haze-easnet -p haze-playout
+            cargo build @CargoProfileArgs @CargoTargetArgs -p haze -p haze-cap -p haze-easnet -p haze-location -p haze-playout
             cargo build @CargoProfileArgs @CargoTargetArgs -p haze-media --features gstreamer-backend
             cargo build @CargoProfileArgs @CargoTargetArgs -p haze-cgen --features "gpu-wgpu"
         }
@@ -465,6 +466,7 @@ try {
     $ExePath = Join-Path $Root "$TargetProfileDir/haze.exe"
     $CapRustExePath = Join-Path $Root "$TargetProfileDir/haze-cap-ingest.exe"
     $EasNetExePath = Join-Path $Root "$TargetProfileDir/haze-easnet.exe"
+    $LocationExePath = Join-Path $Root "$TargetProfileDir/haze-location.exe"
     $PlayoutExePath = Join-Path $Root "$TargetProfileDir/haze-playout-rs.exe"
     $MediaExePath = Join-Path $Root "$TargetProfileDir/haze-media.exe"
     $CgenExePath = Join-Path $Root "$TargetProfileDir/haze-cgen.exe"
@@ -476,6 +478,9 @@ try {
     }
     if (-not (Test-Path -LiteralPath $EasNetExePath)) {
         throw "Missing Rust EAS NET executable: $EasNetExePath"
+    }
+    if (-not (Test-Path -LiteralPath $LocationExePath)) {
+        throw "Missing Rust location executable: $LocationExePath"
     }
     if (-not (Test-Path -LiteralPath $PlayoutExePath)) {
         throw "Missing Rust playout executable: $PlayoutExePath"
@@ -504,11 +509,14 @@ try {
         "haze-data-ingest.exe",
         "haze-cap-ingest.exe",
         "haze-easnet.exe",
+        "haze-location.exe",
         "haze-tts.exe",
         "haze-sapi5-shim.exe",
         "haze-product-render.exe",
         "haze-playlist.exe",
         "haze-webhook.exe",
+        "haze-asr.exe",
+        "whisper-server.exe",
         "haze-ivr.exe",
         "haze-playout.exe",
         "haze-playout-rs.exe",
@@ -565,6 +573,7 @@ try {
     Copy-Item -LiteralPath $ExePath -Destination (Join-Path $BinFull "haze.exe") -Force
     Copy-Item -LiteralPath $CapRustExePath -Destination (Join-Path $BinFull "haze-cap-ingest.exe") -Force
     Copy-Item -LiteralPath $EasNetExePath -Destination (Join-Path $BinFull "haze-easnet.exe") -Force
+    Copy-Item -LiteralPath $LocationExePath -Destination (Join-Path $BinFull "haze-location.exe") -Force
     Copy-Item -LiteralPath $PlayoutExePath -Destination (Join-Path $BinFull "haze-playout-rs.exe") -Force
     Copy-Item -LiteralPath $MediaExePath -Destination (Join-Path $BinFull "haze-media.exe") -Force
     Copy-Item -LiteralPath $CgenExePath -Destination (Join-Path $BinFull "haze-cgen.exe") -Force
@@ -596,10 +605,10 @@ try {
     }
     $ManagedOut = Join-Path $OutFull "managed"
     New-Item -ItemType Directory -Force -Path $ManagedOut | Out-Null
-    if ((Test-Path -LiteralPath "scripts/tts/chatterbox_infer.py") -or (Test-Path -LiteralPath "scripts/tts/f5_infer.py")) {
+    if ((Test-Path -LiteralPath "scripts/tts/chatterbox_infer.py") -or (Test-Path -LiteralPath "scripts/tts/f5_infer.py") -or (Test-Path -LiteralPath "scripts/install-whisper-model.ps1")) {
         $ManagedScripts = Join-Path $ManagedOut "scripts"
         New-Item -ItemType Directory -Force -Path $ManagedScripts | Out-Null
-        foreach ($Script in @("scripts/tts/chatterbox_infer.py", "scripts/tts/f5_infer.py")) {
+        foreach ($Script in @("scripts/tts/chatterbox_infer.py", "scripts/tts/f5_infer.py", "scripts/install-whisper-model.sh", "scripts/install-whisper-model.ps1")) {
             if (Test-Path -LiteralPath $Script) {
                 Copy-Item -LiteralPath $Script -Destination $ManagedScripts -Force
             }
@@ -608,7 +617,7 @@ try {
 
     New-Item -ItemType Directory -Force -Path (Join-Path $OutFull "audio") | Out-Null
 
-    foreach ($Dir in @("audio/_uploads", "audio/_previews", "bin", "logs", "runtime", "runtime/audio/alerts", "runtime/audio/playlist", "runtime/audio/playout", "runtime/audio/tts", "runtime/feeds", "runtime/playlists", "runtime/queues/alerts", "runtime/state")) {
+    foreach ($Dir in @("audio/_uploads", "audio/_previews", "bin", "logs", "runtime", "runtime/audio/alerts", "runtime/audio/playlist", "runtime/audio/playout", "runtime/audio/tts", "runtime/feeds", "runtime/models/whisper", "runtime/playlists", "runtime/queues/alerts", "runtime/state")) {
         New-Item -ItemType Directory -Force -Path (Join-Path $OutFull $Dir) | Out-Null
     }
 
