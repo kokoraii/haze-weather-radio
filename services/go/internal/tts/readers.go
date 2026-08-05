@@ -9,11 +9,21 @@ import (
 
 // Reader maps a Haze reader_id to a concrete TTS provider voice.
 type Reader struct {
-	ID       string `json:"id"`
+	ID        string        `json:"id"`
+	Provider  string        `json:"provider"`
+	Gender    string        `json:"gender,omitempty"`
+	Language  string        `json:"language,omitempty"`
+	VoiceID   string        `json:"voice_id"`
+	Backup    *ReaderBackup `json:"backup,omitempty"`
+	BackupFor []string      `json:"backup_for,omitempty"`
+}
+
+// ReaderBackup selects a local or alternate provider when a reader's primary
+// provider cannot synthesize the request.
+type ReaderBackup struct {
+	ReaderID string `json:"reader_id,omitempty"`
 	Provider string `json:"provider"`
-	Gender   string `json:"gender,omitempty"`
-	Language string `json:"language,omitempty"`
-	VoiceID  string `json:"voice_id"`
+	VoiceID  string `json:"voice_id,omitempty"`
 }
 
 type readersXML struct {
@@ -27,6 +37,12 @@ type readerXML struct {
 	Language string `xml:"language"`
 	VoiceID  string `xml:"voice_id"`
 	Path     string `xml:"path"`
+	Backup   *struct {
+		Provider string   `xml:"provider,attr"`
+		VoiceID  string   `xml:"voice_id"`
+		Path     string   `xml:"path"`
+		Readers  []string `xml:"reader"`
+	} `xml:"backup"`
 }
 
 // LoadReaders parses managed/configs/readers.xml.
@@ -42,10 +58,14 @@ func LoadReaders(path string) ([]Reader, error) {
 	}
 
 	readers := make([]Reader, 0, len(parsed.Readers))
+	readerIndexes := make(map[string]int, len(parsed.Readers))
 	for _, item := range parsed.Readers {
 		readerID := strings.TrimSpace(item.ID)
 		if readerID == "" {
 			continue
+		}
+		if _, exists := readerIndexes[readerID]; exists {
+			return nil, fmt.Errorf("duplicate reader id %q", readerID)
 		}
 		provider := NormalizeProvider(item.Provider)
 		if provider == "" {
@@ -55,19 +75,88 @@ func LoadReaders(path string) ([]Reader, error) {
 		if voiceID == "" {
 			voiceID = strings.TrimSpace(item.Path)
 		}
+		var backup *ReaderBackup
+		var backupFor []string
+		if item.Backup != nil {
+			backupFor = normalizeBackupReaderIDs(item.Backup.Readers)
+			if len(backupFor) > 0 {
+				if strings.TrimSpace(item.Backup.Provider) != "" || strings.TrimSpace(item.Backup.VoiceID) != "" || strings.TrimSpace(item.Backup.Path) != "" {
+					return nil, fmt.Errorf("reader %q backup cannot mix reader targets with an inline provider or voice", readerID)
+				}
+			} else {
+				backupProvider := NormalizeProvider(item.Backup.Provider)
+				backupVoiceID := strings.TrimSpace(item.Backup.VoiceID)
+				if backupVoiceID == "" {
+					backupVoiceID = strings.TrimSpace(item.Backup.Path)
+				}
+				if backupProvider != "" && backupProvider != "auto" {
+					backup = &ReaderBackup{Provider: backupProvider, VoiceID: backupVoiceID}
+				}
+			}
+		}
 		gender := strings.ToLower(strings.TrimSpace(item.Gender))
 		if gender != "female" {
 			gender = "male"
 		}
+		readerIndexes[readerID] = len(readers)
 		readers = append(readers, Reader{
-			ID:       readerID,
-			Provider: provider,
-			Gender:   gender,
-			Language: NormalizeLanguage(item.Language),
-			VoiceID:  voiceID,
+			ID:        readerID,
+			Provider:  provider,
+			Gender:    gender,
+			Language:  NormalizeLanguage(item.Language),
+			VoiceID:   voiceID,
+			Backup:    backup,
+			BackupFor: backupFor,
 		})
 	}
+	for _, backupReader := range readers {
+		for _, targetID := range backupReader.BackupFor {
+			if targetID == backupReader.ID {
+				return nil, fmt.Errorf("reader %q cannot back up itself", backupReader.ID)
+			}
+			targetIndex, ok := readerIndexes[targetID]
+			if !ok {
+				return nil, fmt.Errorf("reader %q backs up unknown reader %q", backupReader.ID, targetID)
+			}
+			candidate := &ReaderBackup{
+				ReaderID: backupReader.ID,
+				Provider: backupReader.Provider,
+				VoiceID:  backupReader.VoiceID,
+			}
+			if existing := readers[targetIndex].Backup; existing != nil {
+				if sameReaderBackup(existing, candidate) {
+					continue
+				}
+				return nil, fmt.Errorf("reader %q has more than one backup", targetID)
+			}
+			readers[targetIndex].Backup = candidate
+		}
+	}
 	return readers, nil
+}
+
+func normalizeBackupReaderIDs(values []string) []string {
+	result := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
+}
+
+func sameReaderBackup(left *ReaderBackup, right *ReaderBackup) bool {
+	return left != nil && right != nil &&
+		left.ReaderID == right.ReaderID &&
+		left.Provider == right.Provider &&
+		left.VoiceID == right.VoiceID
 }
 
 // NormalizeProvider maps provider names onto the service provider IDs.

@@ -455,6 +455,101 @@ func TestBuildSegmentedProductItemPacesTextOnlySegments(t *testing.T) {
 	}
 }
 
+func TestBuildProductUsesCachedCompleteAudioWhenSegmentSynthesisFails(t *testing.T) {
+	dir := t.TempDir()
+	outputDir := filepath.Join(dir, "runtime", "audio", "playlist")
+	cachedPath := filepath.Join(outputDir, "cwxr-on01", "forecast-en-ca-cached.wav")
+	if err := writeTestWAVFile(cachedPath, 48000, 1, 4800); err != nil {
+		t.Fatal(err)
+	}
+	clientConn, serverConn := net.Pipe()
+	bridge := &bridgeClient{
+		conn:            clientConn,
+		events:          make(chan map[string]any, 16),
+		pendingProducts: map[string]chan productResult{},
+		pendingSynth:    map[string]chan synthResult{},
+	}
+	go bridge.readLoop()
+	defer bridge.Close()
+	defer serverConn.Close()
+	go func() {
+		decoder := json.NewDecoder(serverConn)
+		encoder := json.NewEncoder(serverConn)
+		for {
+			var message map[string]any
+			if decoder.Decode(&message) != nil {
+				return
+			}
+			data := mapAt(message, "data")
+			switch message["type"] {
+			case "product.render.request":
+				requestID := firstText(message, data, "request_id", "subject")
+				_ = encoder.Encode(map[string]any{
+					"type": "product.rendered",
+					"data": map[string]any{
+						"request_id": requestID,
+						"product": map[string]any{
+							"package_id": "forecast",
+							"title":      "Forecast",
+							"language":   "en-CA",
+							"reader_id":  "00",
+							"segments": []map[string]any{
+								{"kind": "opener", "text": "The forecast."},
+								{"kind": "package", "text": "Cloudy today."},
+							},
+						},
+					},
+				})
+			case "tts.synthesize":
+				jobID := firstText(message, data, "job_id", "subject")
+				_ = encoder.Encode(map[string]any{
+					"type": "tts.failed",
+					"data": map[string]any{"job_id": jobID, "error": "remote voice unavailable"},
+				})
+			}
+		}
+	}()
+	planner := &feedPlanner{
+		cfg: loadedConfig{
+			BaseDir:   dir,
+			OutputDir: outputDir,
+			Root:      rootConfig{Playout: playoutConfig{SampleRate: 48000, Channels: 1}},
+		},
+		bridge: bridge,
+		feed:   feedXML{ID: "cwxr-on01", Timezone: "America/Toronto"},
+	}
+	now := time.Now()
+
+	item, err := planner.buildProduct(context.Background(), "forecast", "routine", "", now, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.AudioPath != cachedPath {
+		t.Fatalf("audio path = %q, want cached %q", item.AudioPath, cachedPath)
+	}
+	if !strings.Contains(planner.lastError, "segmented synthesis failed") {
+		t.Fatalf("last error = %q", planner.lastError)
+	}
+}
+
+func TestProductSegmentScratchNamesAreNotCacheCandidates(t *testing.T) {
+	tests := []struct {
+		name string
+		want bool
+	}{
+		{name: "forecast-en-ca-123-text-00.wav", want: true},
+		{name: "marine-en-ca-123-audio-12.WAV", want: true},
+		{name: "forecast-en-ca-complete.wav", want: false},
+		{name: "text-forecast-en-ca.wav", want: false},
+		{name: "forecast-en-ca-123-text-a0.wav", want: false},
+	}
+	for _, test := range tests {
+		if got := isProductSegmentScratchName(test.name); got != test.want {
+			t.Errorf("isProductSegmentScratchName(%q) = %v, want %v", test.name, got, test.want)
+		}
+	}
+}
+
 func TestMinuteTargetFindsNextWallClockSecond(t *testing.T) {
 	from := time.Date(2026, 6, 15, 12, 4, 59, 0, time.UTC)
 	until := from.Add(2 * time.Minute)

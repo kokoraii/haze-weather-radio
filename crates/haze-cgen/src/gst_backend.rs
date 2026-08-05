@@ -199,7 +199,7 @@ fn spawn_output_fanout(
             .clamp(feed.sync.reconnect_initial_ms.max(100), 300_000),
     ));
     let factory = Arc::new(GstOutputSinkFactory::new(program_map));
-    let fanout = OutputFanout::spawn(pipeline_spec.outputs, factory, worker_config)
+    let fanout = OutputFanout::spawn_paused(pipeline_spec.outputs, factory, worker_config)
         .context("failed to start isolated CGEN output workers")?;
     Ok(Some(Arc::new(fanout)))
 }
@@ -1119,6 +1119,9 @@ fn run_pipeline_once(
             return Err(err);
         }
     };
+    if let Some(fanout) = output_fanout.as_deref() {
+        fanout.start();
+    }
     let (initial_audio_mode, initial_video_mode) = {
         let state = state_rx.borrow();
         let video_connected = input_video_connected(&input_health, &feed);
@@ -5127,7 +5130,7 @@ impl InputSourceFragment {
                 )
             } else {
                 format!(
-                    " ! capsfilter caps={} ! parsebin ! decodebin",
+                    " ! capsfilter caps={} ! parsebin ! decodebin force-sw-decoders=true",
                     gst_quote(MPEG_TS_VIDEO_CAPS)
                 )
             };
@@ -5842,7 +5845,7 @@ mod tests {
             .contains("identity name=program_ts_monitor silent=true"));
         assert!(plan.description.contains("tsdemux name=src"));
         assert!(plan.description.contains(
-            "src. ! capsfilter caps=\"video/x-h264;video/x-h265;video/mpeg;video/x-vp8;video/x-vp9;image/jpeg\" ! parsebin ! decodebin"
+            "src. ! capsfilter caps=\"video/x-h264;video/x-h265;video/mpeg;video/x-vp8;video/x-vp9;image/jpeg\" ! parsebin ! decodebin force-sw-decoders=true"
         ));
         assert!(plan.description.contains(
             "src. ! capsfilter caps=\"audio/mpeg;audio/x-ac3;audio/x-eac3;audio/x-opus;audio/x-dts;audio/x-private1-ac3;audio/x-private1-lpcm;audio/x-lpcm\" ! parsebin ! decodebin"

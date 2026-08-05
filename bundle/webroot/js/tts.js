@@ -20,6 +20,9 @@ const fields = {
     voiceID: document.getElementById('ttsVoiceID'),
     language: document.getElementById('ttsLanguage'),
     gender: document.getElementById('ttsGender'),
+    backupProvider: document.getElementById('ttsBackupProvider'),
+    backupVoiceID: document.getElementById('ttsBackupVoiceID'),
+    backupReaderIDs: document.getElementById('ttsBackupReaderIDs'),
     volume: document.getElementById('ttsPreviewVolume'),
     rate: document.getElementById('ttsPreviewRate'),
     previewText: document.getElementById('ttsPreviewText'),
@@ -62,6 +65,9 @@ function readEditor() {
         gender: fields.gender.value || 'male',
         language: fields.language.value.trim() || 'en-us',
         voice_id: fields.voiceID.value.trim(),
+        backup_provider: fields.backupProvider.value || '',
+        backup_voice_id: fields.backupVoiceID.value.trim(),
+        backup_reader_ids: fields.backupReaderIDs.value.split(/[,;\r\n]+/).map((value) => value.trim()).filter(Boolean),
     };
 }
 
@@ -88,6 +94,9 @@ function writeEditor(reader) {
         fields.voiceID.value = '';
         fields.language.value = '';
         fields.gender.value = 'male';
+        fields.backupProvider.value = '';
+        fields.backupVoiceID.value = '';
+        fields.backupReaderIDs.value = '';
         selectedLabel.textContent = 'No reader selected';
         providerMetric.textContent = 'none';
         revokePreview();
@@ -98,16 +107,25 @@ function writeEditor(reader) {
     fields.voiceID.value = reader.voice_id || '';
     fields.language.value = reader.language || 'en-us';
     fields.gender.value = reader.gender || 'male';
+    fields.backupProvider.value = reader.backup_provider || '';
+    fields.backupVoiceID.value = reader.backup_voice_id || '';
+    fields.backupReaderIDs.value = Array.isArray(reader.backup_reader_ids) ? reader.backup_reader_ids.join(', ') : '';
     selectedLabel.textContent = reader.id || 'New reader';
     providerMetric.textContent = reader.provider || 'auto';
 }
 
 function renderProviders() {
     const current = fields.provider.value;
+    const currentBackup = fields.backupProvider.value;
     fields.provider.innerHTML = providers.map((provider) => (
         `<option value="${escapeHtml(provider)}">${escapeHtml(provider)}</option>`
     )).join('');
+    fields.backupProvider.innerHTML = '<option value="">No backup</option>' + providers
+        .filter((provider) => provider !== 'auto')
+        .map((provider) => `<option value="${escapeHtml(provider)}">${escapeHtml(provider)}</option>`)
+        .join('');
     if (providers.includes(current)) fields.provider.value = current;
+    if (providers.includes(currentBackup)) fields.backupProvider.value = currentBackup;
 }
 
 function renderTable() {
@@ -130,8 +148,8 @@ function renderTable() {
                     <span>${escapeHtml(reader.gender || 'male')} · ${escapeHtml(reader.language || 'en-us')}</span>
                 </div>
             </td>
-            <td><span class="table-pill" data-state="tts">${escapeHtml(reader.provider || 'auto')}</span></td>
-            <td title="${escapeHtml(reader.voice_id || 'Auto voice')}">${reader.voice_id ? escapeHtml(reader.voice_id) : '<span class="table-muted">Auto voice</span>'}</td>
+            <td><span class="table-pill" data-state="tts">${escapeHtml(reader.provider || 'auto')}</span>${reader.backup_provider ? `<span class="table-muted"> → ${escapeHtml(reader.backup_provider)}</span>` : ''}${Array.isArray(reader.backup_reader_ids) && reader.backup_reader_ids.length ? `<span class="table-muted"> for ${escapeHtml(reader.backup_reader_ids.join(', '))}</span>` : ''}</td>
+            <td title="${escapeHtml(reader.voice_id || 'Auto voice')}${reader.backup_voice_id ? `, inline backup ${escapeHtml(reader.backup_voice_id)}` : ''}">${reader.voice_id ? escapeHtml(reader.voice_id) : '<span class="table-muted">Auto voice</span>'}</td>
         </tr>
     `;
     }).join('');
@@ -228,6 +246,9 @@ function addReader() {
         gender: 'male',
         language: 'en-us',
         voice_id: '',
+        backup_provider: '',
+        backup_voice_id: '',
+        backup_reader_ids: [],
     });
     selectedID = id;
     renderTable();

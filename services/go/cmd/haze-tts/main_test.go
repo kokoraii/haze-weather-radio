@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -14,10 +16,12 @@ import (
 )
 
 type fakeProvider struct {
-	id       string
-	audio    tts.Audio
-	mu       sync.Mutex
-	requests []tts.Request
+	id                  string
+	audio               tts.Audio
+	err                 error
+	waitForCancellation bool
+	mu                  sync.Mutex
+	requests            []tts.Request
 }
 
 func (p *fakeProvider) ID() string { return p.id }
@@ -26,11 +30,15 @@ func (p *fakeProvider) ListVoices(context.Context) ([]tts.Voice, error) {
 	return nil, nil
 }
 
-func (p *fakeProvider) Synthesize(_ context.Context, req tts.Request) (tts.Audio, error) {
+func (p *fakeProvider) Synthesize(ctx context.Context, req tts.Request) (tts.Audio, error) {
 	p.mu.Lock()
 	p.requests = append(p.requests, req)
 	p.mu.Unlock()
-	return p.audio, nil
+	if p.waitForCancellation {
+		<-ctx.Done()
+		return tts.Audio{}, ctx.Err()
+	}
+	return p.audio, p.err
 }
 
 func (p *fakeProvider) requestAt(index int) tts.Request {
@@ -127,6 +135,113 @@ func TestHandleSynthesisJobPublishesPCMMetadata(t *testing.T) {
 	}
 	if raw, err := os.ReadFile(outputPath); err != nil || len(raw) != 4 {
 		t.Fatalf("output bytes = %d err=%v", len(raw), err)
+	}
+}
+
+func TestHandleSynthesisJobDropsExpiredQueuedRequest(t *testing.T) {
+	provider := &fakeProvider{id: "piper", audio: tts.Audio{Format: tts.FormatWAV, Data: []byte("wav")}}
+	state := &serviceState{
+		cfg:          serviceConfig{Timeout: time.Second},
+		providers:    map[string]tts.Provider{"piper": provider},
+		dictionaries: map[string]dictionaryResult{},
+	}
+	conn, peer := net.Pipe()
+	defer conn.Close()
+	defer peer.Close()
+	outputPath := filepath.Join(t.TempDir(), "expired.wav")
+
+	go handleSynthesisJob(context.Background(), conn, state, map[string]any{
+		"type": "tts.synthesize",
+		"data": map[string]any{
+			"job_id":      "expired-job",
+			"provider":    "piper",
+			"text":        "stale weather",
+			"output_path": outputPath,
+			"deadline_at": time.Now().Add(-time.Second).UTC().Format(time.RFC3339Nano),
+		},
+	})
+
+	var event map[string]any
+	if err := json.NewDecoder(peer).Decode(&event); err != nil {
+		t.Fatal(err)
+	}
+	if event["type"] != "tts.failed" {
+		t.Fatalf("event type = %v, want tts.failed", event["type"])
+	}
+	data := event["data"].(map[string]any)
+	if !strings.Contains(data["error"].(string), "expired") {
+		t.Fatalf("error = %v", data["error"])
+	}
+	if got := provider.requestCount(); got != 0 {
+		t.Fatalf("expired request reached provider %d time(s)", got)
+	}
+	if _, err := os.Stat(outputPath); !os.IsNotExist(err) {
+		t.Fatalf("expired request wrote output, err=%v", err)
+	}
+}
+
+func TestSynthesizeWithReaderBackupUsesConfiguredVoice(t *testing.T) {
+	primary := &fakeProvider{id: "speakyapi", err: tts.ErrProviderUnavailable}
+	backup := &fakeProvider{id: "piper", audio: tts.Audio{Format: tts.FormatWAV, Data: []byte("backup")}}
+	audio, provider, voiceID, backupUsed, err := synthesizeWithReaderBackup(
+		context.Background(),
+		map[string]tts.Provider{"speakyapi": primary, "piper": backup},
+		"speakyapi",
+		tts.Request{Text: "weather", VoiceID: "RadioMET Tom", Language: "en-US"},
+		&tts.ReaderBackup{Provider: "piper", VoiceID: "en_US-hfc_male-medium"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if provider.ID() != "piper" || !backupUsed || voiceID != "en_US-hfc_male-medium" || string(audio.Data) != "backup" {
+		t.Fatalf("fallback result provider=%v used=%v voice=%q audio=%q", provider.ID(), backupUsed, voiceID, audio.Data)
+	}
+	if got := backup.requestAt(0).VoiceID; got != "en_US-hfc_male-medium" {
+		t.Fatalf("backup voice = %q", got)
+	}
+}
+
+func TestSynthesizeWithReaderBackupLimitsHungPrimary(t *testing.T) {
+	primary := &fakeProvider{id: "speakyapi", waitForCancellation: true}
+	backup := &fakeProvider{id: "piper", audio: tts.Audio{Format: tts.FormatWAV, Data: []byte("backup")}}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, provider, _, backupUsed, err := synthesizeWithReaderBackupLimit(
+		ctx,
+		map[string]tts.Provider{"speakyapi": primary, "piper": backup},
+		"speakyapi",
+		tts.Request{Text: "weather", VoiceID: "RadioMET Tom", Language: "en-US"},
+		&tts.ReaderBackup{ReaderID: "000", Provider: "piper", VoiceID: "en_US-hfc_male-medium"},
+		25*time.Millisecond,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if provider.ID() != "piper" || !backupUsed {
+		t.Fatalf("provider=%s backup_used=%v", provider.ID(), backupUsed)
+	}
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("hung primary consumed the parent deadline: %v", err)
+	}
+}
+
+func TestSynthesizeWithoutBackupRetainsParentDeadline(t *testing.T) {
+	primary := &fakeProvider{id: "speakyapi", waitForCancellation: true}
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+	_, _, _, backupUsed, err := synthesizeWithReaderBackupLimit(
+		ctx,
+		map[string]tts.Provider{"speakyapi": primary},
+		"speakyapi",
+		tts.Request{Text: "weather"},
+		nil,
+		5*time.Millisecond,
+	)
+	if err == nil || backupUsed {
+		t.Fatalf("err=%v backup_used=%v", err, backupUsed)
+	}
+	if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		t.Fatalf("ordinary reader did not retain its parent deadline: %v", ctx.Err())
 	}
 }
 

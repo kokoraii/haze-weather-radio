@@ -175,21 +175,25 @@ func (c *bridgeClient) Synthesize(ctx context.Context, job synthJob) (string, er
 		}
 	}
 	priority := normalizeSynthesisPriority(job.Priority)
+	data := map[string]any{
+		"job_id":             job.ID,
+		"text":               job.Text,
+		"reader_id":          job.ReaderID,
+		"language":           job.Language,
+		"timezone":           job.Timezone,
+		"output_path":        job.OutputPath,
+		"target_sample_rate": job.TargetSampleRate,
+		"target_channels":    job.TargetChannels,
+		"priority":           priority,
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		data["deadline_at"] = deadline.UTC().Format(time.RFC3339Nano)
+	}
 	if err := c.Publish(map[string]any{
 		"type":    "tts.synthesize",
 		"source":  serviceID,
 		"subject": job.ID,
-		"data": map[string]any{
-			"job_id":             job.ID,
-			"text":               job.Text,
-			"reader_id":          job.ReaderID,
-			"language":           job.Language,
-			"timezone":           job.Timezone,
-			"output_path":        job.OutputPath,
-			"target_sample_rate": job.TargetSampleRate,
-			"target_channels":    job.TargetChannels,
-			"priority":           priority,
-		},
+		"data":    data,
 	}); err != nil {
 		return "", err
 	}

@@ -484,6 +484,7 @@ func (p *feedPlanner) nextPlannedItem(ctx context.Context, now time.Time) (playl
 		return item, true
 	}
 	pkgID := p.nextRoutinePackage()
+	failures := make([]string, 0, len(p.cfg.Root.Playout.PlaylistOrder))
 	for attempts := 0; pkgID != "" && attempts < len(p.cfg.Root.Playout.PlaylistOrder); attempts++ {
 		item, err := p.buildProduct(ctx, pkgID, "routine", "", timelineEnd, now)
 		if err == nil {
@@ -503,10 +504,15 @@ func (p *feedPlanner) nextPlannedItem(ctx context.Context, now time.Time) (playl
 			return item, true
 		}
 		p.lastError = err.Error()
+		failures = append(failures, fmt.Sprintf("%s: %v", pkgID, err))
 		pkgID = p.nextRoutinePackage()
 	}
 	p.nextRoutineRetryAt = now.Add(routineRetryDelay)
-	p.lastError = fmt.Sprintf("routine products unavailable; retrying at %s", p.nextRoutineRetryAt.UTC().Format(time.RFC3339))
+	detail := strings.Join(failures, "; ")
+	if detail == "" {
+		detail = "no routine package could be selected"
+	}
+	p.lastError = fmt.Sprintf("routine products unavailable (%s); retrying at %s", detail, p.nextRoutineRetryAt.UTC().Format(time.RFC3339))
 	return playlistItem{}, false
 }
 
@@ -695,8 +701,15 @@ func (p *feedPlanner) buildProduct(ctx context.Context, pkgID string, source str
 			return cached, nil
 		}
 	}
-	if item, ok, err := p.buildSegmentedProductItem(ctx, product, pkgID, source, targetRaw, timelineEnd, now, queueID); ok || err != nil {
-		return item, err
+	if item, ok, segmentErr := p.buildSegmentedProductItem(ctx, product, pkgID, source, targetRaw, timelineEnd, now, queueID); ok || segmentErr != nil {
+		if segmentErr == nil {
+			return item, nil
+		}
+		if cached, cachedOK := p.cachedProductItem(pkgID, product, source, targetRaw, timelineEnd, now, p.cacheFallbackMaxAge(source)); cachedOK {
+			p.lastError = fmt.Sprintf("using cached %s audio after segmented synthesis failed: %v", pkgID, segmentErr)
+			return cached, nil
+		}
+		return playlistItem{}, segmentErr
 	}
 	if strings.TrimSpace(product.Text) == "" {
 		return playlistItem{}, fmt.Errorf("product %s rendered empty text", pkgID)
@@ -857,6 +870,9 @@ func latestCachedProductAudioPath(dir string, entries []os.DirEntry, prefix stri
 		if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(strings.ToLower(name), ".wav") {
 			continue
 		}
+		if isProductSegmentScratchName(name) {
+			continue
+		}
 		info, err := entry.Info()
 		if err != nil {
 			continue
@@ -871,6 +887,31 @@ func latestCachedProductAudioPath(dir string, entries []os.DirEntry, prefix stri
 		}
 	}
 	return bestPath
+}
+
+func isProductSegmentScratchName(name string) bool {
+	base := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(name)), ".wav")
+	for _, marker := range []string{"-text-", "-audio-"} {
+		index := strings.LastIndex(base, marker)
+		if index < 0 {
+			continue
+		}
+		suffix := base[index+len(marker):]
+		if len(suffix) < 2 {
+			continue
+		}
+		digits := true
+		for _, char := range suffix {
+			if char < '0' || char > '9' {
+				digits = false
+				break
+			}
+		}
+		if digits {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *feedPlanner) renderProductForBuild(ctx context.Context, queueID string, pkgID string, source string, language string, now time.Time) (renderedProduct, error) {

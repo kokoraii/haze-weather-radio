@@ -36,6 +36,8 @@ const (
 	synthesisLowQueueSize    = 16
 	synthesisCacheMaxEntries = 256
 	synthesisCacheMaxIdle    = 30 * time.Minute
+	defaultSynthesisWorkers  = 4
+	primaryAttemptWithBackup = 30 * time.Second
 )
 
 var errSystemShutdown = errors.New("system shutdown requested")
@@ -77,6 +79,7 @@ func run() error {
 	cacheMaxBytes := flag.Int64("cache-max-bytes", 0, "maximum persistent synthesis cache size in bytes; 0 is unlimited")
 	cacheMaxEntries := flag.Int("cache-max-entries", synthesisCacheMaxEntries, "maximum persistent synthesis cache entries; 0 is unlimited")
 	timeout := flag.Duration("timeout", 60*time.Second, "synthesis timeout")
+	workers := flag.Int("workers", envIntOrDefault("HAZE_TTS_WORKERS", defaultSynthesisWorkers), "maximum concurrent synthesis jobs")
 	flag.Parse()
 	setTTSRuntimeEnv(ttsRuntimeEnv{
 		PiperVoicesDir:        *piperVoicesDir,
@@ -104,7 +107,7 @@ func run() error {
 			CacheMaxBytes:   *cacheMaxBytes,
 			CacheMaxEntries: *cacheMaxEntries,
 			Timeout:         *timeout,
-			Workers:         1,
+			Workers:         maxInt(1, *workers),
 			SpeakyAPIURL:    *speakyAPIURL,
 			RuntimeIdle:     *runtimeIdleTimeout,
 		})
@@ -771,8 +774,16 @@ func handleSynthesisJob(ctx context.Context, conn net.Conn, state *serviceState,
 		return
 	}
 
-	jobCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
+	jobCtx, cancel, err := synthesisJobContext(ctx, cfg.Timeout, firstText(message, data, "deadline_at", "expires_at"))
+	if err != nil {
+		state.publishTTSError(conn, jobID, err.Error())
+		return
+	}
 	defer cancel()
+	if err := jobCtx.Err(); err != nil {
+		state.publishTTSError(conn, jobID, "synthesis request expired before processing")
+		return
+	}
 	reader, hasReader, err := state.serviceReader(firstText(message, data, "reader_id"), firstText(message, data, "language"))
 	if err != nil {
 		state.publishTTSError(conn, jobID, err.Error())
@@ -848,9 +859,13 @@ func handleSynthesisJob(ctx context.Context, conn net.Conn, state *serviceState,
 		}
 	}
 
-	audio, provider, err := synthesizeWithProvider(jobCtx, state.providers, providerID, request)
+	audio, provider, activeVoiceID, backupUsed, err := synthesizeWithReaderBackup(jobCtx, state.providers, providerID, request, reader.Backup)
 	if err != nil {
 		state.publishTTSError(conn, jobID, err.Error())
+		return
+	}
+	if err := jobCtx.Err(); err != nil {
+		state.publishTTSError(conn, jobID, "synthesis request expired before completion")
 		return
 	}
 	if audio.Format != tts.FormatWAV && audio.Format != tts.FormatPCM16LE {
@@ -860,6 +875,10 @@ func handleSynthesisJob(ctx context.Context, conn net.Conn, state *serviceState,
 	audio, err = tts.NormalizeAudio(audio, targetSampleRate, targetChannels)
 	if err != nil {
 		state.publishTTSError(conn, jobID, err.Error())
+		return
+	}
+	if err := jobCtx.Err(); err != nil {
+		state.publishTTSError(conn, jobID, "synthesis request expired before output was written")
 		return
 	}
 	if err := writeFileAtomic(outputPath, audio.Data, 0o644); err != nil {
@@ -874,29 +893,53 @@ func handleSynthesisJob(ctx context.Context, conn net.Conn, state *serviceState,
 		Bytes:      int64(len(audio.Data)),
 		ProviderID: provider.ID(),
 		ReaderID:   reader.ID,
-		VoiceID:    voiceID,
+		VoiceID:    activeVoiceID,
 		Language:   language,
 		LastUsed:   time.Now(),
 	}
-	if persisted, persistErr := state.persistSynthesis(cacheKey, cacheEntry, audio.Data); persistErr != nil {
-		log.Printf("synthesis cache write failed: %v", persistErr)
-	} else {
-		cacheEntry = persisted
+	if !backupUsed {
+		if persisted, persistErr := state.persistSynthesis(cacheKey, cacheEntry, audio.Data); persistErr != nil {
+			log.Printf("synthesis cache write failed: %v", persistErr)
+		} else {
+			cacheEntry = persisted
+		}
+		state.storeSynthesis(cacheKey, cacheEntry)
 	}
-	state.storeSynthesis(cacheKey, cacheEntry)
 	_ = state.publishServiceEvent(conn, "tts.synthesized", jobID, map[string]any{
-		"job_id":      jobID,
-		"output_path": outputPath,
-		"bytes":       len(audio.Data),
-		"format":      audio.Format,
-		"sample_rate": audio.SampleRate,
-		"channels":    audio.Channels,
-		"provider":    provider.ID(),
-		"reader_id":   reader.ID,
-		"voice_id":    voiceID,
-		"language":    language,
-		"cache_hit":   false,
+		"job_id":             jobID,
+		"output_path":        outputPath,
+		"bytes":              len(audio.Data),
+		"format":             audio.Format,
+		"sample_rate":        audio.SampleRate,
+		"channels":           audio.Channels,
+		"provider":           provider.ID(),
+		"reader_id":          reader.ID,
+		"voice_id":           activeVoiceID,
+		"language":           language,
+		"cache_hit":          false,
+		"backup_used":        backupUsed,
+		"requested_provider": providerID,
 	})
+}
+
+func synthesisJobContext(parent context.Context, timeout time.Duration, deadlineRaw string) (context.Context, context.CancelFunc, error) {
+	deadlineRaw = strings.TrimSpace(deadlineRaw)
+	if deadlineRaw == "" {
+		ctx, cancel := context.WithTimeout(parent, timeout)
+		return ctx, cancel, nil
+	}
+	deadline, err := time.Parse(time.RFC3339Nano, deadlineRaw)
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid synthesis deadline %q", deadlineRaw)
+	}
+	if timeout > 0 {
+		serviceDeadline := time.Now().Add(timeout)
+		if serviceDeadline.Before(deadline) {
+			deadline = serviceDeadline
+		}
+	}
+	ctx, cancel := context.WithDeadline(parent, deadline)
+	return ctx, cancel, nil
 }
 
 func serviceReader(path string, readerID string, language string) (tts.Reader, bool, error) {
@@ -1250,6 +1293,60 @@ func synthesizeWithProvider(ctx context.Context, providers map[string]tts.Provid
 		failures = append(failures, fmt.Errorf("%s: %w", provider.ID(), err))
 	}
 	return tts.Audio{}, nil, errors.Join(failures...)
+}
+
+func synthesizeWithReaderBackup(ctx context.Context, providers map[string]tts.Provider, providerID string, req tts.Request, backup *tts.ReaderBackup) (tts.Audio, tts.Provider, string, bool, error) {
+	return synthesizeWithReaderBackupLimit(ctx, providers, providerID, req, backup, primaryAttemptWithBackup)
+}
+
+func synthesizeWithReaderBackupLimit(ctx context.Context, providers map[string]tts.Provider, providerID string, req tts.Request, backup *tts.ReaderBackup, primaryLimit time.Duration) (tts.Audio, tts.Provider, string, bool, error) {
+	primaryCtx := ctx
+	primaryCancel := func() {}
+	if backup != nil {
+		primaryCtx, primaryCancel = context.WithTimeout(ctx, primaryAttemptBudget(ctx, primaryLimit))
+	}
+	audio, provider, primaryErr := synthesizeWithProvider(primaryCtx, providers, providerID, req)
+	primaryCancel()
+	if primaryErr == nil {
+		return audio, provider, req.VoiceID, false, nil
+	}
+	if backup == nil || ctx.Err() != nil {
+		return tts.Audio{}, nil, "", false, primaryErr
+	}
+	backupProviderID := tts.NormalizeProvider(backup.Provider)
+	backupVoiceID := strings.TrimSpace(backup.VoiceID)
+	if backupProviderID == tts.NormalizeProvider(providerID) && backupVoiceID == strings.TrimSpace(req.VoiceID) {
+		return tts.Audio{}, nil, "", false, primaryErr
+	}
+	backupRequest := req
+	backupRequest.VoiceID = backupVoiceID
+	audio, provider, backupErr := synthesizeWithProvider(ctx, providers, backupProviderID, backupRequest)
+	if backupErr != nil {
+		return tts.Audio{}, nil, "", false, errors.Join(
+			fmt.Errorf("primary %s: %w", providerID, primaryErr),
+			fmt.Errorf("backup %s: %w", backupProviderID, backupErr),
+		)
+	}
+	return audio, provider, backupVoiceID, true, nil
+}
+
+func primaryAttemptBudget(ctx context.Context, primaryLimit time.Duration) time.Duration {
+	if primaryLimit <= 0 {
+		primaryLimit = primaryAttemptWithBackup
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return primaryLimit
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return time.Nanosecond
+	}
+	halfRemaining := remaining / 2
+	if halfRemaining > 0 && halfRemaining < primaryLimit {
+		return halfRemaining
+	}
+	return primaryLimit
 }
 
 func providerCandidates(providers map[string]tts.Provider, providerID string) ([]tts.Provider, error) {

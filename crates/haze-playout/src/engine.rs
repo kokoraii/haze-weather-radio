@@ -13,7 +13,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::task::JoinHandle;
 use tokio::time::{interval, Instant, MissedTickBehavior};
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::bridge::{self, BridgeClient, ProductRenderRequest, RenderedProduct, SynthJob};
 use crate::config::{display_text, resolve_path, FeedConfig, LoadedConfig};
@@ -584,6 +587,60 @@ enum ConnectedOutcome {
     Shutdown,
 }
 
+#[derive(Clone)]
+struct SessionTasks {
+    cancellation: CancellationToken,
+    tracker: TaskTracker,
+}
+
+impl SessionTasks {
+    fn new() -> Self {
+        Self {
+            cancellation: CancellationToken::new(),
+            tracker: TaskTracker::new(),
+        }
+    }
+
+    fn spawn<F>(&self, task: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let cancellation = self.cancellation.clone();
+        self.tracker.spawn(async move {
+            tokio::select! {
+                _ = cancellation.cancelled() => {}
+                _ = task => {}
+            }
+        });
+    }
+
+    fn spawn_cooperative<F>(&self, task: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.tracker.spawn(task);
+    }
+
+    fn track_abortable(&self, mut task: JoinHandle<()>) {
+        let cancellation = self.cancellation.clone();
+        self.tracker.spawn(async move {
+            tokio::select! {
+                _ = cancellation.cancelled() => {
+                    task.abort();
+                    let _ = task.await;
+                }
+                _ = &mut task => {}
+            }
+        });
+    }
+
+    async fn shutdown(&self) {
+        self.cancellation.cancel();
+        self.tracker.close();
+        self.tracker.wait().await;
+    }
+}
+
 pub(crate) async fn run(options: Options) -> Result<()> {
     if options.bridge_addr.trim().is_empty() {
         anyhow::bail!("missing host event bridge address");
@@ -597,15 +654,7 @@ pub(crate) async fn run(options: Options) -> Result<()> {
         } else {
             options.media_bridge_addr.trim()
         };
-        match run_connected(
-            Arc::clone(&cfg),
-            connection.client,
-            connection.events,
-            media_bridge_addr,
-            &options,
-        )
-        .await
-        {
+        match run_connected(Arc::clone(&cfg), connection, media_bridge_addr, &options).await {
             ConnectedOutcome::Shutdown => return Ok(()),
             ConnectedOutcome::Reconnect => {
                 tracing::warn!("host event bridge disconnected; reconnecting playout service");
@@ -616,14 +665,20 @@ pub(crate) async fn run(options: Options) -> Result<()> {
 
 async fn run_connected(
     cfg: Arc<LoadedConfig>,
-    client: BridgeClient,
-    mut events: mpsc::Receiver<Value>,
+    connection: bridge::BridgeConnection,
     media_bridge_addr: &str,
     options: &Options,
 ) -> ConnectedOutcome {
+    let bridge::BridgeConnection {
+        client,
+        mut events,
+        reader_task,
+    } = connection;
     let mut handles = HashMap::<String, FeedHandle>::new();
     let audio_cache = Arc::new(AudioCache::default());
-    let audio_cache_maintenance = spawn_audio_cache_maintenance(&audio_cache);
+    let session_tasks = SessionTasks::new();
+    session_tasks.track_abortable(reader_task);
+    spawn_audio_cache_maintenance(&session_tasks, &audio_cache);
     for feed in cfg.enabled_feeds().cloned() {
         let media_client = match bridge::connect_publish_only_retry(media_bridge_addr).await {
             Ok(client) => client,
@@ -632,7 +687,7 @@ async fn run_connected(
                     feed_id = feed.id,
                     "failed to connect feed media bridge publisher: {err}"
                 );
-                audio_cache_maintenance.abort();
+                session_tasks.shutdown().await;
                 return ConnectedOutcome::Reconnect;
             }
         };
@@ -643,25 +698,29 @@ async fn run_connected(
             feed,
             options.alert_poll,
             Arc::clone(&audio_cache),
+            &session_tasks,
         );
         handles.insert(handle.feed.id.clone(), handle);
     }
     client.service_ready(handles.len()).await;
 
-    while let Some(event) = events.recv().await {
+    let outcome = loop {
+        let Some(event) = events.recv().await else {
+            break ConnectedOutcome::Reconnect;
+        };
         if bridge::string_at(&event, "type") == "system.shutdown" {
-            audio_cache_maintenance.abort();
-            return ConnectedOutcome::Shutdown;
+            break ConnectedOutcome::Shutdown;
         }
-        dispatch_event(&cfg, &audio_cache, &handles, event).await;
-    }
-    audio_cache_maintenance.abort();
-    ConnectedOutcome::Reconnect
+        dispatch_event(&cfg, &audio_cache, &handles, &session_tasks, event).await;
+    };
+    drop(handles);
+    session_tasks.shutdown().await;
+    outcome
 }
 
-fn spawn_audio_cache_maintenance(audio_cache: &Arc<AudioCache>) -> tokio::task::JoinHandle<()> {
+fn spawn_audio_cache_maintenance(tasks: &SessionTasks, audio_cache: &Arc<AudioCache>) {
     let cache = Arc::downgrade(audio_cache);
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         let mut ticker = interval(AUDIO_CACHE_PRUNE_INTERVAL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
@@ -671,13 +730,14 @@ fn spawn_audio_cache_maintenance(audio_cache: &Arc<AudioCache>) -> tokio::task::
             };
             cache.prune_idle().await;
         }
-    })
+    });
 }
 
 async fn dispatch_event(
     cfg: &Arc<LoadedConfig>,
     audio_cache: &Arc<AudioCache>,
     handles: &HashMap<String, FeedHandle>,
+    tasks: &SessionTasks,
     event: Value,
 ) {
     match bridge::string_at(&event, "type") {
@@ -725,7 +785,7 @@ async fn dispatch_event(
             let audio_cache = Arc::clone(audio_cache);
             let data = data.clone();
             let feed_id = feed_id.to_string();
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 match audio_item_from_ready(&cfg, &audio_cache, &handle.feed, data).await {
                     Ok(item) => {
                         permit.send(item);
@@ -1551,6 +1611,7 @@ impl FeedHandle {
         feed: FeedConfig,
         alert_poll: Duration,
         audio_cache: Arc<AudioCache>,
+        tasks: &SessionTasks,
     ) -> Self {
         let (audio_tx, audio_rx) = mpsc::channel(ROUTINE_AUDIO_QUEUE_CAPACITY);
         let (priority_tx, priority_rx) = mpsc::channel(PRIORITY_AUDIO_QUEUE_CAPACITY);
@@ -1564,7 +1625,7 @@ impl FeedHandle {
         let (segment_group_revision_tx, segment_group_revision_rx) =
             mpsc::channel(SEGMENT_GROUP_REVISION_QUEUE_CAPACITY);
 
-        tokio::spawn(package_builder(
+        tasks.spawn(package_builder(
             Arc::clone(&cfg),
             client.clone(),
             feed.clone(),
@@ -1572,14 +1633,14 @@ impl FeedHandle {
             request_rx,
             audio_tx.clone(),
         ));
-        tokio::spawn(priority_builder(
+        tasks.spawn(priority_builder(
             Arc::clone(&cfg),
             feed.clone(),
             Arc::clone(&audio_cache),
             priority_prepare_rx,
             priority_tx.clone(),
         ));
-        tokio::spawn(segment_group_builder(
+        tasks.spawn(segment_group_builder(
             Arc::clone(&cfg),
             Arc::clone(&audio_cache),
             Arc::clone(&segment_group_mailbox),
@@ -1588,7 +1649,7 @@ impl FeedHandle {
         ));
 
         if feed.same_enabled() {
-            tokio::spawn(alert_scanner(
+            tasks.spawn(alert_scanner(
                 Arc::clone(&cfg),
                 client.clone(),
                 feed.clone(),
@@ -1607,7 +1668,7 @@ impl FeedHandle {
             }
         }
 
-        tokio::spawn(
+        tasks.spawn_cooperative(
             FeedRunner {
                 cfg,
                 client,
@@ -1622,8 +1683,9 @@ impl FeedHandle {
                 sinks: Vec::new(),
                 after_current_action: None,
                 paused: false,
+                tasks: tasks.clone(),
             }
-            .run(),
+            .run(tasks.cancellation.clone()),
         );
 
         Self {
@@ -1653,19 +1715,29 @@ struct FeedRunner {
     sinks: Vec<Box<dyn Sink>>,
     after_current_action: Option<AfterCurrentAction>,
     paused: bool,
+    tasks: SessionTasks,
 }
 
 impl FeedRunner {
-    async fn run(mut self) {
+    async fn run(mut self, cancellation: CancellationToken) {
         self.sinks = sinks_for_feed(&self.cfg, &self.feed);
         let pcm_publisher = spawn_pcm_publisher(
+            &self.tasks,
             self.media_client.clone(),
             self.feed.id.clone(),
             self.cfg.root.playout.sample_rate,
             self.cfg.root.playout.channels,
         );
-        update_runtime(&self.cfg, &self.feed.id, "Idle").await;
-        self.pump(pcm_publisher).await;
+        let ready = tokio::select! {
+            _ = cancellation.cancelled() => false,
+            _ = update_runtime(&self.cfg, &self.feed.id, "Idle") => true,
+        };
+        if ready {
+            tokio::select! {
+                _ = cancellation.cancelled() => {}
+                _ = self.pump(pcm_publisher) => {}
+            }
+        }
         for sink in &mut self.sinks {
             if let Err(err) = sink.close() {
                 tracing::warn!(
@@ -1781,6 +1853,7 @@ impl FeedRunner {
                         BreakInCommand::Start { id, title } => {
                             if let Some(done) = live_breakin.take() {
                                 spawn_complete_live_breakin(
+                                    &self.tasks,
                                     self.client.clone(),
                                     Arc::clone(&self.cfg),
                                     self.feed.id.clone(),
@@ -1791,6 +1864,7 @@ impl FeedRunner {
                             if let Some(item) = current.take() {
                                 if item.is_alert() {
                                     spawn_interrupt_item(
+                                        &self.tasks,
                                         self.client.clone(),
                                         self.feed.id.clone(),
                                         item.clone(),
@@ -1799,6 +1873,7 @@ impl FeedRunner {
                                     interrupted_priority = Some(item);
                                 } else {
                                     spawn_interrupt_item(
+                                        &self.tasks,
                                         self.client.clone(),
                                         self.feed.id.clone(),
                                         item.clone(),
@@ -1868,6 +1943,7 @@ impl FeedRunner {
                             if live_breakin.as_ref().is_some_and(|live| live.id == id) {
                                 if let Some(done) = live_breakin.take() {
                                     spawn_complete_live_breakin(
+                                        &self.tasks,
                                         self.client.clone(),
                                         Arc::clone(&self.cfg),
                                         self.feed.id.clone(),
@@ -1923,6 +1999,7 @@ impl FeedRunner {
                             active_routine_ids.remove(&item.id);
                             segment_groups.remove(&item.id);
                             spawn_interrupt_item(
+                                &self.tasks,
                                 self.client.clone(),
                                 self.feed.id.clone(),
                                 item,
@@ -1930,6 +2007,7 @@ impl FeedRunner {
                             position = 0;
                             gap_until = tick_now;
                             spawn_update_runtime(
+                                &self.tasks,
                                 Arc::clone(&self.cfg),
                                 self.feed.id.clone(),
                                 "Idle".to_string(),
@@ -1939,6 +2017,7 @@ impl FeedRunner {
                             active_routine_ids.remove(&item.id);
                             segment_groups.remove(&item.id);
                             spawn_interrupt_item(
+                                &self.tasks,
                                 self.client.clone(),
                                 self.feed.id.clone(),
                                 item,
@@ -1952,6 +2031,7 @@ impl FeedRunner {
                         );
                         if let Some(done) = take_finished_breakin(&mut live_breakin) {
                             spawn_complete_live_breakin(
+                                &self.tasks,
                                 self.client.clone(),
                                 Arc::clone(&self.cfg),
                                 self.feed.id.clone(),
@@ -1965,7 +2045,12 @@ impl FeedRunner {
                             &mut active_priority_ids,
                             &self.feed.id,
                         ) {
-                            spawn_accept_item(self.client.clone(), self.feed.id.clone(), item.clone());
+                            spawn_accept_item(
+                                &self.tasks,
+                                self.client.clone(),
+                                self.feed.id.clone(),
+                                item.clone(),
+                            );
                         }
                         let priority_ready =
                             interrupted_priority.is_some() || !priority_pending.is_empty();
@@ -1974,6 +2059,7 @@ impl FeedRunner {
                         {
                             if let Some(item) = current.take() {
                                 spawn_interrupt_item(
+                                    &self.tasks,
                                     self.client.clone(),
                                     self.feed.id.clone(),
                                     item.clone(),
@@ -2020,7 +2106,12 @@ impl FeedRunner {
                                     &mut segment_groups,
                                     &self.feed.id,
                                 ) {
-                                    spawn_accept_item(self.client.clone(), self.feed.id.clone(), item.clone());
+                                    spawn_accept_item(
+                                        &self.tasks,
+                                        self.client.clone(),
+                                        self.feed.id.clone(),
+                                        item.clone(),
+                                    );
                                     pending = Some(item);
                                 }
                             }
@@ -2039,6 +2130,7 @@ impl FeedRunner {
                                     if let Some(item) = current.as_ref() {
                                         position = 0;
                                         spawn_start_item(
+                                            &self.tasks,
                                             self.client.clone(),
                                             Arc::clone(&self.cfg),
                                             self.feed.id.clone(),
@@ -2119,6 +2211,7 @@ impl FeedRunner {
                         }
                         if let Some(done) = completed_breakin {
                             spawn_complete_live_breakin(
+                                &self.tasks,
                                 self.client.clone(),
                                 Arc::clone(&self.cfg),
                                 self.feed.id.clone(),
@@ -2143,6 +2236,7 @@ impl FeedRunner {
                                 active_routine_ids.remove(&item.id);
                                 segment_groups.remove(&item.id);
                                 spawn_interrupt_item(
+                                    &self.tasks,
                                     self.client.clone(),
                                     self.feed.id.clone(),
                                     item,
@@ -2150,6 +2244,7 @@ impl FeedRunner {
                                 position = 0;
                                 gap_until = tick_now;
                                 spawn_update_runtime(
+                                    &self.tasks,
                                     Arc::clone(&self.cfg),
                                     self.feed.id.clone(),
                                     "Idle".to_string(),
@@ -2172,9 +2267,15 @@ impl FeedRunner {
                                     );
                                 }
                                 let gap_after = item.gap_after;
-                                spawn_finish_item(self.client.clone(), self.feed.id.clone(), item);
+                                spawn_finish_item(
+                                    &self.tasks,
+                                    self.client.clone(),
+                                    self.feed.id.clone(),
+                                    item,
+                                );
                                 gap_until = tick_now + gap_after;
                                 spawn_update_runtime(
+                                    &self.tasks,
                                     Arc::clone(&self.cfg),
                                     self.feed.id.clone(),
                                     "Idle".to_string(),
@@ -2432,49 +2533,61 @@ fn remember_completed_routine_item(
     }
 }
 
-fn spawn_accept_item(client: BridgeClient, feed_id: String, item: AudioItem) {
-    tokio::spawn(async move {
+fn spawn_accept_item(tasks: &SessionTasks, client: BridgeClient, feed_id: String, item: AudioItem) {
+    tasks.spawn(async move {
         accept_item(&client, &feed_id, &item).await;
     });
 }
 
 fn spawn_start_item(
+    tasks: &SessionTasks,
     client: BridgeClient,
     cfg: Arc<LoadedConfig>,
     feed_id: String,
     item: AudioItem,
 ) {
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         start_item(&client, &cfg, &feed_id, &item).await;
     });
 }
 
-fn spawn_finish_item(client: BridgeClient, feed_id: String, item: AudioItem) {
-    tokio::spawn(async move {
+fn spawn_finish_item(tasks: &SessionTasks, client: BridgeClient, feed_id: String, item: AudioItem) {
+    tasks.spawn(async move {
         finish_item(&client, &feed_id, &item).await;
     });
 }
 
-fn spawn_interrupt_item(client: BridgeClient, feed_id: String, item: AudioItem) {
-    tokio::spawn(async move {
+fn spawn_interrupt_item(
+    tasks: &SessionTasks,
+    client: BridgeClient,
+    feed_id: String,
+    item: AudioItem,
+) {
+    tasks.spawn(async move {
         interrupt_item(&client, &feed_id, &item).await;
     });
 }
 
 fn spawn_complete_live_breakin(
+    tasks: &SessionTasks,
     client: BridgeClient,
     cfg: Arc<LoadedConfig>,
     feed_id: String,
     live: LiveBreakIn,
     cancelled: bool,
 ) {
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         complete_live_breakin(&client, &cfg, &feed_id, &live, cancelled).await;
     });
 }
 
-fn spawn_update_runtime(cfg: Arc<LoadedConfig>, feed_id: String, now_playing: String) {
-    tokio::spawn(async move {
+fn spawn_update_runtime(
+    tasks: &SessionTasks,
+    cfg: Arc<LoadedConfig>,
+    feed_id: String,
+    now_playing: String,
+) {
+    tasks.spawn(async move {
         update_runtime(&cfg, &feed_id, &now_playing).await;
     });
 }
@@ -2920,6 +3033,7 @@ async fn write_runtime_payload(
 }
 
 fn spawn_pcm_publisher(
+    tasks: &SessionTasks,
     client: BridgeClient,
     feed_id: String,
     sample_rate: u32,
@@ -2927,7 +3041,7 @@ fn spawn_pcm_publisher(
 ) -> PcmPublisher {
     let (tx, mut rx) = mpsc::channel::<PcmPublish>(pcm_publish_queue_capacity());
     let (recycle_tx, recycled) = mpsc::channel::<Vec<u8>>(pcm_publish_queue_capacity() + 2);
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         let mut delivery_state = PcmDeliveryState::default();
         while let Some(mut chunk) = rx.recv().await {
             delivery_state.prepare(&mut chunk);
@@ -4614,6 +4728,51 @@ fn safe_id(value: &str) -> String {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct DropSignal(Option<oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn session_shutdown_cancels_and_awaits_tracked_tasks() {
+        let tasks = SessionTasks::new();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        tasks.spawn(async move {
+            let _drop_signal = DropSignal(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+
+        started_rx.await.expect("tracked task started");
+        tasks.shutdown().await;
+
+        dropped_rx.await.expect("tracked task was cancelled");
+    }
+
+    #[tokio::test]
+    async fn session_shutdown_aborts_and_awaits_owned_join_handles() {
+        let tasks = SessionTasks::new();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _drop_signal = DropSignal(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        tasks.track_abortable(task);
+
+        started_rx.await.expect("owned task started");
+        tasks.shutdown().await;
+
+        dropped_rx.await.expect("owned task was aborted");
+    }
 
     #[test]
     fn alert_pending_accepts_empty_and_pending_only() {

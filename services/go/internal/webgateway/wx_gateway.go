@@ -430,6 +430,14 @@ func loadReaderCatalog(configPath string) ([]map[string]any, error) {
 	}
 	out := make([]map[string]any, 0, len(readers))
 	for _, reader := range readers {
+		backupProvider := ""
+		backupVoiceID := ""
+		backupReaderID := ""
+		if reader.Backup != nil {
+			backupProvider = reader.Backup.Provider
+			backupVoiceID = reader.Backup.VoiceID
+			backupReaderID = reader.Backup.ReaderID
+		}
 		labelParts := []string{reader.ID}
 		for _, part := range []string{reader.Provider, reader.Gender, reader.Language, reader.VoiceID} {
 			if strings.TrimSpace(part) != "" {
@@ -437,12 +445,16 @@ func loadReaderCatalog(configPath string) ([]map[string]any, error) {
 			}
 		}
 		out = append(out, map[string]any{
-			"id":       reader.ID,
-			"provider": reader.Provider,
-			"gender":   reader.Gender,
-			"language": reader.Language,
-			"voice_id": reader.VoiceID,
-			"label":    strings.Join(labelParts, " · "),
+			"id":                reader.ID,
+			"provider":          reader.Provider,
+			"gender":            reader.Gender,
+			"language":          reader.Language,
+			"voice_id":          reader.VoiceID,
+			"backup_reader_id":  backupReaderID,
+			"backup_provider":   backupProvider,
+			"backup_voice_id":   backupVoiceID,
+			"backup_reader_ids": append([]string(nil), reader.BackupFor...),
+			"label":             strings.Join(labelParts, " · "),
 		})
 	}
 	sort.SliceStable(out, func(i, j int) bool {

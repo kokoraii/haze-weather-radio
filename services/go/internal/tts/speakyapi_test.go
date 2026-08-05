@@ -6,7 +6,25 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
+
+func TestSpeakyAPIProviderUsesBoundedHTTPTransport(t *testing.T) {
+	provider := NewSpeakyAPIProvider("http://127.0.0.1:5000")
+	if provider.Client == nil {
+		t.Fatal("SpeakyAPI HTTP client is nil")
+	}
+	if provider.Client.Timeout != 60*time.Second {
+		t.Fatalf("HTTP timeout = %s", provider.Client.Timeout)
+	}
+	transport, ok := provider.Client.Transport.(*http.Transport)
+	if !ok || transport.DialContext == nil {
+		t.Fatalf("SpeakyAPI transport = %#v", provider.Client.Transport)
+	}
+	if speakyAPIConnectTimeout > 5*time.Second {
+		t.Fatalf("connect timeout = %s, want no more than 5s", speakyAPIConnectTimeout)
+	}
+}
 
 func TestSpeakyAPIProviderListVoices(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

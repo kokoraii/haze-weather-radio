@@ -30,11 +30,18 @@ type ttsReadersXML struct {
 }
 
 type ttsReaderXML struct {
-	ID       string `xml:"id,attr"`
-	Provider string `xml:"provider,attr"`
-	Gender   string `xml:"gender"`
-	Language string `xml:"language"`
-	VoiceID  string `xml:"voice_id,omitempty"`
+	ID       string              `xml:"id,attr"`
+	Provider string              `xml:"provider,attr"`
+	Gender   string              `xml:"gender"`
+	Language string              `xml:"language"`
+	VoiceID  string              `xml:"voice_id,omitempty"`
+	Backup   *ttsReaderBackupXML `xml:"backup,omitempty"`
+}
+
+type ttsReaderBackupXML struct {
+	Provider string   `xml:"provider,attr,omitempty"`
+	VoiceID  string   `xml:"voice_id,omitempty"`
+	Readers  []string `xml:"reader,omitempty"`
 }
 
 func loadTTSPayload(configPath string) (map[string]any, error) {
@@ -221,29 +228,41 @@ func writeTTSReadersXML(path string, items []ttsReaderXML) error {
 func normalizeTTSReaders(items []ttsReaderXML) ([]ttsReaderXML, error) {
 	out := make([]ttsReaderXML, 0, len(items))
 	seen := map[string]struct{}{}
+	indexes := make(map[string]int, len(items))
 	for _, item := range items {
-		item.ID = cleanReaderID(item.ID)
-		if item.ID == "" {
-			return nil, fmt.Errorf("reader id is required")
+		var err error
+		item, err = normalizeTTSReaderFields(item)
+		if err != nil {
+			return nil, err
 		}
 		if _, ok := seen[item.ID]; ok {
 			return nil, fmt.Errorf("duplicate reader id %q", item.ID)
 		}
 		seen[item.ID] = struct{}{}
-		item.Provider = tts.NormalizeProvider(item.Provider)
-		if item.Provider == "" {
-			item.Provider = "auto"
-		}
-		item.Gender = strings.ToLower(strings.TrimSpace(item.Gender))
-		if item.Gender != "female" {
-			item.Gender = "male"
-		}
-		item.Language = tts.NormalizeLanguage(item.Language)
-		if item.Language == "" {
-			item.Language = "en-us"
-		}
-		item.VoiceID = strings.TrimSpace(item.VoiceID)
+		indexes[item.ID] = len(out)
 		out = append(out, item)
+	}
+	backupsByTarget := make(map[string]string)
+	for _, item := range out {
+		if item.Backup == nil || len(item.Backup.Readers) == 0 {
+			continue
+		}
+		for _, targetID := range item.Backup.Readers {
+			if targetID == item.ID {
+				return nil, fmt.Errorf("reader %q cannot back up itself", item.ID)
+			}
+			if _, ok := seen[targetID]; !ok {
+				return nil, fmt.Errorf("reader %q backs up unknown reader %q", item.ID, targetID)
+			}
+			target := out[indexes[targetID]]
+			if target.Backup != nil && len(target.Backup.Readers) == 0 {
+				return nil, fmt.Errorf("reader %q has both inline and reader-declared backups", targetID)
+			}
+			if existing, ok := backupsByTarget[targetID]; ok && existing != item.ID {
+				return nil, fmt.Errorf("reader %q is backed up by both %q and %q", targetID, existing, item.ID)
+			}
+			backupsByTarget[targetID] = item.ID
+		}
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		return naturalReaderSortKey(out[i].ID) < naturalReaderSortKey(out[j].ID)
@@ -251,26 +270,111 @@ func normalizeTTSReaders(items []ttsReaderXML) ([]ttsReaderXML, error) {
 	return out, nil
 }
 
+func normalizeTTSReaderFields(item ttsReaderXML) (ttsReaderXML, error) {
+	item.ID = cleanReaderID(item.ID)
+	if item.ID == "" {
+		return ttsReaderXML{}, fmt.Errorf("reader id is required")
+	}
+	item.Provider = tts.NormalizeProvider(item.Provider)
+	if item.Provider == "" {
+		item.Provider = "auto"
+	}
+	item.Gender = strings.ToLower(strings.TrimSpace(item.Gender))
+	if item.Gender != "female" {
+		item.Gender = "male"
+	}
+	item.Language = tts.NormalizeLanguage(item.Language)
+	if item.Language == "" {
+		item.Language = "en-us"
+	}
+	item.VoiceID = strings.TrimSpace(item.VoiceID)
+	if item.Backup == nil {
+		return item, nil
+	}
+	item.Backup.Provider = strings.TrimSpace(item.Backup.Provider)
+	item.Backup.VoiceID = strings.TrimSpace(item.Backup.VoiceID)
+	item.Backup.Readers = normalizeTTSBackupReaderIDs(item.Backup.Readers)
+	if len(item.Backup.Readers) > 0 {
+		if item.Backup.Provider != "" || item.Backup.VoiceID != "" {
+			return ttsReaderXML{}, fmt.Errorf("reader %q backup cannot mix reader targets with an inline provider or voice", item.ID)
+		}
+		return item, nil
+	}
+	item.Backup.Provider = tts.NormalizeProvider(item.Backup.Provider)
+	if item.Backup.Provider == "" || item.Backup.Provider == "auto" {
+		item.Backup = nil
+	} else if item.Backup.Provider == item.Provider && item.Backup.VoiceID == item.VoiceID {
+		return ttsReaderXML{}, fmt.Errorf("reader %q backup duplicates its primary voice", item.ID)
+	}
+	return item, nil
+}
+
+func normalizeTTSBackupReaderIDs(values []string) []string {
+	result := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = cleanReaderID(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
+}
+
 func ttsReaderFromMap(raw any) (ttsReaderXML, error) {
 	itemMap, ok := raw.(map[string]any)
 	if !ok {
 		return ttsReaderXML{}, fmt.Errorf("reader must be an object")
 	}
-	return normalizeOneTTSReader(ttsReaderXML{
+	item := ttsReaderXML{
 		ID:       stringPayload(itemMap, "id", ""),
 		Provider: stringPayload(itemMap, "provider", "auto"),
 		Gender:   stringPayload(itemMap, "gender", "male"),
 		Language: stringPayload(itemMap, "language", "en-us"),
 		VoiceID:  stringPayload(itemMap, "voice_id", ""),
-	})
+	}
+	backupProvider := stringPayload(itemMap, "backup_provider", "")
+	backupVoiceID := stringPayload(itemMap, "backup_voice_id", "")
+	backupReaderIDs := stringListPayload(itemMap["backup_reader_ids"])
+	if backupMap, ok := itemMap["backup"].(map[string]any); ok {
+		backupProvider = stringPayload(backupMap, "provider", backupProvider)
+		backupVoiceID = stringPayload(backupMap, "voice_id", backupVoiceID)
+		if values := stringListPayload(backupMap["readers"]); len(values) > 0 {
+			backupReaderIDs = values
+		}
+	}
+	if strings.TrimSpace(backupProvider) != "" || strings.TrimSpace(backupVoiceID) != "" || len(backupReaderIDs) > 0 {
+		item.Backup = &ttsReaderBackupXML{Provider: backupProvider, VoiceID: backupVoiceID, Readers: backupReaderIDs}
+	}
+	return normalizeOneTTSReader(item)
 }
 
 func normalizeOneTTSReader(item ttsReaderXML) (ttsReaderXML, error) {
-	items, err := normalizeTTSReaders([]ttsReaderXML{item})
-	if err != nil {
-		return ttsReaderXML{}, err
+	return normalizeTTSReaderFields(item)
+}
+
+func stringListPayload(value any) []string {
+	var values []string
+	switch typed := value.(type) {
+	case []any:
+		for _, item := range typed {
+			if text, ok := item.(string); ok {
+				values = append(values, text)
+			}
+		}
+	case []string:
+		values = append(values, typed...)
+	case string:
+		values = strings.FieldsFunc(typed, func(char rune) bool {
+			return char == ',' || char == ';' || char == '\n' || char == '\r'
+		})
 	}
-	return items[0], nil
+	return normalizeTTSBackupReaderIDs(values)
 }
 
 func cleanReaderID(value string) string {
@@ -292,13 +396,24 @@ func naturalReaderSortKey(id string) string {
 func ttsPayload(path string, relPath string, items []ttsReaderXML) map[string]any {
 	readers := make([]map[string]any, 0, len(items))
 	for _, item := range items {
+		backupProvider := ""
+		backupVoiceID := ""
+		backupReaderIDs := []string{}
+		if item.Backup != nil {
+			backupProvider = item.Backup.Provider
+			backupVoiceID = item.Backup.VoiceID
+			backupReaderIDs = append(backupReaderIDs, item.Backup.Readers...)
+		}
 		readers = append(readers, map[string]any{
-			"id":       item.ID,
-			"provider": item.Provider,
-			"gender":   item.Gender,
-			"language": item.Language,
-			"voice_id": item.VoiceID,
-			"label":    ttsReaderLabel(item),
+			"id":                item.ID,
+			"provider":          item.Provider,
+			"gender":            item.Gender,
+			"language":          item.Language,
+			"voice_id":          item.VoiceID,
+			"backup_provider":   backupProvider,
+			"backup_voice_id":   backupVoiceID,
+			"backup_reader_ids": backupReaderIDs,
+			"label":             ttsReaderLabel(item),
 		})
 	}
 	return map[string]any{

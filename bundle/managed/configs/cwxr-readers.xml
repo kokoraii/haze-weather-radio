@@ -24,4 +24,36 @@
         <language>en-US</language>
         <voice_id>11</voice_id>
     </reader>
+    <reader id="000" provider="piper">
+        <gender>male</gender>
+        <language>en-US</language>
+        <voice_id>en_US-hfc_male-medium</voice_id>
+        <backup>
+            <reader>00</reader>
+        </backup>
+    </reader>
+    <reader id="001" provider="piper">
+        <gender>female</gender>
+        <language>en-US</language>
+        <voice_id>en_US-lessac-low</voice_id>
+        <backup>
+            <reader>01</reader>
+        </backup>
+    </reader>
+    <reader id="002" provider="piper">
+        <gender>male</gender>
+        <language>fr-CA</language>
+        <voice_id>fr_FR-gilles-low</voice_id>
+        <backup>
+            <reader>02</reader>
+        </backup>
+    </reader>
+    <reader id="003" provider="piper">
+        <gender>female</gender>
+        <language>fr-CA</language>
+        <voice_id>fr_FR-siwis-medium</voice_id>
+        <backup>
+            <reader>03</reader>
+        </backup>
+    </reader>
 </Readers>

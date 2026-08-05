@@ -1110,6 +1110,7 @@ struct VideoEncodingChain {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum H264Encoder {
+    Nvidia,
     VaApi,
     X264,
 }
@@ -1118,20 +1119,30 @@ impl H264Encoder {
     fn select(scan: ScanMode) -> Self {
         // SAFETY: gst_is_initialized only reads GStreamer's process-wide initialization state.
         let initialized = unsafe { gst::ffi::gst_is_initialized() } == gst::glib::ffi::GTRUE;
+        let nvidia_available = initialized && gst::ElementFactory::find("nvh264enc").is_some();
         let va_api_available = initialized && gst::ElementFactory::find("vah264enc").is_some();
-        Self::select_with_availability(scan, va_api_available)
+        Self::select_with_availability(scan, nvidia_available, va_api_available)
     }
 
-    fn select_with_availability(scan: ScanMode, va_api_available: bool) -> Self {
-        if va_api_available && matches!(scan, ScanMode::Progressive) {
-            Self::VaApi
-        } else {
-            Self::X264
+    fn select_with_availability(
+        scan: ScanMode,
+        nvidia_available: bool,
+        va_api_available: bool,
+    ) -> Self {
+        if matches!(scan, ScanMode::Progressive) {
+            if nvidia_available {
+                return Self::Nvidia;
+            }
+            if va_api_available {
+                return Self::VaApi;
+            }
         }
+        Self::X264
     }
 
     const fn element(self) -> &'static str {
         match self {
+            Self::Nvidia => "nvh264enc",
             Self::VaApi => "vah264enc",
             Self::X264 => "x264enc",
         }
@@ -1139,6 +1150,7 @@ impl H264Encoder {
 
     const fn raw_format(self) -> &'static str {
         match self {
+            Self::Nvidia => "BGRx",
             Self::VaApi => "NV12",
             Self::X264 => "I420",
         }
@@ -1146,6 +1158,10 @@ impl H264Encoder {
 
     fn description(self, target_kbps: u32, max_kbps: u32, constant: bool, gop: u32) -> String {
         match self {
+            Self::Nvidia => format!(
+                "nvh264enc name=video_encoder rc-mode={} bitrate={target_kbps} max-bitrate={max_kbps} vbv-buffer-size={max_kbps} gop-size={gop} bframes=0 preset=p5 tune=low-latency zerolatency=true spatial-aq=true temporal-aq=true multi-pass=two-pass-quarter repeat-sequence-header=true aud=true cabac=true ! video/x-h264,profile=high",
+                if constant { "cbr" } else { "vbr" }
+            ),
             Self::VaApi => {
                 let rate_control = if constant { "cbr" } else { "vbr" };
                 let bitrate_kbps = if constant { target_kbps } else { max_kbps };
@@ -2151,9 +2167,13 @@ mod tests {
     }
 
     #[test]
-    fn h264_encoder_prefers_va_api_only_for_progressive_output() {
+    fn h264_encoder_prefers_available_hardware_for_progressive_output() {
         assert_eq!(
-            H264Encoder::select_with_availability(ScanMode::Progressive, true),
+            H264Encoder::select_with_availability(ScanMode::Progressive, true, true),
+            H264Encoder::Nvidia
+        );
+        assert_eq!(
+            H264Encoder::select_with_availability(ScanMode::Progressive, false, true),
             H264Encoder::VaApi
         );
         assert_eq!(
@@ -2162,13 +2182,24 @@ mod tests {
                     field_order: FieldOrder::TopFirst,
                 },
                 true,
+                true,
             ),
             H264Encoder::X264
         );
         assert_eq!(
-            H264Encoder::select_with_availability(ScanMode::Progressive, false),
+            H264Encoder::select_with_availability(ScanMode::Progressive, false, false),
             H264Encoder::X264
         );
+
+        let nvidia = H264Encoder::Nvidia.description(4_000, 6_000, false, 60);
+        assert!(nvidia.contains("nvh264enc name=video_encoder"));
+        assert!(nvidia.contains("rc-mode=vbr"));
+        assert!(nvidia.contains("bitrate=4000"));
+        assert!(nvidia.contains("max-bitrate=6000"));
+        assert!(nvidia.contains("preset=p5"));
+        assert!(nvidia.contains("multi-pass=two-pass-quarter"));
+        assert!(nvidia.contains("video/x-h264,profile=high"));
+        assert_eq!(H264Encoder::Nvidia.raw_format(), "BGRx");
 
         let va_api = H264Encoder::VaApi.description(4_000, 6_000, false, 60);
         assert!(va_api.contains("vah264enc name=video_encoder"));

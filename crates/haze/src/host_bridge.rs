@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -11,6 +11,9 @@ use tracing::{debug, error, info, warn};
 
 const CAP_REPLAY_WINDOW: Duration = Duration::from_secs(15 * 60);
 const CAP_REPLAY_LIMIT: usize = 512;
+// Modern clients register immediately. This bounded fallback keeps receive-only
+// legacy clients working without exposing new sockets to replay before registration.
+const CLIENT_HANDSHAKE_GRACE: Duration = Duration::from_millis(500);
 
 struct BridgeEnvelope {
     origin: Option<usize>,
@@ -23,6 +26,7 @@ struct BridgeClientHandle {
     receive_events: bool,
     client_id: Option<String>,
     subscriptions: Vec<String>,
+    legacy_activation_at: Option<Instant>,
 }
 
 enum ClientMessage {
@@ -75,46 +79,52 @@ impl HostBridge {
             let mut clients: Vec<BridgeClientHandle> = Vec::new();
             let mut cap_replay = VecDeque::<(Instant, Vec<u8>)>::new();
             loop {
-                drain_new_clients(&client_receiver, &mut clients, &mut cap_replay);
-                match envelope_receiver.recv() {
-                    Ok(envelope) => {
-                        drain_new_clients(&client_receiver, &mut clients, &mut cap_replay);
-                        match handle_client_message(envelope.value.clone()) {
-                            ClientMessage::Event(message) => {
-                                let _ = event_sender.send(message.clone());
-                                let Ok(mut raw) = serde_json::to_vec(&message) else {
-                                    continue;
-                                };
-                                raw.push(b'\n');
-                                if replayable_event(&message) {
-                                    cap_replay.push_back((Instant::now(), raw.clone()));
-                                    prune_replay(&mut cap_replay);
-                                    while cap_replay.len() > CAP_REPLAY_LIMIT {
-                                        cap_replay.pop_front();
-                                    }
-                                }
-                                deliver_event(&mut clients, &envelope, &message, &raw);
+                drain_new_clients(&client_receiver, &mut clients);
+                activate_due_legacy_clients(&mut clients, &mut cap_replay);
+                let wait = next_legacy_activation_wait(&clients).unwrap_or(CLIENT_HANDSHAKE_GRACE);
+                let envelope = match envelope_receiver.recv_timeout(wait) {
+                    Ok(envelope) => envelope,
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => break,
+                };
+                drain_new_clients(&client_receiver, &mut clients);
+                activate_due_legacy_clients(&mut clients, &mut cap_replay);
+                match handle_client_message(envelope.value.clone()) {
+                    ClientMessage::Event(message) => {
+                        activate_origin_as_legacy(&mut clients, envelope.origin, &mut cap_replay);
+                        let _ = event_sender.send(message.clone());
+                        let Ok(mut raw) = serde_json::to_vec(&message) else {
+                            continue;
+                        };
+                        raw.push(b'\n');
+                        if replayable_event(&message) {
+                            cap_replay.push_back((Instant::now(), raw.clone()));
+                            prune_replay(&mut cap_replay);
+                            while cap_replay.len() > CAP_REPLAY_LIMIT {
+                                cap_replay.pop_front();
                             }
-                            ClientMessage::Configure {
+                        }
+                        deliver_event(&mut clients, &envelope, &message, &raw);
+                    }
+                    ClientMessage::Configure {
+                        receive_events,
+                        client_id,
+                        subscriptions,
+                    } => {
+                        if let Some(origin) = envelope.origin {
+                            configure_client(
+                                &mut clients,
+                                origin,
                                 receive_events,
                                 client_id,
                                 subscriptions,
-                            } => {
-                                if let Some(origin) = envelope.origin {
-                                    for client in &mut clients {
-                                        if client.id == origin {
-                                            client.receive_events = receive_events;
-                                            client.client_id = client_id;
-                                            client.subscriptions = subscriptions;
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            ClientMessage::Consumed => {}
+                                &mut cap_replay,
+                            );
                         }
                     }
-                    Err(_) => break,
+                    ClientMessage::Consumed => {
+                        activate_origin_as_legacy(&mut clients, envelope.origin, &mut cap_replay)
+                    }
                 }
             }
         });
@@ -142,9 +152,12 @@ impl HostBridge {
                                         .send(BridgeClientHandle {
                                             id: client_id,
                                             sender: tx,
-                                            receive_events: true,
+                                            receive_events: false,
                                             client_id: None,
                                             subscriptions: Vec::new(),
+                                            legacy_activation_at: Some(
+                                                Instant::now() + CLIENT_HANDSHAKE_GRACE,
+                                            ),
                                         })
                                         .is_err()
                                     {
@@ -190,18 +203,84 @@ impl HostBridge {
 fn drain_new_clients(
     client_receiver: &Receiver<BridgeClientHandle>,
     clients: &mut Vec<BridgeClientHandle>,
-    cap_replay: &mut VecDeque<(Instant, Vec<u8>)>,
 ) {
     while let Ok(client) = client_receiver.try_recv() {
-        prune_replay(cap_replay);
-        if client.receive_events
-            && subscription_matches(&client.subscriptions, "cap.alert.received")
-        {
-            for (_, raw) in cap_replay.iter() {
-                let _ = client.sender.try_send(raw.clone());
-            }
-        }
         clients.push(client);
+    }
+}
+
+fn configure_client(
+    clients: &mut [BridgeClientHandle],
+    origin: usize,
+    receive_events: bool,
+    client_id: Option<String>,
+    subscriptions: Vec<String>,
+    cap_replay: &mut VecDeque<(Instant, Vec<u8>)>,
+) {
+    let Some(client) = clients.iter_mut().find(|client| client.id == origin) else {
+        return;
+    };
+    client.receive_events = receive_events;
+    client.client_id = client_id;
+    client.subscriptions = subscriptions;
+    client.legacy_activation_at = None;
+    replay_cap_events(client, cap_replay);
+}
+
+fn activate_origin_as_legacy(
+    clients: &mut [BridgeClientHandle],
+    origin: Option<usize>,
+    cap_replay: &mut VecDeque<(Instant, Vec<u8>)>,
+) {
+    let Some(origin) = origin else {
+        return;
+    };
+    let Some(client) = clients
+        .iter_mut()
+        .find(|client| client.id == origin && client.legacy_activation_at.is_some())
+    else {
+        return;
+    };
+    client.receive_events = true;
+    client.legacy_activation_at = None;
+    replay_cap_events(client, cap_replay);
+}
+
+fn activate_due_legacy_clients(
+    clients: &mut [BridgeClientHandle],
+    cap_replay: &mut VecDeque<(Instant, Vec<u8>)>,
+) {
+    let now = Instant::now();
+    for client in clients.iter_mut().filter(|client| {
+        client
+            .legacy_activation_at
+            .is_some_and(|activation_at| activation_at <= now)
+    }) {
+        client.receive_events = true;
+        client.legacy_activation_at = None;
+        replay_cap_events(client, cap_replay);
+    }
+}
+
+fn next_legacy_activation_wait(clients: &[BridgeClientHandle]) -> Option<Duration> {
+    let now = Instant::now();
+    clients
+        .iter()
+        .filter_map(|client| client.legacy_activation_at)
+        .min()
+        .map(|activation_at| activation_at.saturating_duration_since(now))
+}
+
+fn replay_cap_events(client: &BridgeClientHandle, cap_replay: &mut VecDeque<(Instant, Vec<u8>)>) {
+    if client.legacy_activation_at.is_some()
+        || !client.receive_events
+        || !subscription_matches(&client.subscriptions, "cap.alert.received")
+    {
+        return;
+    }
+    prune_replay(cap_replay);
+    for (_, raw) in cap_replay.iter() {
+        let _ = client.sender.try_send(raw.clone());
     }
 }
 
@@ -314,7 +393,10 @@ fn deliver_event(
         .filter(|value| !value.is_empty());
     let mut delivered = false;
     clients.retain(|client| {
-        if envelope.origin.is_some_and(|id| id == client.id) || !client.receive_events {
+        if envelope.origin.is_some_and(|id| id == client.id)
+            || !client.receive_events
+            || client.legacy_activation_at.is_some()
+        {
             return true;
         }
         if target.is_some_and(|target| client.client_id.as_deref() != Some(target)) {
@@ -475,6 +557,7 @@ mod tests {
                 receive_events: true,
                 client_id: Some("haze-location".to_string()),
                 subscriptions: vec!["location.*".to_string()],
+                legacy_activation_at: None,
             },
             BridgeClientHandle {
                 id: 2,
@@ -482,6 +565,7 @@ mod tests {
                 receive_events: true,
                 client_id: Some("haze-ivr-1".to_string()),
                 subscriptions: vec!["location.query.completed".to_string()],
+                legacy_activation_at: None,
             },
         ];
         let message = json!({
@@ -500,5 +584,133 @@ mod tests {
             requester_receiver.try_recv().expect("targeted response"),
             b"response\n"
         );
+    }
+
+    #[test]
+    fn pending_clients_receive_neither_replay_nor_broadcasts() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let mut clients = vec![BridgeClientHandle {
+            id: 1,
+            sender,
+            receive_events: true,
+            client_id: None,
+            subscriptions: Vec::new(),
+            legacy_activation_at: Some(Instant::now() + CLIENT_HANDSHAKE_GRACE),
+        }];
+        let mut replay = VecDeque::from([(
+            Instant::now(),
+            b"{\"type\":\"cap.alert.received\"}\n".to_vec(),
+        )]);
+
+        replay_cap_events(&clients[0], &mut replay);
+        let message = json!({"type": "cap.alert.received"});
+        let envelope = BridgeEnvelope {
+            origin: None,
+            value: message.clone(),
+        };
+        deliver_event(&mut clients, &envelope, &message, b"broadcast\n");
+
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn configured_subscriptions_are_applied_before_cap_replay() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let mut clients = vec![BridgeClientHandle {
+            id: 1,
+            sender,
+            receive_events: true,
+            client_id: None,
+            subscriptions: Vec::new(),
+            legacy_activation_at: Some(Instant::now() + CLIENT_HANDSHAKE_GRACE),
+        }];
+        let mut replay = VecDeque::from([(
+            Instant::now(),
+            b"{\"type\":\"cap.alert.received\"}\n".to_vec(),
+        )]);
+
+        configure_client(
+            &mut clients,
+            1,
+            true,
+            Some("haze-location".to_string()),
+            vec!["location.*".to_string()],
+            &mut replay,
+        );
+
+        assert!(receiver.try_recv().is_err());
+        let message = json!({"type": "location.query.request"});
+        let envelope = BridgeEnvelope {
+            origin: None,
+            value: message.clone(),
+        };
+        deliver_event(&mut clients, &envelope, &message, b"location\n");
+        assert_eq!(receiver.try_recv().expect("location event"), b"location\n");
+    }
+
+    #[test]
+    fn publish_only_handshake_discards_replay_and_broadcasts() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let mut clients = vec![BridgeClientHandle {
+            id: 1,
+            sender,
+            receive_events: true,
+            client_id: None,
+            subscriptions: Vec::new(),
+            legacy_activation_at: Some(Instant::now() + CLIENT_HANDSHAKE_GRACE),
+        }];
+        let mut replay = VecDeque::from([(
+            Instant::now(),
+            b"{\"type\":\"cap.alert.received\"}\n".to_vec(),
+        )]);
+
+        configure_client(
+            &mut clients,
+            1,
+            false,
+            Some("publisher".to_string()),
+            Vec::new(),
+            &mut replay,
+        );
+        let message = json!({"type": "cap.alert.received"});
+        let envelope = BridgeEnvelope {
+            origin: None,
+            value: message.clone(),
+        };
+        deliver_event(&mut clients, &envelope, &message, b"broadcast\n");
+
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn clients_without_handshakes_activate_as_legacy_after_grace() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let mut clients = vec![BridgeClientHandle {
+            id: 1,
+            sender,
+            receive_events: true,
+            client_id: None,
+            subscriptions: Vec::new(),
+            legacy_activation_at: Some(Instant::now() - Duration::from_millis(1)),
+        }];
+        let mut replay = VecDeque::from([(
+            Instant::now(),
+            b"{\"type\":\"cap.alert.received\"}\n".to_vec(),
+        )]);
+
+        activate_due_legacy_clients(&mut clients, &mut replay);
+
+        assert!(clients[0].legacy_activation_at.is_none());
+        assert_eq!(
+            receiver.try_recv().expect("legacy CAP replay"),
+            b"{\"type\":\"cap.alert.received\"}\n"
+        );
+        let message = json!({"type": "product.rendered"});
+        let envelope = BridgeEnvelope {
+            origin: None,
+            value: message.clone(),
+        };
+        deliver_event(&mut clients, &envelope, &message, b"routine\n");
+        assert_eq!(receiver.try_recv().expect("legacy broadcast"), b"routine\n");
     }
 }

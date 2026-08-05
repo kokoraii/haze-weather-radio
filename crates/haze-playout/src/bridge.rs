@@ -10,6 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
 type BridgeResult<T> = std::result::Result<T, String>;
@@ -20,6 +21,21 @@ type PendingProducts = PendingMap<RenderedProduct>;
 
 const SYNTH_REPLY_TIMEOUT: Duration = Duration::from_secs(90);
 const PRODUCT_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+const PLAYOUT_CLIENT_ID: &str = "haze-playout";
+const PLAYOUT_SUBSCRIPTIONS: &[&str] = &[
+    "system.shutdown",
+    "scheduled_package",
+    "playlist_refill",
+    "playlist.item.ready",
+    "playlist.item.group",
+    "cap.alert.audio.ready",
+    "playlist.control",
+    "operator.breakin.*",
+    "tts.synthesized",
+    "tts.failed",
+    "product.rendered",
+    "product.render.failed",
+];
 
 #[derive(Clone)]
 pub(crate) struct BridgeClient {
@@ -31,6 +47,7 @@ pub(crate) struct BridgeClient {
 pub(crate) struct BridgeConnection {
     pub(crate) client: BridgeClient,
     pub(crate) events: mpsc::Receiver<Value>,
+    pub(crate) reader_task: JoinHandle<()>,
 }
 
 #[derive(Debug, Clone)]
@@ -94,7 +111,7 @@ pub(crate) async fn connect(addr: &str) -> Result<BridgeConnection> {
     let (tx, rx) = mpsc::channel(256);
     let pending_synth = Arc::new(Mutex::new(HashMap::new()));
     let pending_products = Arc::new(Mutex::new(HashMap::new()));
-    tokio::spawn(read_loop(
+    let reader_task = tokio::spawn(read_loop(
         reader,
         tx,
         Arc::clone(&pending_synth),
@@ -107,34 +124,54 @@ pub(crate) async fn connect(addr: &str) -> Result<BridgeConnection> {
             pending_products,
         },
         events: rx,
+        reader_task,
     })
 }
 
 pub(crate) async fn connect_retry(addr: &str) -> Result<BridgeConnection> {
     loop {
         match connect(addr).await {
-            Ok(connection) => return Ok(connection),
+            Ok(connection) => match connection.client.register_playout_consumer().await {
+                Ok(()) => return Ok(connection),
+                Err(err) => {
+                    tracing::warn!(
+                        "failed to register playout event subscriptions at {addr}: {err}"
+                    );
+                }
+            },
             Err(err) => {
                 tracing::warn!("waiting for host event bridge at {addr}: {err}");
-                sleep(Duration::from_secs(1)).await;
             }
         }
+        sleep(Duration::from_secs(1)).await;
     }
 }
 
 pub(crate) async fn connect_publish_only_retry(addr: &str) -> Result<BridgeClient> {
     loop {
-        match connect(addr).await {
-            Ok(connection) => {
-                connection.client.set_receive_events(false).await?;
-                return Ok(connection.client);
-            }
+        match connect_publish_only(addr).await {
+            Ok(client) => return Ok(client),
             Err(err) => {
                 tracing::warn!("waiting for host media bridge at {addr}: {err}");
                 sleep(Duration::from_secs(1)).await;
             }
         }
     }
+}
+
+async fn connect_publish_only(addr: &str) -> Result<BridgeClient> {
+    let stream = TcpStream::connect(addr)
+        .await
+        .with_context(|| format!("failed to connect to host media bridge at {addr}"))?;
+    let (reader, writer) = stream.into_split();
+    drop(reader);
+    let client = BridgeClient {
+        writer: Arc::new(Mutex::new(writer)),
+        pending_synth: Arc::new(Mutex::new(HashMap::new())),
+        pending_products: Arc::new(Mutex::new(HashMap::new())),
+    };
+    client.set_receive_events(false).await?;
+    Ok(client)
 }
 
 impl BridgeClient {
@@ -152,13 +189,16 @@ impl BridgeClient {
     }
 
     pub(crate) async fn set_receive_events(&self, receive_events: bool) -> Result<()> {
-        self.publish(json!({
-            "type": "bridge.client",
-            "source": "haze-playout",
-            "data": {
-                "receive_events": receive_events,
-            }
-        }))
+        self.publish(client_registration(receive_events, None, &[]))
+            .await
+    }
+
+    async fn register_playout_consumer(&self) -> Result<()> {
+        self.publish(client_registration(
+            true,
+            Some(PLAYOUT_CLIENT_ID),
+            PLAYOUT_SUBSCRIPTIONS,
+        ))
         .await
     }
 
@@ -399,5 +439,62 @@ fn fallback_text(value: &str, fallback: &str) -> String {
         fallback.to_string()
     } else {
         value.to_string()
+    }
+}
+
+fn client_registration(
+    receive_events: bool,
+    client_id: Option<&str>,
+    subscriptions: &[&str],
+) -> Value {
+    let mut data = json!({
+        "receive_events": receive_events,
+        "subscriptions": subscriptions,
+    });
+    if let (Some(client_id), Some(object)) = (client_id, data.as_object_mut()) {
+        object.insert("client_id".to_string(), json!(client_id));
+    }
+    json!({
+        "type": "bridge.client",
+        "source": "haze-playout",
+        "data": data,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn playout_registration_uses_targeted_non_pcm_subscriptions() {
+        let registration =
+            client_registration(true, Some(PLAYOUT_CLIENT_ID), PLAYOUT_SUBSCRIPTIONS);
+        let data = registration["data"]
+            .as_object()
+            .expect("registration data object");
+        let subscriptions = data["subscriptions"]
+            .as_array()
+            .expect("subscription array");
+
+        assert_eq!(data["client_id"], PLAYOUT_CLIENT_ID);
+        assert_eq!(data["receive_events"], true);
+        assert!(subscriptions.iter().any(|value| value == "system.shutdown"));
+        assert!(subscriptions
+            .iter()
+            .any(|value| value == "playlist.item.ready"));
+        assert!(!subscriptions.iter().any(|value| value == "playout.pcm"));
+        assert!(!subscriptions.iter().any(|value| value == "*"));
+    }
+
+    #[test]
+    fn publish_only_registration_has_no_identity_or_subscriptions() {
+        let registration = client_registration(false, None, &[]);
+        let data = registration["data"]
+            .as_object()
+            .expect("registration data object");
+
+        assert_eq!(data["receive_events"], false);
+        assert_eq!(data["subscriptions"], json!([]));
+        assert!(!data.contains_key("client_id"));
     }
 }

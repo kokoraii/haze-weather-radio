@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -14,6 +15,8 @@ import (
 )
 
 const speakyAPIProviderID = "speakyapi"
+
+const speakyAPIConnectTimeout = 4 * time.Second
 
 // SpeakyAPIProvider talks to an external SpeakyAPI server. SpeakyAPI exposes
 // Windows SAPI/Maki voices through HTTP for hosts that cannot run SAPI locally.
@@ -30,8 +33,17 @@ func NewSpeakyAPIProvider(baseURL string) *SpeakyAPIProvider {
 	}
 	return &SpeakyAPIProvider{
 		BaseURL: strings.TrimRight(strings.TrimSpace(baseURL), "/"),
-		Client:  &http.Client{Timeout: 60 * time.Second},
+		Client:  newSpeakyAPIHTTPClient(),
 	}
+}
+
+func newSpeakyAPIHTTPClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = (&net.Dialer{
+		Timeout:   speakyAPIConnectTimeout,
+		KeepAlive: 30 * time.Second,
+	}).DialContext
+	return &http.Client{Transport: transport, Timeout: 60 * time.Second}
 }
 
 func (p *SpeakyAPIProvider) ID() string { return speakyAPIProviderID }

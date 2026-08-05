@@ -32,10 +32,6 @@ services:
       enabled: true
       addr: "127.0.0.1:8097"
       backend: "auto" # auto, gstreamer, or legacy
-      webrtc:
-        public_ip: "" # Public IPv4 address advertised to internet listeners behind NAT.
-        udp_port_min: 0 # Set both ports and forward the same UDP range through the gateway.
-        udp_port_max: 0
       audio_processing:
         loudness_enabled: true
         gain_db: 3
@@ -378,8 +374,8 @@ playout:
 
 operator:
   on_air_name: [
-    text: "Canada RadioMET",
-    pronunciation: "all hazards, canada radio met"
+    text: "Canadian Weather Radio Service",
+    pronunciation: "The Canadian Weather Radio Service"
   ]
   telephone_name: [
     text: "TeleWeather",
@@ -437,13 +433,13 @@ webpanel:
     host: "0.0.0.0"
     port: ${PORT}
   tls:
-    enabled: false
-    mode: acme # acme or manual
+    enabled: true
+    mode: manual # acme or manual
     domains: ["cwrs.rai.blue"] # example: ["radio.example.com"]
     email: "" # optional Let's Encrypt account email
     cache_dir: runtime/tls/acme
-    cert_file: "" # manual mode only
-    key_file: "" # manual mode only
+    cert_file: "runtime/tls/local/cert.pem" # manual mode only
+    key_file: "runtime/tls/local/key.pem" # manual mode only
     redirect_http: true
     hsts: false # only enable after HTTPS is stable for your domain
     staging: false # use Let's Encrypt staging while testing ACME setup

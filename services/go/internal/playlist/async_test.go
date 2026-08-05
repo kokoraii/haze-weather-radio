@@ -846,6 +846,54 @@ func TestBridgeSynthesizePropagatesRoutineAndAlertPriorities(t *testing.T) {
 	}
 }
 
+func TestBridgeSynthesizePropagatesRequestDeadline(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	t.Cleanup(func() {
+		_ = serverConn.Close()
+		_ = clientConn.Close()
+	})
+	bridge := &bridgeClient{
+		conn:            clientConn,
+		pendingProducts: map[string]chan productResult{},
+		pendingSynth:    map[string]chan synthResult{},
+	}
+	go bridge.readLoop()
+	deadlineValues := make(chan string, 1)
+	go func() {
+		decoder := json.NewDecoder(serverConn)
+		encoder := json.NewEncoder(serverConn)
+		var message map[string]any
+		if decoder.Decode(&message) != nil {
+			return
+		}
+		data := mapAt(message, "data")
+		deadlineValues <- firstText(message, data, "deadline_at")
+		jobID := firstText(message, data, "job_id", "subject")
+		_ = encoder.Encode(map[string]any{
+			"type": "tts.synthesized",
+			"data": map[string]any{"job_id": jobID, "output_path": "test.wav"},
+		})
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := bridge.Synthesize(ctx, synthJob{ID: "deadline"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case raw := <-deadlineValues:
+		deadline, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			t.Fatalf("deadline = %q: %v", raw, err)
+		}
+		if deadline.Before(time.Now()) {
+			t.Fatalf("propagated deadline is already expired: %s", deadline)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("missing propagated synthesis deadline")
+	}
+}
+
 func TestRebasePreparedItemDoesNotCatchUpMissedTargetOrAddExtraGap(t *testing.T) {
 	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
 	planner := &feedPlanner{}

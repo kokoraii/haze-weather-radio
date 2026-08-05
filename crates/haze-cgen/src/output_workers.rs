@@ -467,6 +467,7 @@ struct OutputWorkerHandle {
 
 pub(crate) struct OutputFanout {
     workers: Vec<OutputWorkerHandle>,
+    start_tx: watch::Sender<bool>,
     shutdown_tx: watch::Sender<bool>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -477,11 +478,26 @@ impl OutputFanout {
         factory: Arc<dyn OutputSinkFactory>,
         config: OutputWorkerConfig,
     ) -> Result<Self, OutputRuntimeError> {
-        Self::spawn_with_validator(
+        Self::spawn_with_validator_and_start_state(
             outputs,
             factory,
             Arc::new(NoAdditionalCompatibility),
             config,
+            true,
+        )
+    }
+
+    pub(crate) fn spawn_paused(
+        outputs: impl IntoIterator<Item = EncoderOutputSpec>,
+        factory: Arc<dyn OutputSinkFactory>,
+        config: OutputWorkerConfig,
+    ) -> Result<Self, OutputRuntimeError> {
+        Self::spawn_with_validator_and_start_state(
+            outputs,
+            factory,
+            Arc::new(NoAdditionalCompatibility),
+            config,
+            false,
         )
     }
 
@@ -490,6 +506,16 @@ impl OutputFanout {
         factory: Arc<dyn OutputSinkFactory>,
         validator: Arc<dyn OutputCompatibilityValidator>,
         config: OutputWorkerConfig,
+    ) -> Result<Self, OutputRuntimeError> {
+        Self::spawn_with_validator_and_start_state(outputs, factory, validator, config, true)
+    }
+
+    fn spawn_with_validator_and_start_state(
+        outputs: impl IntoIterator<Item = EncoderOutputSpec>,
+        factory: Arc<dyn OutputSinkFactory>,
+        validator: Arc<dyn OutputCompatibilityValidator>,
+        config: OutputWorkerConfig,
+        started: bool,
     ) -> Result<Self, OutputRuntimeError> {
         config.validate()?;
         tokio::runtime::Handle::try_current()
@@ -523,6 +549,7 @@ impl OutputFanout {
                 })?;
         }
 
+        let (start_tx, start_rx) = watch::channel(started);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut workers = Vec::with_capacity(outputs.len());
         let mut tasks = Vec::with_capacity(outputs.len());
@@ -539,6 +566,7 @@ impl OutputFanout {
                 output,
                 factory: Arc::clone(&factory),
                 config: config.clone(),
+                start_rx: start_rx.clone(),
                 video_rx,
                 audio_rx,
                 shutdown_rx: shutdown_rx.clone(),
@@ -558,9 +586,14 @@ impl OutputFanout {
 
         Ok(Self {
             workers,
+            start_tx,
             shutdown_tx,
             tasks: Mutex::new(tasks),
         })
+    }
+
+    pub(crate) fn start(&self) {
+        self.start_tx.send_replace(true);
     }
 
     /// Publish one retained frame to every destination without awaiting any worker.
@@ -704,6 +737,7 @@ struct OutputWorkerContext {
     output: Arc<EncoderOutputSpec>,
     factory: Arc<dyn OutputSinkFactory>,
     config: OutputWorkerConfig,
+    start_rx: watch::Receiver<bool>,
     video_rx: watch::Receiver<Option<VideoEnvelope>>,
     audio_rx: mpsc::Receiver<AudioEnvelope>,
     shutdown_rx: watch::Receiver<bool>,
@@ -717,6 +751,18 @@ async fn run_output_worker(mut context: OutputWorkerContext) {
     let mut connected_once = false;
     let mut timestamps = TimestampTracker::default();
     let mut last_video_dispatch = 0_u64;
+
+    if !wait_for_start(&mut context.start_rx, &mut context.shutdown_rx).await {
+        set_state(
+            &context.state_tx,
+            OutputWorkerPhase::Stopped,
+            connection_generation,
+            consecutive_failures,
+            None,
+            None,
+        );
+        return;
+    }
 
     loop {
         if shutdown_requested(&context.shutdown_rx) {
@@ -1036,6 +1082,28 @@ async fn wait_for_shutdown(shutdown_rx: &mut watch::Receiver<bool>) {
     }
 }
 
+async fn wait_for_start(
+    start_rx: &mut watch::Receiver<bool>,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> bool {
+    loop {
+        if *shutdown_rx.borrow() {
+            return false;
+        }
+        if *start_rx.borrow() {
+            return true;
+        }
+        tokio::select! {
+            changed = start_rx.changed() => {
+                if changed.is_err() {
+                    return false;
+                }
+            }
+            _ = wait_for_shutdown(shutdown_rx) => return false,
+        }
+    }
+}
+
 fn set_state(
     state_tx: &watch::Sender<OutputStateView>,
     phase: OutputWorkerPhase,
@@ -1265,6 +1333,28 @@ mod tests {
         })
         .await
         .expect("condition completed before timeout");
+    }
+
+    #[tokio::test]
+    async fn paused_fanout_does_not_connect_until_started() {
+        let state = Arc::new(SinkState::default());
+        let factory = Arc::new(TestFactory {
+            states: BTreeMap::from([("primary".to_string(), Arc::clone(&state))]),
+        });
+        let fanout = OutputFanout::spawn_paused([rtmp_output("primary")], factory, test_config())
+            .expect("valid paused fanout");
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(state.connect_count.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            fanout.statuses()[0].state.phase,
+            OutputWorkerPhase::Starting
+        );
+
+        fanout.start();
+        wait_until(|| fanout.statuses()[0].state.phase == OutputWorkerPhase::Online).await;
+        assert_eq!(state.connect_count.load(Ordering::Relaxed), 1);
+        fanout.shutdown().await;
     }
 
     #[tokio::test]

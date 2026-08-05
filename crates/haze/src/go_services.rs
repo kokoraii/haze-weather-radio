@@ -293,6 +293,7 @@ struct TtsConfig {
     cache_max_bytes: Option<u64>,
     cache_max_entries: Option<usize>,
     timeout: Option<String>,
+    workers: Option<usize>,
     piper_voices_dir: Option<String>,
     kokoro_model_dir: Option<String>,
     kokoro_runtime_provider: Option<String>,
@@ -1149,6 +1150,9 @@ fn service_specs(root: &RootConfig, host: &ServiceHostConfig) -> Vec<ServiceSpec
                 }
                 if let Some(max_entries) = tts.cache_max_entries {
                     args.extend(["--cache-max-entries".to_string(), max_entries.to_string()]);
+                }
+                if let Some(workers) = tts.workers {
+                    args.extend(["--workers".to_string(), workers.max(1).to_string()]);
                 }
                 if let Some(model_dir) = tts
                     .kokoro_model_dir
@@ -2910,6 +2914,7 @@ services:
       cache_dir: runtime/cache/tts-custom
       cache_max_bytes: 123456
       cache_max_entries: 321
+      workers: 6
 "#,
         )
         .expect("config");
@@ -2942,6 +2947,10 @@ services:
             .args
             .windows(2)
             .any(|args| { args == ["--cache-max-entries".to_string(), "321".to_string()] }));
+        assert!(tts
+            .args
+            .windows(2)
+            .any(|args| { args == ["--workers".to_string(), "6".to_string()] }));
     }
 
     #[test]

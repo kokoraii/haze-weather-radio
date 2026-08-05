@@ -32,10 +32,6 @@ services:
       enabled: true
       addr: "127.0.0.1:8097"
       backend: "auto" # auto, gstreamer, or legacy
-      webrtc:
-        public_ip: "" # Public IPv4 address advertised to internet listeners behind NAT.
-        udp_port_min: 0 # Set both ports and forward the same UDP range through the gateway.
-        udp_port_max: 0
       audio_processing:
         loudness_enabled: true
         gain_db: 3
@@ -54,7 +50,7 @@ services:
         windows_priority: high
         nice: 0
     cgen:
-      enabled: false
+      enabled: true
       config: "managed/configs/cgen.xml"
       scheduler:
         # Keep CGEN responsive without letting it starve playout, media, or drivers.
@@ -96,9 +92,6 @@ services:
       language: "en-US"
       timezone: "Local"
       out_dir: "runtime/audio/tts"
-      cache_dir: "runtime/cache/tts"
-      cache_max_bytes: 536870912
-      cache_max_entries: 4096
       timeout: "60s"
       workers: 4
       piper_voices_dir: "managed/voices/piper"
@@ -414,17 +407,17 @@ wx_on_demand: # haze can accept a POST request from external applications with a
 
 webpanel:
   enabled: true
-  host: "0.0.0.0"
-  port: ${PORT}
+  host: "127.0.0.1"
+  port: 6446
   public_port:
-    enabled: false
-    host: "0.0.0.0"
+    enabled: true
+    host: "172.16.1.31"
     http_port: 80
-    https_port: 443
+    https_port: 6444
   public:
     enabled: true
-    host: "0.0.0.0"
-    port: ${PORT}
+    host: "127.0.0.1"
+    port: 6446
     site_name: "${SITE_NAME}"
     alerts_archive:
       access: public # disabled, public
@@ -434,21 +427,21 @@ webpanel:
         enabled: true
   admin:
     enabled: true
-    host: "0.0.0.0"
-    port: ${PORT}
+    host: "127.0.0.1"
+    port: 6446
   tls:
-    enabled: false
-    mode: acme # acme or manual
+    enabled: true
+    mode: manual # acme or manual
     domains: ["cwrs.rai.blue"] # example: ["radio.example.com"]
     email: "" # optional Let's Encrypt account email
     cache_dir: runtime/tls/acme
-    cert_file: "" # manual mode only
-    key_file: "" # manual mode only
-    redirect_http: true
+    cert_file: runtime/tls/manual/servinor.crt # manual mode only
+    key_file: runtime/tls/manual/servinor.key # manual mode only
+    redirect_http: false
     hsts: false # only enable after HTTPS is stable for your domain
     staging: false # use Let's Encrypt staging while testing ACME setup
     http_challenge:
-      enabled: true
+      enabled: false
       host: "0.0.0.0"
       port: 80 # Let's Encrypt HTTP-01 must be reachable from the internet on external port 80
   receiver:
