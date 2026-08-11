@@ -17,7 +17,11 @@ func (s *Service) writeTwilioSearchConnect(writer http.ResponseWriter, request *
 	callSID := strings.TrimSpace(request.FormValue("CallSid"))
 	language = fallbackText(language, s.cfg.IVR.DefaultLanguage)
 	region = searchRegionFromSelector(region)
-	session, err := s.twilio.newPending(accountSID, callSID, language, region)
+	caller := ""
+	if s.cfg.IVR.Search.CallerHintEnabled {
+		caller = request.FormValue("From")
+	}
+	session, err := s.twilio.newPending(accountSID, callSID, language, region, caller)
 	if err != nil {
 		http.Error(writer, "unable to create Twilio search session", http.StatusBadRequest)
 		return

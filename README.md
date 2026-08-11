@@ -196,6 +196,52 @@ On Windows:
 
 The installer writes `runtime/models/whisper/ggml-base-q5_1.bin` atomically and verifies its SHA-256 digest. Restart Haze after installing or replacing the model. If the model or runtime is unavailable, voice search remains degraded while T9, multitap, and numeric location entry continue working.
 
+### IVR telephone location-code API
+
+The IVR exposes its current Hello Weather telephone-code directory on its configured HTTP listener. The listener defaults to loopback and should remain private unless it is placed behind an appropriate HTTPS reverse proxy.
+
+```text
+GET /ivr/v1/location-codes
+GET /ivr/v1/location-codes?province=SK
+GET /ivr/v1/location-codes?q=saskatoon&limit=25&offset=0
+```
+
+Results are sorted by the five-digit canonical code and include the shorter `dial_code`, province-local `regional_id`, English `name`, French `name_fr`, province, forecast target, and numeric `latitude` and `longitude` from the source-qualified ECCC city-page point. When no distinct French catalog name is available, `name_fr` falls back to the English name. Where a unique, exact match to a Statistics Canada census subdivision exists, `population` and `census_year` contain its official census value and reference year. They are omitted for ambiguous or non-municipal locations. Where an exact catalog city-and-province match exists, `postal_codes` contains sorted three-character Canadian forward sortation area prefixes and `postal_code_format` is `fsa`. This bounded list contains at most 64 entries, with `postal_codes_truncated` set when more are available. Exact six-character postal codes identify delivery areas and are not assigned to an entire weather location. `feed_id`, language, and timezone are included only when a configured feed directly covers the location. With no `limit`, the complete directory is returned. An explicitly supplied `limit` is capped at 500 and can be combined with `offset` for pagination. The optional `source` parameter currently accepts only `hello_weather`. The `q` filter also matches returned FSA prefixes.
+
+### IVR point API
+
+The read-only point service resolves coordinates, names, and provider identifiers through the event-brokered Haze location service. `/point` and `/ivr/v1/point` are equivalent.
+
+```text
+GET /point?geocode=52.13%2C-106.67
+GET /point?icao=CYXE
+GET /point?iata=YXE
+GET /point?citypage=sk-40
+GET /point?helloweather=06040
+GET /point?postal=S7L%202V7
+GET /point?name=Saskatoon
+GET /point?scheme=hydrometric&authority=eccc&value=05HG001
+```
+
+Each request accepts exactly one selector. Convenience selectors cover `geocode`, `name`, `icao`, `iata`, `citypage`, `helloweather`, `postal`, and canonical `id`. Any other catalog identifier can be queried with `scheme` and `value`, plus optional `authority` for source-qualified resolution. Optional `country`, `region`, `locale`, and `limit` controls narrow the query. Limits are capped at 10 because name and reverse-geocode queries may be ambiguous.
+
+Responses contain bounded canonical candidates with localized names, every identifier attached to each returned entity, capabilities, point coordinates, match confidence, and ambiguity metadata. `population` and `census_year` are included only for a verified Statistics Canada census subdivision or a uniquely bridged ECCC forecast location. Stations, zones, and other nearby results never inherit a municipality's population. Attributes, deployments, evidence blobs, bounding boxes, and area geometry are not exposed. A six-character Canadian postal code falls back to its three-character FSA when the exact delivery-area record is unavailable. Hello Weather codes resolve through their linked ECCC city-page point.
+
+### VoIP.ms DID line selection
+
+Route each VoIP.ms DID to `sip:{DID}@sip.teleweather.ca:5080` so Haze receives the called number as the SIP user. Haze preserves the calling party identity and uses the called DID to select the IVR line. Canadian geographic DIDs can select an enabled province or territory line by area code, while toll-free and otherwise unmatched DIDs use the Canada line.
+
+For deterministic routing, add the normalized number to the line's `dids` list under `services.go.ivr.extensions`. `caller_id_name` sets the connected-line display name advertised toward the SIP provider. Both fields are optional, and an explicit DID mapping takes precedence over area-code inference.
+
+```yaml
+- extension: "haze"
+  dids: ["+18005550123"]
+  caller_id_name: "Canada TeleWeather"
+  province: "CA"
+```
+
+Connected-line display is provider and destination dependent. It does not replace the inbound caller's `From` identity and does not guarantee that a PSTN handset will display the configured line name.
+
 ### Public WebRTC behind NAT
 
 Set `services.rust.media.webrtc.public_ip` to the gateway's public IPv4 address and configure a bounded `udp_port_min` and `udp_port_max`. Forward that same UDP range one-to-one from the gateway to the Haze host and allow it through the host firewall. Each concurrent WebRTC listener uses one UDP port. Environment variables `HAZE_MEDIA_WEBRTC_HOST`, `HAZE_MEDIA_WEBRTC_UDP_PORT_MIN`, and `HAZE_MEDIA_WEBRTC_UDP_PORT_MAX` override these values for machine-specific deployments.

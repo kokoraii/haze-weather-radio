@@ -40,6 +40,8 @@ type twilioPendingSession struct {
 	Region     string
 	ExpiresAt  time.Time
 	Used       bool
+
+	callerProvince string
 }
 
 type twilioLocationResult struct {
@@ -139,9 +141,13 @@ func newTwilioRuntime(cfg loadedConfig) (*twilioRuntime, error) {
 	}, nil
 }
 
-func (runtime *twilioRuntime) newPending(accountSID string, callSID string, language string, region string) (*twilioPendingSession, error) {
+func (runtime *twilioRuntime) newPending(accountSID string, callSID string, language string, region string, caller ...string) (*twilioPendingSession, error) {
 	if runtime == nil || accountSID != runtime.accountSID || !validTwilioSID(callSID, "CA") {
 		return nil, fmt.Errorf("invalid Twilio call identity")
+	}
+	callerProvince := ""
+	if len(caller) > 0 {
+		callerProvince = callerProvinceHint(caller[0])
 	}
 	expires := time.Now().UTC().Add(runtime.cfg.SessionTTL)
 	token, err := runtime.newBoundToken("search", accountSID, callSID, language, region, expires)
@@ -150,7 +156,7 @@ func (runtime *twilioRuntime) newPending(accountSID string, callSID string, lang
 	}
 	session := &twilioPendingSession{
 		Token: token, AccountSID: accountSID, CallSID: callSID, Language: language,
-		Region: region, ExpiresAt: expires,
+		Region: region, ExpiresAt: expires, callerProvince: callerProvince,
 	}
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
@@ -467,6 +473,66 @@ func validTwilioSID(value string, prefix string) bool {
 		}
 	}
 	return true
+}
+
+// normalizeNANPCaller accepts the common Twilio forms of a Canadian or US
+// NANP number. It returns an E.164 number or an empty string for anonymous,
+// international, malformed, or extension-bearing values.
+func normalizeNANPCaller(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	hasCountryPrefix := strings.HasPrefix(value, "+")
+	var digits strings.Builder
+	for index, char := range value {
+		switch {
+		case char >= '0' && char <= '9':
+			digits.WriteRune(char)
+		case char == '+' && index == 0:
+		case char == ' ' || char == '-' || char == '.' || char == '(' || char == ')':
+		default:
+			return ""
+		}
+	}
+	number := digits.String()
+	if hasCountryPrefix && (len(number) != 11 || number[0] != '1') {
+		return ""
+	}
+	if len(number) == 11 && number[0] == '1' {
+		number = number[1:]
+	}
+	if len(number) != 10 || number[0] < '2' || number[0] > '9' || number[3] < '2' || number[3] > '9' {
+		return ""
+	}
+	return "+1" + number
+}
+
+// callerProvinceHint derives a conservative Canadian province hint from a
+// NANP area code. Shared area codes and non-geographic codes deliberately
+// return no hint.
+func callerProvinceHint(caller string) string {
+	caller = normalizeNANPCaller(caller)
+	if len(caller) != 12 {
+		return ""
+	}
+	return canadianAreaCodeProvinces[caller[2:5]]
+}
+
+// The 902/782 codes shared by Nova Scotia and Prince Edward Island, and 867
+// shared by all three territories, are intentionally omitted.
+var canadianAreaCodeProvinces = map[string]string{
+	"368": "AB", "403": "AB", "568": "AB", "587": "AB", "780": "AB", "825": "AB",
+	"236": "BC", "250": "BC", "257": "BC", "604": "BC", "672": "BC", "778": "BC",
+	"204": "MB", "431": "MB", "584": "MB",
+	"428": "NB", "506": "NB",
+	"709": "NL", "879": "NL",
+	"226": "ON", "249": "ON", "289": "ON", "343": "ON", "365": "ON", "382": "ON",
+	"416": "ON", "437": "ON", "519": "ON", "548": "ON", "613": "ON", "647": "ON",
+	"683": "ON", "705": "ON", "742": "ON", "753": "ON", "807": "ON", "905": "ON", "942": "ON",
+	"263": "QC", "354": "QC", "367": "QC", "418": "QC", "438": "QC", "450": "QC",
+	"468": "QC", "514": "QC", "579": "QC", "581": "QC", "819": "QC", "873": "QC",
+	"306": "SK", "474": "SK", "639": "SK",
 }
 
 func maxDuration(left time.Duration, right time.Duration) time.Duration {

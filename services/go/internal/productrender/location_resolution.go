@@ -120,6 +120,9 @@ func capLocationReferences(alert capmodel.Alert) ([]alertmodel.LocationReference
 	seen := map[string]struct{}{}
 	for _, info := range alert.Infos {
 		for _, area := range info.Areas {
+			if capmodel.IsECCCThreatArea(area) {
+				continue
+			}
 			for _, geocode := range area.Geocodes {
 				value := strings.TrimSpace(geocode.Value)
 				if value == "" {

@@ -440,6 +440,9 @@ func (s *Service) ivrForecastRegionAreaText(location ResolvedLocation, info capm
 	leftovers := make([]string, 0, len(info.Areas))
 	seen := map[string]struct{}{}
 	for _, area := range info.Areas {
+		if capmodel.IsECCCThreatArea(area) {
+			continue
+		}
 		covered := false
 		for _, geocode := range area.Geocodes {
 			if _, ok := coveredCodes[ivrCanonicalAlertCode(geocode.Value)]; ok {
@@ -480,11 +483,17 @@ func ivrAlertCoverageCodes(info capmodel.AlertInfo) map[string]struct{} {
 		}
 	}
 	for _, area := range info.Areas {
+		if capmodel.IsECCCThreatArea(area) {
+			continue
+		}
 		for _, geocode := range area.Geocodes {
 			add(geocode.Value)
 		}
 	}
 	for _, param := range info.Parameters {
+		if capmodel.IsECCCStormParameter(param.Name) {
+			continue
+		}
 		name := strings.ToLower(strings.TrimSpace(param.Name))
 		if strings.Contains(name, "status") || strings.Contains(name, "coverage") {
 			continue
@@ -516,6 +525,9 @@ func ivrAlertAreaNames(info capmodel.AlertInfo) []string {
 		out = append(out, value)
 	}
 	for _, area := range info.Areas {
+		if capmodel.IsECCCThreatArea(area) {
+			continue
+		}
 		add(area.Description)
 	}
 	return out

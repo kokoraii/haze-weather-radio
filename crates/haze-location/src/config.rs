@@ -15,6 +15,7 @@ pub struct ServiceConfig {
     pub default_limit: usize,
     pub maximum_limit: usize,
     pub packs: Vec<PackConfig>,
+    pub geometry_packs: Vec<GeometryPackConfig>,
     pub overlay_path: PathBuf,
     pub allowed_overlay_sources: Vec<String>,
     pub feed_bindings_path: Option<PathBuf>,
@@ -32,6 +33,16 @@ pub enum PackFormat {
 pub struct PackConfig {
     pub id: String,
     pub path: PathBuf,
+    pub priority: i32,
+    pub format: PackFormat,
+    pub required: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct GeometryPackConfig {
+    pub id: String,
+    pub path: PathBuf,
+    pub core_id: String,
     pub priority: i32,
     pub format: PackFormat,
     pub required: bool,
@@ -85,6 +96,8 @@ struct CatalogsXml {
     packs: Vec<PackXml>,
     #[serde(rename = "legacy", default)]
     legacy: Vec<PackXml>,
+    #[serde(rename = "geometry", default)]
+    geometry: Vec<GeometryPackXml>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -93,6 +106,24 @@ struct PackXml {
     id: String,
     #[serde(rename = "@path", default)]
     path: PathBuf,
+    #[serde(rename = "@priority", default)]
+    priority: i32,
+    #[serde(rename = "@enabled", default = "default_true")]
+    enabled: bool,
+    #[serde(rename = "@required", default)]
+    required: bool,
+    #[serde(rename = "@format", default)]
+    format: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GeometryPackXml {
+    #[serde(rename = "@id", default)]
+    id: String,
+    #[serde(rename = "@path", default)]
+    path: PathBuf,
+    #[serde(rename = "@core", default)]
+    core: String,
     #[serde(rename = "@priority", default)]
     priority: i32,
     #[serde(rename = "@enabled", default = "default_true")]
@@ -171,6 +202,7 @@ pub fn load(root_config_path: &Path, locations_override: Option<&Path>) -> Resul
         .with_context(|| format!("failed to parse {}", locations_path.display()))?;
 
     let mut packs = Vec::new();
+    let mut declared_pack_ids = std::collections::HashSet::new();
     for (legacy, pack) in xml
         .catalogs
         .packs
@@ -181,6 +213,10 @@ pub fn load(root_config_path: &Path, locations_override: Option<&Path>) -> Resul
         if !pack.enabled {
             continue;
         }
+        let id = pack_id(&pack.id, &pack.path, "location-pack");
+        if !declared_pack_ids.insert(id.clone()) {
+            anyhow::bail!("duplicate location pack id: {id}");
+        }
         let path = resolve_path(root_dir, &pack.path);
         if !path.exists() {
             if pack.required {
@@ -189,14 +225,6 @@ pub fn load(root_config_path: &Path, locations_override: Option<&Path>) -> Resul
             warn!(path = %path.display(), "optional location pack is not installed");
             continue;
         }
-        let id = if pack.id.trim().is_empty() {
-            path.file_stem()
-                .and_then(|value| value.to_str())
-                .unwrap_or("location-pack")
-                .to_string()
-        } else {
-            pack.id.trim().to_string()
-        };
         let format = if legacy || pack.format.eq_ignore_ascii_case("legacy") {
             PackFormat::Legacy
         } else {
@@ -211,6 +239,63 @@ pub fn load(root_config_path: &Path, locations_override: Option<&Path>) -> Resul
         });
     }
     packs.sort_by(|left, right| {
+        right
+            .priority
+            .cmp(&left.priority)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    let loaded_pack_ids: std::collections::HashSet<_> =
+        packs.iter().map(|pack| pack.id.as_str()).collect();
+    let mut geometry_packs = Vec::new();
+    let mut all_ids = declared_pack_ids.clone();
+    for pack in xml.catalogs.geometry {
+        if !pack.enabled {
+            continue;
+        }
+        let id = pack_id(&pack.id, &pack.path, "location-geometry");
+        if !all_ids.insert(id.clone()) {
+            anyhow::bail!("duplicate location pack id: {id}");
+        }
+        let core_id = pack.core.trim().to_string();
+        if core_id.is_empty() {
+            anyhow::bail!("geometry pack {id} is missing its core pack id");
+        }
+        if !declared_pack_ids.contains(&core_id) {
+            anyhow::bail!("geometry pack {id} references unknown core pack {core_id}");
+        }
+        if !loaded_pack_ids.contains(core_id.as_str()) {
+            if pack.required {
+                anyhow::bail!("geometry pack {id} requires unavailable core pack {core_id}");
+            }
+            warn!(geometry_pack = %id, core_pack = %core_id, "optional geometry pack core is not installed");
+            continue;
+        }
+        let path = resolve_path(root_dir, &pack.path);
+        if !path.exists() {
+            if pack.required {
+                anyhow::bail!(
+                    "required location geometry pack is missing: {}",
+                    path.display()
+                );
+            }
+            warn!(path = %path.display(), "optional location geometry pack is not installed");
+            continue;
+        }
+        geometry_packs.push(GeometryPackConfig {
+            id,
+            path,
+            core_id,
+            priority: pack.priority,
+            format: if pack.format.eq_ignore_ascii_case("legacy") {
+                PackFormat::Legacy
+            } else {
+                PackFormat::Normalized
+            },
+            required: pack.required,
+        });
+    }
+    geometry_packs.sort_by(|left, right| {
         right
             .priority
             .cmp(&left.priority)
@@ -255,6 +340,7 @@ pub fn load(root_config_path: &Path, locations_override: Option<&Path>) -> Resul
         }
         .clamp(1, 100),
         packs,
+        geometry_packs,
         overlay_path: resolve_path(root_dir, &overlay_path),
         allowed_overlay_sources: xml
             .overlay
@@ -267,6 +353,17 @@ pub fn load(root_config_path: &Path, locations_override: Option<&Path>) -> Resul
         force_groups,
         never_groups,
     })
+}
+
+fn pack_id(raw: &str, path: &Path, fallback: &str) -> String {
+    let raw = raw.trim();
+    if !raw.is_empty() {
+        return raw.to_string();
+    }
+    path.file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(fallback)
+        .to_string()
 }
 
 fn resolve_path(base: &Path, path: &Path) -> PathBuf {
@@ -322,5 +419,49 @@ mod tests {
             config.never_groups,
             vec![("c".to_string(), "d".to_string())]
         );
+    }
+
+    #[test]
+    fn loads_geometry_pack_paired_with_core() {
+        let dir = tempdir().expect("temp directory");
+        fs::create_dir_all(dir.path().join("managed/configs")).expect("config directory");
+        fs::write(dir.path().join("core.sqlite"), b"").expect("core file");
+        fs::write(dir.path().join("geometry.sqlite"), b"").expect("geometry file");
+        fs::write(dir.path().join("config.yaml"), "services: {}\n").expect("root config");
+        fs::write(
+            dir.path().join("managed/configs/locations.xml"),
+            r#"<locations><catalogs><legacy id="core" path="core.sqlite"/><geometry id="boundaries" path="geometry.sqlite" core="core" priority="20" format="legacy"/></catalogs></locations>"#,
+        )
+        .expect("location config");
+
+        let config = load(&dir.path().join("config.yaml"), None).expect("load config");
+        assert_eq!(config.geometry_packs.len(), 1);
+        assert_eq!(config.geometry_packs[0].id, "boundaries");
+        assert_eq!(config.geometry_packs[0].core_id, "core");
+        assert_eq!(config.geometry_packs[0].format, PackFormat::Legacy);
+    }
+
+    #[test]
+    fn rejects_unknown_geometry_core_and_skips_missing_optional_file() {
+        let dir = tempdir().expect("temp directory");
+        fs::create_dir_all(dir.path().join("managed/configs")).expect("config directory");
+        fs::write(dir.path().join("core.sqlite"), b"").expect("core file");
+        fs::write(dir.path().join("config.yaml"), "services: {}\n").expect("root config");
+        let locations = dir.path().join("managed/configs/locations.xml");
+        fs::write(
+            &locations,
+            r#"<locations><catalogs><legacy id="core" path="core.sqlite"/><geometry id="missing" path="missing.sqlite" core="core"/></catalogs></locations>"#,
+        )
+        .expect("location config");
+        let config = load(&dir.path().join("config.yaml"), None).expect("optional geometry");
+        assert!(config.geometry_packs.is_empty());
+
+        fs::write(
+            &locations,
+            r#"<locations><catalogs><legacy id="core" path="core.sqlite"/><geometry id="bad" path="missing.sqlite" core="typo"/></catalogs></locations>"#,
+        )
+        .expect("location config");
+        let error = load(&dir.path().join("config.yaml"), None).expect_err("unknown core");
+        assert!(error.to_string().contains("unknown core pack typo"));
     }
 }

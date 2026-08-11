@@ -894,6 +894,48 @@ func TestBridgeSynthesizePropagatesRequestDeadline(t *testing.T) {
 	}
 }
 
+func TestBridgeSynthesizePropagatesVoiceRouteKey(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	t.Cleanup(func() {
+		_ = serverConn.Close()
+		_ = clientConn.Close()
+	})
+	bridge := &bridgeClient{
+		conn:            clientConn,
+		pendingProducts: map[string]chan productResult{},
+		pendingSynth:    map[string]chan synthResult{},
+	}
+	go bridge.readLoop()
+	routeKeys := make(chan string, 1)
+	go func() {
+		decoder := json.NewDecoder(serverConn)
+		encoder := json.NewEncoder(serverConn)
+		var message map[string]any
+		if decoder.Decode(&message) != nil {
+			return
+		}
+		data := mapAt(message, "data")
+		routeKeys <- firstText(message, data, "voice_route_key")
+		jobID := firstText(message, data, "job_id", "subject")
+		_ = encoder.Encode(map[string]any{
+			"type": "tts.synthesized",
+			"data": map[string]any{"job_id": jobID, "output_path": "test.wav"},
+		})
+	}()
+
+	if _, err := bridge.Synthesize(context.Background(), synthJob{ID: "segment-1", VoiceRouteKey: "product-1"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-routeKeys:
+		if got != "product-1" {
+			t.Fatalf("voice route key = %q, want product-1", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("missing voice route key")
+	}
+}
+
 func TestRebasePreparedItemDoesNotCatchUpMissedTargetOrAddExtraGap(t *testing.T) {
 	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
 	planner := &feedPlanner{}

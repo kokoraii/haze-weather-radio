@@ -20,10 +20,18 @@ import (
 	"time"
 
 	"github.com/meowraii/haze-weather-radio/services/go/internal/datastore"
+	"github.com/meowraii/haze-weather-radio/services/go/internal/locationdb"
 )
 
 const serviceID = "haze-ivr"
 const staticPromptManifestVersion = 1
+
+var locationCodeCORSOrigins = map[string]struct{}{
+	"https://teleweather.ca":     {},
+	"https://www.teleweather.ca": {},
+	"http://localhost:4321":      {},
+	"http://127.0.0.1:4321":      {},
+}
 
 type staticPromptManifest struct {
 	Version     int                         `json:"version"`
@@ -48,6 +56,9 @@ type Service struct {
 	cfg            loadedConfig
 	resolver       *Resolver
 	searchIndex    *locationSearchIndex
+	capabilities   *locationdb.CapabilityCatalog
+	pointQuery     pointQueryFunc
+	pointSlots     chan struct{}
 	cache          *ProductCache
 	bridge         *bridgeClient
 	mediaBridge    *bridgeClient
@@ -127,6 +138,15 @@ func Run(ctx context.Context, options Options) error {
 			store:       store,
 		}
 		service.resolver = NewResolver(cfg)
+		if capabilities, loaded := locationdb.LoadCapabilityCatalog(cfg.BaseDir); loaded {
+			service.capabilities = capabilities
+			log.Printf("IVR capability targets indexed forecasts=%d observations=%d air_quality=%d hydrometric=%d marine=%d",
+				capabilities.Count(locationdb.CapabilityForecast),
+				capabilities.Count(locationdb.CapabilityObservation),
+				capabilities.Count(locationdb.CapabilityAirQuality),
+				capabilities.Count(locationdb.CapabilityHydrometric),
+				capabilities.Count(locationdb.CapabilityMarineForecast))
+		}
 		if cfg.IVR.Search.enabled() {
 			searchIndex, searchErr := loadLocationSearchIndex(cfg, service.resolver)
 			if searchErr != nil {
@@ -294,6 +314,9 @@ func (s *Service) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ivr/v1/health", s.handleHealth)
 	mux.HandleFunc("/ivr/v1/lookup", s.handleLookup)
+	mux.HandleFunc("/ivr/v1/location-codes", s.handleLocationCodes)
+	mux.HandleFunc("/ivr/v1/point", s.handlePoint)
+	mux.HandleFunc("/point", s.handlePoint)
 	mux.HandleFunc("/ivr/v1/prompt", s.handlePrompt)
 	mux.HandleFunc("/ivr/v1/audio", s.handleAudio)
 	mux.HandleFunc("/ivr/v1/alert_audio", s.handleAlertAudio)
@@ -312,8 +335,33 @@ func (s *Service) routes() http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("X-Content-Type-Options", "nosniff")
 		s.metrics.HTTPRequests.Add(1)
+		if request.URL.Path == "/ivr/v1/location-codes" || request.URL.Path == "/ivr/v1/point" || request.URL.Path == "/point" {
+			if origin := locationCodeCORSOrigin(request.Header.Get("Origin")); origin != "" {
+				writer.Header().Set("Access-Control-Allow-Origin", origin)
+				writer.Header().Set("Access-Control-Allow-Methods", http.MethodGet)
+				writer.Header().Set("Access-Control-Allow-Headers", "Accept")
+				writer.Header().Set("Access-Control-Max-Age", "600")
+			}
+			writer.Header().Add("Vary", "Origin")
+			if request.Method == http.MethodOptions {
+				if writer.Header().Get("Access-Control-Allow-Origin") == "" {
+					http.Error(writer, "origin not allowed", http.StatusForbidden)
+					return
+				}
+				writer.WriteHeader(http.StatusNoContent)
+				return
+			}
+		}
 		mux.ServeHTTP(writer, request)
 	})
+}
+
+func locationCodeCORSOrigin(origin string) string {
+	origin = strings.TrimSpace(origin)
+	if _, ok := locationCodeCORSOrigins[origin]; ok {
+		return origin
+	}
+	return ""
 }
 
 func (s *Service) handleHealth(writer http.ResponseWriter, _ *http.Request) {
@@ -401,6 +449,14 @@ func (s *Service) handleAlertAudio(writer http.ResponseWriter, request *http.Req
 			text = s.locationMenuAlertText(location, len(alerts))
 		}
 		lineKey = "location_menu_" + firstNonBlank(location.FeedID, location.Code, "default")
+	case "observation_choices":
+		choices := s.observationStationChoices(location)
+		if len(choices) == 0 {
+			text = "No nearby observation station is available."
+		} else {
+			text = localizedObservationChoicesPrompt(location.Language, choices)
+		}
+		lineKey = "observation_choices_" + firstNonBlank(location.Code, location.FeedID, "default")
 	default:
 		alert, ok := ivrAlertByDigit(alerts, request.URL.Query().Get("index"))
 		if !ok {
@@ -430,6 +486,8 @@ func (s *Service) handleTwiML(writer http.ResponseWriter, request *http.Request)
 		s.writeLocationMenuTwiML(writer, request)
 	case "location_option":
 		s.handleLocationOptionTwiML(writer, request)
+	case "observation_choice":
+		s.handleObservationChoiceTwiML(writer, request)
 	case "alert_menu":
 		s.writeAlertMenuTwiML(writer, request)
 	case "alert_option":
@@ -551,14 +609,16 @@ func (s *Service) handleEntryDigit(writer http.ResponseWriter, request *http.Req
 		if option.Language != "" {
 			location.Language = option.Language
 		}
-		s.writeProductTwiML(writer, request, location, splitCSV(option.Packages), "")
+		packages := splitCSV(option.Packages)
+		s.writeProductTwiML(writer, request, s.mapProductLocation(location, packages, nil), packages, "")
 	case "broadcast":
 		location, err := s.defaultFeedLocation()
 		if err != nil || !s.broadcastAvailable(location.FeedID) {
 			s.writeEntryErrorTwiML(writer, request)
 			return
 		}
-		s.writeProductTwiML(writer, request, location, s.broadcastPackages(option), "")
+		packages := s.broadcastPackages(option)
+		s.writeProductTwiML(writer, request, s.mapProductLocation(location, packages, nil), packages, "")
 	case "operator":
 		s.writeOperatorTwiML(writer, request)
 	default:
@@ -730,10 +790,15 @@ func (s *Service) handleLocationOptionTwiML(writer http.ResponseWriter, request 
 	}
 	switch option.Action {
 	case "product":
+		packages := splitCSV(option.Packages)
+		if packagesInclude(packages, "current_conditions") && len(s.observationStationChoices(location)) > 1 {
+			s.writeObservationChoiceTwiML(writer, request, location, packages)
+			return
+		}
 		params := locationTwiMLParams(location)
 		params["state"] = "location_menu"
 		params["alert_auto"] = "0"
-		s.writeProductTwiML(writer, request, location, splitCSV(option.Packages), twimlURL(request, "/ivr/v1/twiml", params))
+		s.writeProductTwiML(writer, request, s.mapProductLocation(location, packages, nil), packages, twimlURL(request, "/ivr/v1/twiml", params))
 	case "menu":
 		s.writeConfiguredMenu(writer, request, location, option.Next)
 	case "broadcast":
@@ -744,7 +809,8 @@ func (s *Service) handleLocationOptionTwiML(writer http.ResponseWriter, request 
 		params := locationTwiMLParams(location)
 		params["state"] = "location_menu"
 		params["alert_auto"] = "0"
-		s.writeProductTwiML(writer, request, location, s.broadcastPackages(option), twimlURL(request, "/ivr/v1/twiml", params))
+		packages := s.broadcastPackages(option)
+		s.writeProductTwiML(writer, request, s.mapProductLocation(location, packages, nil), packages, twimlURL(request, "/ivr/v1/twiml", params))
 	default:
 		s.writeLocationMenuWithAlertAuto(writer, request, location, false)
 	}
@@ -868,10 +934,15 @@ func (s *Service) handleConfiguredMenuOptionTwiML(writer http.ResponseWriter, re
 	}
 	switch option.Action {
 	case "product":
+		packages := splitCSV(option.Packages)
+		if packagesInclude(packages, "current_conditions") && len(s.observationStationChoices(location)) > 1 {
+			s.writeObservationChoiceTwiML(writer, request, location, packages)
+			return
+		}
 		params := locationTwiMLParams(location)
 		params["state"] = "ivr_menu"
 		params["menu"] = menuID
-		s.writeProductTwiML(writer, request, location, splitCSV(option.Packages), twimlURL(request, "/ivr/v1/twiml", params))
+		s.writeProductTwiML(writer, request, s.mapProductLocation(location, packages, nil), packages, twimlURL(request, "/ivr/v1/twiml", params))
 	case "menu":
 		s.writeConfiguredMenu(writer, request, location, option.Next)
 	case "broadcast":
@@ -882,7 +953,8 @@ func (s *Service) handleConfiguredMenuOptionTwiML(writer http.ResponseWriter, re
 		params := locationTwiMLParams(location)
 		params["state"] = "ivr_menu"
 		params["menu"] = menuID
-		s.writeProductTwiML(writer, request, location, s.broadcastPackages(option), twimlURL(request, "/ivr/v1/twiml", params))
+		packages := s.broadcastPackages(option)
+		s.writeProductTwiML(writer, request, s.mapProductLocation(location, packages, nil), packages, twimlURL(request, "/ivr/v1/twiml", params))
 	case "operator":
 		s.writeOperatorTwiML(writer, request)
 	default:
@@ -906,10 +978,16 @@ func (s *Service) writeProductTwiML(writer http.ResponseWriter, request *http.Re
 	queryLocation := location.Code
 	packages = normalizePackages(packages, s.cfg.IVR.DefaultPackages)
 	params := map[string]string{
-		"code":     queryLocation,
-		"feed_id":  location.FeedID,
-		"lang":     location.Language,
-		"packages": strings.Join(packages, ","),
+		"code":               queryLocation,
+		"feed_id":            location.FeedID,
+		"lang":               location.Language,
+		"packages":           strings.Join(packages, ","),
+		"forecast_id":        location.Forecast,
+		"station_id":         location.StationID,
+		"air_quality_id":     location.AirQualityID,
+		"climate_id":         location.ClimateID,
+		"hydrometric_id":     location.HydrometricID,
+		"marine_forecast_id": location.MarineForecastID,
 	}
 	if queryLocation == "" {
 		delete(params, "code")
@@ -1151,6 +1229,24 @@ func (s *Service) extensionTelephoneServiceName(line extensionConfig) string {
 	return strings.TrimSpace(extensionName + " " + telephoneName)
 }
 
+func (s *Service) extensionCallerIDName(line extensionConfig) string {
+	if configured := strings.TrimSpace(line.CallerIDName); configured != "" {
+		return configured
+	}
+	telephoneName := "Haze Weather Telephone"
+	if s != nil {
+		telephoneName = fallbackText(writtenDisplayText(s.cfg.Root.Operator.TelephoneName), telephoneName)
+	}
+	extensionName := writtenDisplayText(line.Name)
+	if extensionName == "" {
+		return telephoneName
+	}
+	if strings.EqualFold(line.NamePosition, "after") {
+		return strings.TrimSpace(telephoneName + " " + extensionName)
+	}
+	return strings.TrimSpace(extensionName + " " + telephoneName)
+}
+
 func (s *Service) extensionGreetingValues(line extensionConfig) map[string]string {
 	return s.promptValues(map[string]string{
 		"extension_telephone_service_name": s.extensionTelephoneServiceName(line),
@@ -1360,7 +1456,37 @@ func (s *Service) locationFromRequest(request *http.Request) (ResolvedLocation, 
 	if lang := firstNonBlank(request.URL.Query().Get("lang"), request.FormValue("lang")); lang != "" {
 		location.Language = lang
 	}
+	s.applyRequestedCapabilityTargets(request, &location)
 	return location, nil
+}
+
+func (s *Service) applyRequestedCapabilityTargets(request *http.Request, location *ResolvedLocation) {
+	if s == nil || s.capabilities == nil || request == nil || location == nil {
+		return
+	}
+	value := func(key string) string {
+		return firstNonBlank(request.URL.Query().Get(key), request.FormValue(key))
+	}
+	if target, ok := s.capabilities.Find(locationdb.CapabilityForecast, value("forecast_id")); ok {
+		location.Forecast = target.ID
+	}
+	if target, ok := s.capabilities.Find(locationdb.CapabilityObservation, value("station_id")); ok {
+		location.StationID = target.ID
+		location.Latitude = floatText(target.Latitude)
+		location.Longitude = floatText(target.Longitude)
+	}
+	if target, ok := s.capabilities.Find(locationdb.CapabilityAirQuality, value("air_quality_id")); ok {
+		location.AirQualityID = target.ID
+	}
+	if target, ok := s.capabilities.Find(locationdb.CapabilityClimate, value("climate_id")); ok {
+		location.ClimateID = target.ID
+	}
+	if target, ok := s.capabilities.Find(locationdb.CapabilityHydrometric, value("hydrometric_id")); ok {
+		location.HydrometricID = target.ID
+	}
+	if target, ok := s.capabilities.Find(locationdb.CapabilityMarineForecast, value("marine_forecast_id")); ok {
+		location.MarineForecastID = target.ID
+	}
 }
 
 func (s *Service) resolveLocation(code string) (ResolvedLocation, error) {

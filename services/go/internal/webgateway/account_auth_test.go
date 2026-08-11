@@ -153,16 +153,19 @@ func TestAccountPasswordHashUsesRequiredPepperedProfile(t *testing.T) {
 	}
 }
 
-func TestAccountLoginLocksAccountAfterFiveFailures(t *testing.T) {
+func TestRegularAccountLoginLocksAfterFiveFailures(t *testing.T) {
 	manager, _ := newTestAccountAuthManager(t, false)
 	defer manager.Close()
+	createTestAccount(t, manager, Account{
+		Username: "operator", PasswordExpiryDays: 90, AllowUserPasswordChange: true, LoggingEnabled: true,
+	}, "operator correct horse battery staple")
 	for attempt := 0; attempt < 5; attempt++ {
 		request := testLoginRequest("198.51.100.9:44000")
 		_, _ = manager.LoginWithRequest(context.Background(), LoginInput{
-			Username: "admin", Password: "incorrect password value", Request: request,
+			Username: "operator", Password: "incorrect password value", Request: request,
 		})
 	}
-	account, err := manager.accounts.store.ByUsername(context.Background(), "admin")
+	account, err := manager.accounts.store.ByUsername(context.Background(), "operator")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,10 +173,71 @@ func TestAccountLoginLocksAccountAfterFiveFailures(t *testing.T) {
 		t.Fatalf("account lock state = locked:%v attempts:%d", account.AccountLocked, account.FailedLoginAttempts)
 	}
 	_, err = manager.LoginWithRequest(context.Background(), LoginInput{
-		Username: "admin", Password: "correct horse battery staple", Request: testLoginRequest("198.51.100.9:44001"),
+		Username: "operator", Password: "operator correct horse battery staple", Request: testLoginRequest("198.51.100.9:44001"),
 	})
 	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "locked") {
 		t.Fatalf("locked account login error = %v", err)
+	}
+}
+
+func TestAccountLockAutomaticallyExpiresAfterTwoMinutes(t *testing.T) {
+	manager, _ := newTestAccountAuthManager(t, false)
+	defer manager.Close()
+	createTestAccount(t, manager, Account{
+		Username: "operator", PasswordExpiryDays: 90, AllowUserPasswordChange: true, LoggingEnabled: true,
+	}, "operator correct horse battery staple")
+	ctx := context.Background()
+	account, err := manager.accounts.store.ByUsername(ctx, "operator")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockedAt := time.Now().UTC().Add(-2 * time.Minute)
+	for attempt := 0; attempt < 5; attempt++ {
+		account, err = manager.accounts.store.RecordLoginFailure(ctx, account.ID, 5, 2*time.Minute, lockedAt)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !account.AccountLocked {
+		t.Fatal("regular account did not enter the temporary lock state")
+	}
+	account, err = manager.accounts.applyAccountLockPolicy(ctx, account, lockedAt.Add(2*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if account.AccountLocked || account.FailedLoginAttempts != 0 {
+		t.Fatalf("expired account lock = locked:%v attempts:%d", account.AccountLocked, account.FailedLoginAttempts)
+	}
+}
+
+func TestAdministratorAccountNeverLocks(t *testing.T) {
+	manager, _ := newTestAccountAuthManager(t, false)
+	defer manager.Close()
+	ctx := context.Background()
+	for attempt := 0; attempt < 5; attempt++ {
+		_, _ = manager.LoginWithRequest(ctx, LoginInput{
+			Username: "admin", Password: "incorrect password value", Request: testLoginRequest("198.51.100.10:44000"),
+		})
+	}
+	account, err := manager.accounts.store.ByUsername(ctx, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if account.AccountLocked || account.FailedLoginAttempts != 5 {
+		t.Fatalf("administrator lock state = locked:%v attempts:%d", account.AccountLocked, account.FailedLoginAttempts)
+	}
+	if _, err := manager.accounts.store.db.ExecContext(ctx, `UPDATE users SET account_locked=true WHERE id=?`, account.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.accounts.repairAccountLocks(ctx, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	account, err = manager.accounts.store.ByID(ctx, account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if account.AccountLocked || account.FailedLoginAttempts != 0 {
+		t.Fatalf("legacy administrator lock was not repaired: locked:%v attempts:%d", account.AccountLocked, account.FailedLoginAttempts)
 	}
 }
 
@@ -678,7 +742,8 @@ func newTestAccountAuthManager(t *testing.T, enforceMFA bool) (*AuthManager, str
 	config.Webpanel.Authentication.AuditDir = "logs"
 	config.Webpanel.Authentication.SecureCookies = false
 	config.Webpanel.Authentication.LoginRateLimit = 5
-	config.Webpanel.Authentication.LoginRateWindowSeconds = 900
+	config.Webpanel.Authentication.LoginRateWindowSeconds = 120
+	config.Webpanel.Authentication.AccountLockDurationSeconds = 120
 	config.Storage.SQLite.Path = "runtime/state/haze.db"
 	t.Setenv("HAZE_PASETO_V4_LOCAL_KEY", encodedTestKey(1))
 	t.Setenv("HAZE_PASSWORD_PEPPER", encodedTestKey(2))
@@ -693,6 +758,17 @@ func newTestAccountAuthManager(t *testing.T, enforceMFA bool) (*AuthManager, str
 		t.Fatalf("account authentication was not configured: %v", manager.accounts.initializationError)
 	}
 	return manager, configPath
+}
+
+func createTestAccount(t *testing.T, manager *AuthManager, account Account, password string) {
+	t.Helper()
+	passwordHash, err := manager.accounts.hashPassword(password)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.accounts.store.Create(context.Background(), account, passwordHash); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func encodedTestKey(value byte) string {

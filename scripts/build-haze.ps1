@@ -71,6 +71,10 @@ function Copy-BundleDirectory {
     $PreserveDir = $null
     if ($Name -eq "managed" -and (Test-Path -LiteralPath $Target -PathType Container)) {
         $PreserveFiles = @(Get-ChildItem -LiteralPath $Target -Filter "*.onnx" -Recurse -File -ErrorAction SilentlyContinue)
+        $LocationsTarget = Join-Path $Target "locations"
+        if (Test-Path -LiteralPath $LocationsTarget -PathType Container) {
+            $PreserveFiles += @(Get-ChildItem -LiteralPath $LocationsTarget -Recurse -File -ErrorAction SilentlyContinue)
+        }
         $VoicesTarget = Join-Path $Target "voices"
         if (Test-Path -LiteralPath $VoicesTarget -PathType Container) {
             $PreserveFiles += @(Get-ChildItem -LiteralPath $VoicesTarget -Directory -Filter "kokoro*" -ErrorAction SilentlyContinue | ForEach-Object {
@@ -78,7 +82,7 @@ function Copy-BundleDirectory {
             })
         }
         if ($PreserveFiles.Count -gt 0) {
-            $PreserveDir = Join-Path ([System.IO.Path]::GetTempPath()) ("haze-preserve-onnx-" + [System.Guid]::NewGuid().ToString("N"))
+            $PreserveDir = Join-Path ([System.IO.Path]::GetTempPath()) ("haze-preserve-managed-" + [System.Guid]::NewGuid().ToString("N"))
             $TargetFull = [System.IO.Path]::GetFullPath($Target).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
             foreach ($File in $PreserveFiles) {
                 $Relative = $File.FullName.Substring($TargetFull.Length).TrimStart([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
@@ -563,7 +567,9 @@ try {
                 Remove-Item -Force
         }
     }
-    foreach ($Dir in @("webroot", "managed", "audio")) {
+    # Copy-BundleDirectory owns managed replacement so it can preserve
+    # generated catalog packs under managed/locations across rebuilds.
+    foreach ($Dir in @("webroot", "audio")) {
         $Target = Join-Path $OutFull $Dir
         if (Test-Path -LiteralPath $Target) {
             Remove-Item -LiteralPath $Target -Recurse -Force

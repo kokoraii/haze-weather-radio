@@ -37,7 +37,11 @@ const (
 	synthesisCacheMaxEntries = 256
 	synthesisCacheMaxIdle    = 30 * time.Minute
 	defaultSynthesisWorkers  = 4
-	primaryAttemptWithBackup = 30 * time.Second
+	providerHealthTimeout    = 5 * time.Second
+	providerHealthyTTL       = 30 * time.Second
+	providerUnavailableTTL   = 15 * time.Second
+	voiceRouteTTL            = 5 * time.Minute
+	voiceRouteMaxEntries     = 1024
 )
 
 var errSystemShutdown = errors.New("system shutdown requested")
@@ -152,12 +156,12 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	audio, _, err := synthesizeWithProvider(ctx, providers, providerName, tts.Request{
+	audio, _, _, _, err := synthesizeWithReaderBackup(ctx, providers, providerName, tts.Request{
 		Text:     tts.NormalizeText(*text, dictionary, *timezone),
 		VoiceID:  voiceID,
 		Language: *lang,
 		Volume:   100,
-	})
+	}, reader.Backup)
 	if err != nil {
 		return err
 	}
@@ -188,14 +192,31 @@ type serviceConfig struct {
 }
 
 type serviceState struct {
+	ctx            context.Context
 	cfg            serviceConfig
 	providers      map[string]tts.Provider
 	readers        []tts.Reader
 	readersErr     error
 	dictionaries   map[string]dictionaryResult
 	synthesisCache map[[sha256.Size]byte]synthesisCacheEntry
+	providerHealth map[string]*providerHealthStatus
+	voiceRoutes    map[[sha256.Size]byte]voiceRouteDecision
 	mu             sync.Mutex
+	routeMu        sync.Mutex
 	publishMu      sync.Mutex
+}
+
+type providerHealthStatus struct {
+	available bool
+	expiresAt time.Time
+	ready     chan struct{}
+}
+
+type voiceRouteDecision struct {
+	providerID string
+	voiceID    string
+	backupUsed bool
+	expiresAt  time.Time
 }
 
 type dictionaryResult struct {
@@ -493,12 +514,15 @@ func newServiceState(ctx context.Context, cfg serviceConfig) (*serviceState, err
 		readers = nil
 	}
 	state := &serviceState{
+		ctx:            ctx,
 		cfg:            cfg,
 		providers:      providers,
 		readers:        readers,
 		readersErr:     err,
 		dictionaries:   map[string]dictionaryResult{},
 		synthesisCache: map[[sha256.Size]byte]synthesisCacheEntry{},
+		providerHealth: map[string]*providerHealthStatus{},
+		voiceRoutes:    map[[sha256.Size]byte]voiceRouteDecision{},
 	}
 	return state, nil
 }
@@ -828,6 +852,30 @@ func handleSynthesisJob(ctx context.Context, conn net.Conn, state *serviceState,
 		Rate:            intValue(message, data, "rate", 0),
 		SentenceSilence: floatValue(message, data, "sentence_silence", 0),
 	}
+	requestedProviderID := providerID
+	backupUsed := false
+	readerBackup := reader.Backup
+	voiceRouteLocked := false
+	if hasReader {
+		decision, locked, routeErr := state.resolveVoiceRoute(
+			jobCtx,
+			firstText(message, data, "voice_route_key"),
+			providerID,
+			request.VoiceID,
+			reader.Backup,
+		)
+		if routeErr != nil {
+			state.publishTTSError(conn, jobID, routeErr.Error())
+			return
+		}
+		if locked {
+			providerID = decision.providerID
+			request.VoiceID = decision.voiceID
+			backupUsed = decision.backupUsed
+			readerBackup = nil
+			voiceRouteLocked = true
+		}
+	}
 	targetSampleRate := intValue(message, data, "target_sample_rate", 0)
 	targetChannels := intValue(message, data, "target_channels", 0)
 	outputPath := firstText(message, data, "output_path", "out")
@@ -843,27 +891,30 @@ func handleSynthesisJob(ctx context.Context, conn net.Conn, state *serviceState,
 		if err := materializeCachedAudio(cached.OutputPath, outputPath); err == nil {
 			state.storeSynthesis(cacheKey, cached)
 			_ = state.publishServiceEvent(conn, "tts.synthesized", jobID, map[string]any{
-				"job_id":      jobID,
-				"output_path": outputPath,
-				"bytes":       cached.Bytes,
-				"format":      cached.Format,
-				"sample_rate": cached.SampleRate,
-				"channels":    cached.Channels,
-				"provider":    cached.ProviderID,
-				"reader_id":   cached.ReaderID,
-				"voice_id":    cached.VoiceID,
-				"language":    cached.Language,
-				"cache_hit":   true,
+				"job_id":             jobID,
+				"output_path":        outputPath,
+				"bytes":              cached.Bytes,
+				"format":             cached.Format,
+				"sample_rate":        cached.SampleRate,
+				"channels":           cached.Channels,
+				"provider":           cached.ProviderID,
+				"reader_id":          cached.ReaderID,
+				"voice_id":           cached.VoiceID,
+				"language":           cached.Language,
+				"cache_hit":          true,
+				"backup_used":        backupUsed,
+				"requested_provider": requestedProviderID,
 			})
 			return
 		}
 	}
 
-	audio, provider, activeVoiceID, backupUsed, err := synthesizeWithReaderBackup(jobCtx, state.providers, providerID, request, reader.Backup)
+	audio, provider, activeVoiceID, attemptBackupUsed, err := synthesizeWithReaderBackup(jobCtx, state.providers, providerID, request, readerBackup)
 	if err != nil {
 		state.publishTTSError(conn, jobID, err.Error())
 		return
 	}
+	backupUsed = backupUsed || attemptBackupUsed
 	if err := jobCtx.Err(); err != nil {
 		state.publishTTSError(conn, jobID, "synthesis request expired before completion")
 		return
@@ -897,7 +948,7 @@ func handleSynthesisJob(ctx context.Context, conn net.Conn, state *serviceState,
 		Language:   language,
 		LastUsed:   time.Now(),
 	}
-	if !backupUsed {
+	if !backupUsed || voiceRouteLocked {
 		if persisted, persistErr := state.persistSynthesis(cacheKey, cacheEntry, audio.Data); persistErr != nil {
 			log.Printf("synthesis cache write failed: %v", persistErr)
 		} else {
@@ -918,8 +969,134 @@ func handleSynthesisJob(ctx context.Context, conn net.Conn, state *serviceState,
 		"language":           language,
 		"cache_hit":          false,
 		"backup_used":        backupUsed,
-		"requested_provider": providerID,
+		"requested_provider": requestedProviderID,
 	})
+}
+
+func (s *serviceState) resolveVoiceRoute(ctx context.Context, routeKey string, providerID string, voiceID string, backup *tts.ReaderBackup) (voiceRouteDecision, bool, error) {
+	providerID = tts.NormalizeProvider(providerID)
+	if backup == nil || providerID != "speakyapi" {
+		return voiceRouteDecision{}, false, nil
+	}
+	backupProviderID := tts.NormalizeProvider(backup.Provider)
+	backupVoiceID := strings.TrimSpace(backup.VoiceID)
+	if backupProviderID == "" || backupVoiceID == "" {
+		return voiceRouteDecision{}, false, nil
+	}
+	if strings.TrimSpace(routeKey) == "" {
+		routeKey = fmt.Sprintf("request-%d", time.Now().UnixNano())
+	}
+	key := sha256.Sum256([]byte(strings.Join([]string{routeKey, providerID, voiceID, backupProviderID, backupVoiceID}, "\x00")))
+	now := time.Now()
+	s.routeMu.Lock()
+	if decision, ok := s.voiceRoutes[key]; ok && now.Before(decision.expiresAt) {
+		s.routeMu.Unlock()
+		return decision, true, nil
+	}
+	s.routeMu.Unlock()
+
+	available, err := s.providerAvailable(ctx, providerID)
+	if err != nil {
+		return voiceRouteDecision{}, false, err
+	}
+	decision := voiceRouteDecision{
+		providerID: providerID,
+		voiceID:    voiceID,
+		expiresAt:  now.Add(voiceRouteTTL),
+	}
+	if !available {
+		decision.providerID = backupProviderID
+		decision.voiceID = backupVoiceID
+		decision.backupUsed = true
+	}
+
+	s.routeMu.Lock()
+	defer s.routeMu.Unlock()
+	if existing, ok := s.voiceRoutes[key]; ok && time.Now().Before(existing.expiresAt) {
+		return existing, true, nil
+	}
+	s.pruneVoiceRoutesLocked(time.Now())
+	s.voiceRoutes[key] = decision
+	return decision, true, nil
+}
+
+func (s *serviceState) providerAvailable(ctx context.Context, providerID string) (bool, error) {
+	for {
+		now := time.Now()
+		s.routeMu.Lock()
+		if s.providerHealth == nil {
+			s.providerHealth = map[string]*providerHealthStatus{}
+		}
+		status := s.providerHealth[providerID]
+		if status != nil && status.ready == nil && now.Before(status.expiresAt) {
+			available := status.available
+			s.routeMu.Unlock()
+			return available, nil
+		}
+		if status == nil || (status.ready == nil && !now.Before(status.expiresAt)) {
+			status = &providerHealthStatus{ready: make(chan struct{})}
+			s.providerHealth[providerID] = status
+			probeCtx := s.ctx
+			if probeCtx == nil {
+				probeCtx = context.Background()
+			}
+			go s.probeProvider(probeCtx, providerID, status)
+		}
+		ready := status.ready
+		s.routeMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-ready:
+		}
+	}
+}
+
+func (s *serviceState) probeProvider(ctx context.Context, providerID string, status *providerHealthStatus) {
+	probeCtx, cancel := context.WithTimeout(ctx, providerHealthTimeout)
+	defer cancel()
+	_, err := listVoicesForProvider(probeCtx, s.providers, providerID)
+	available := err == nil
+	ttl := providerHealthyTTL
+	if !available {
+		ttl = providerUnavailableTTL
+	}
+	s.routeMu.Lock()
+	defer s.routeMu.Unlock()
+	if current := s.providerHealth[providerID]; current != status {
+		return
+	}
+	status.available = available
+	status.expiresAt = time.Now().Add(ttl)
+	close(status.ready)
+	status.ready = nil
+}
+
+func (s *serviceState) pruneVoiceRoutesLocked(now time.Time) {
+	if s.voiceRoutes == nil {
+		s.voiceRoutes = map[[sha256.Size]byte]voiceRouteDecision{}
+	}
+	for key, decision := range s.voiceRoutes {
+		if !now.Before(decision.expiresAt) {
+			delete(s.voiceRoutes, key)
+		}
+	}
+	for len(s.voiceRoutes) >= voiceRouteMaxEntries {
+		var oldestKey [sha256.Size]byte
+		var oldestExpiry time.Time
+		found := false
+		for key, decision := range s.voiceRoutes {
+			if !found || decision.expiresAt.Before(oldestExpiry) {
+				oldestKey = key
+				oldestExpiry = decision.expiresAt
+				found = true
+			}
+		}
+		if !found {
+			break
+		}
+		delete(s.voiceRoutes, oldestKey)
+	}
 }
 
 func synthesisJobContext(parent context.Context, timeout time.Duration, deadlineRaw string) (context.Context, context.CancelFunc, error) {
@@ -1296,21 +1473,11 @@ func synthesizeWithProvider(ctx context.Context, providers map[string]tts.Provid
 }
 
 func synthesizeWithReaderBackup(ctx context.Context, providers map[string]tts.Provider, providerID string, req tts.Request, backup *tts.ReaderBackup) (tts.Audio, tts.Provider, string, bool, error) {
-	return synthesizeWithReaderBackupLimit(ctx, providers, providerID, req, backup, primaryAttemptWithBackup)
-}
-
-func synthesizeWithReaderBackupLimit(ctx context.Context, providers map[string]tts.Provider, providerID string, req tts.Request, backup *tts.ReaderBackup, primaryLimit time.Duration) (tts.Audio, tts.Provider, string, bool, error) {
-	primaryCtx := ctx
-	primaryCancel := func() {}
-	if backup != nil {
-		primaryCtx, primaryCancel = context.WithTimeout(ctx, primaryAttemptBudget(ctx, primaryLimit))
-	}
-	audio, provider, primaryErr := synthesizeWithProvider(primaryCtx, providers, providerID, req)
-	primaryCancel()
+	audio, provider, primaryErr := synthesizeWithProvider(ctx, providers, providerID, req)
 	if primaryErr == nil {
 		return audio, provider, req.VoiceID, false, nil
 	}
-	if backup == nil || ctx.Err() != nil {
+	if backup == nil || !readerBackupEligible(ctx, primaryErr) {
 		return tts.Audio{}, nil, "", false, primaryErr
 	}
 	backupProviderID := tts.NormalizeProvider(backup.Provider)
@@ -1330,23 +1497,11 @@ func synthesizeWithReaderBackupLimit(ctx context.Context, providers map[string]t
 	return audio, provider, backupVoiceID, true, nil
 }
 
-func primaryAttemptBudget(ctx context.Context, primaryLimit time.Duration) time.Duration {
-	if primaryLimit <= 0 {
-		primaryLimit = primaryAttemptWithBackup
-	}
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		return primaryLimit
-	}
-	remaining := time.Until(deadline)
-	if remaining <= 0 {
-		return time.Nanosecond
-	}
-	halfRemaining := remaining / 2
-	if halfRemaining > 0 && halfRemaining < primaryLimit {
-		return halfRemaining
-	}
-	return primaryLimit
+func readerBackupEligible(ctx context.Context, primaryErr error) bool {
+	return ctx.Err() == nil &&
+		errors.Is(primaryErr, tts.ErrProviderUnavailable) &&
+		!errors.Is(primaryErr, context.Canceled) &&
+		!errors.Is(primaryErr, context.DeadlineExceeded)
 }
 
 func providerCandidates(providers map[string]tts.Provider, providerID string) ([]tts.Provider, error) {

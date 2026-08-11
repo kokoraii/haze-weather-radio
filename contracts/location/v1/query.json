@@ -18,6 +18,7 @@
     "max_distance_km": 100.0,
     "minimum_confidence": "high",
     "include_inactive": false,
+    "include_area_geometry": false,
     "dedupe_mode": "similar_name",
     "expand_members": true,
     "station_mode_preference": "auto",

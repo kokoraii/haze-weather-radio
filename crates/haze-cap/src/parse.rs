@@ -1,12 +1,24 @@
 use std::collections::HashSet;
 
-use chrono::{DateTime, FixedOffset};
+use chrono::{DateTime, FixedOffset, NaiveDateTime};
 use quick_xml::de::from_str;
 use serde::Deserialize;
 use thiserror::Error;
 use url::Url;
 
-use crate::model::{Alert, AlertArea, AlertInfo, AtomEntry, NameValue, Resource};
+use crate::model::{
+    Alert, AlertArea, AlertInfo, AtomEntry, GeoPoint, NameValue, Resource, StormInfo,
+};
+
+const ECCC_THREAT_AREA_GEOCODE: &str = "layer:EC-MSC-SMC:DLC:1.1";
+const ECCC_STORM_SPEED: &str = "layer:EC-MSC-SMC:1.1:Storm_Speed";
+const ECCC_STORM_DIRECTION: &str = "layer:EC-MSC-SMC:1.1:Storm_Direction";
+const ECCC_STORM_GEOMETRY_TYPE: &str = "layer:EC-MSC-SMC:1.1:Storm_Geometry_Type";
+const ECCC_STORM_POINT: &str = "layer:EC-MSC-SMC:1.1:Storm_Point";
+const ECCC_STORM_TIME: &str = "layer:EC-MSC-SMC:1.1:Storm_Time";
+const ECCC_MOTION_DESCRIPTION: &str = "layer:EC-MSC-SMC:1.1:Motion_Description";
+const ECCC_STORM_POSITION: &str = "layer:EC-MSC-SMC:1.1:Storm_Position_Description";
+const ECCC_REFERENCE_LOCATIONS: &str = "layer:EC-MSC-SMC:1.1:Reference_Location_Points";
 
 #[derive(Debug, Error)]
 pub enum ParseError {
@@ -200,6 +212,22 @@ pub fn parse_atom_entries(raw: &[u8]) -> Result<Vec<AtomEntry>, ParseError> {
 }
 
 fn normalize_info(info: InfoXml) -> AlertInfo {
+    let parameters = normalize_pairs(info.parameters);
+    let storm = normalize_eccc_storm(&parameters);
+    let areas = info
+        .areas
+        .into_iter()
+        .map(|area| {
+            let geocodes = normalize_pairs(area.geocodes);
+            AlertArea {
+                description: clean(&area.description),
+                polygons: clean_slice(area.polygons),
+                circles: clean_slice(area.circles),
+                threat_status: eccc_threat_status(&geocodes),
+                geocodes,
+            }
+        })
+        .collect();
     AlertInfo {
         language: clean(&info.language),
         category: clean_slice(info.category),
@@ -218,17 +246,8 @@ fn normalize_info(info: InfoXml) -> AlertInfo {
         instruction: clean(&info.instruction),
         web: clean(&info.web),
         event_codes: normalize_pairs(info.event_codes),
-        areas: info
-            .areas
-            .into_iter()
-            .map(|area| AlertArea {
-                description: clean(&area.description),
-                polygons: clean_slice(area.polygons),
-                circles: clean_slice(area.circles),
-                geocodes: normalize_pairs(area.geocodes),
-            })
-            .collect(),
-        parameters: normalize_pairs(info.parameters),
+        areas,
+        parameters,
         resources: info
             .resources
             .into_iter()
@@ -239,6 +258,7 @@ fn normalize_info(info: InfoXml) -> AlertInfo {
                 deref_uri: clean(&resource.deref_uri),
             })
             .collect(),
+        storm,
     }
 }
 
@@ -329,6 +349,7 @@ fn validate_cap(alert: &Alert) -> Vec<String> {
                 }
             }
         }
+        validate_eccc_2026_info(info, &prefix, &mut warnings);
     }
     warnings
 }
@@ -370,6 +391,153 @@ fn normalize_pairs(values: Vec<PairXml>) -> Vec<NameValue> {
             }
         })
         .collect()
+}
+
+fn eccc_threat_status(geocodes: &[NameValue]) -> String {
+    geocodes
+        .iter()
+        .find(|geocode| geocode.name.eq_ignore_ascii_case(ECCC_THREAT_AREA_GEOCODE))
+        .map(|geocode| geocode.value.trim().to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+fn normalize_eccc_storm(parameters: &[NameValue]) -> Option<StormInfo> {
+    let mut storm = StormInfo::default();
+    let mut found = false;
+    for parameter in parameters {
+        let name = parameter.name.trim();
+        let value = parameter.value.trim();
+        if name.eq_ignore_ascii_case(ECCC_STORM_SPEED) {
+            found = true;
+            storm.speed = value.to_string();
+            if let Some((number, unit)) = parse_eccc_storm_speed(value) {
+                storm.speed_value = Some(number);
+                storm.speed_unit = unit;
+            }
+        } else if name.eq_ignore_ascii_case(ECCC_STORM_DIRECTION) {
+            found = true;
+            storm.direction_degrees = value
+                .parse::<f64>()
+                .ok()
+                .filter(|number| number.is_finite() && (0.0..=360.0).contains(number));
+        } else if name.eq_ignore_ascii_case(ECCC_STORM_GEOMETRY_TYPE) {
+            found = true;
+            storm.geometry_type = value.to_ascii_lowercase();
+        } else if name.eq_ignore_ascii_case(ECCC_STORM_POINT) {
+            found = true;
+            storm
+                .points
+                .extend(value.split_whitespace().filter_map(parse_eccc_storm_point));
+        } else if name.eq_ignore_ascii_case(ECCC_STORM_TIME) {
+            found = true;
+            storm.time = value.to_string();
+        } else if name.eq_ignore_ascii_case(ECCC_MOTION_DESCRIPTION) {
+            found = true;
+            storm.motion_description = value.to_string();
+        } else if name.eq_ignore_ascii_case(ECCC_STORM_POSITION) {
+            found = true;
+            storm.position_description = value.to_string();
+        } else if name.eq_ignore_ascii_case(ECCC_REFERENCE_LOCATIONS) {
+            found = true;
+            storm.reference_location_points = value.to_string();
+        }
+    }
+    found.then_some(storm)
+}
+
+fn validate_eccc_2026_info(info: &AlertInfo, prefix: &str, warnings: &mut Vec<String>) {
+    for (index, area) in info.areas.iter().enumerate() {
+        if area.threat_status.is_empty() {
+            continue;
+        }
+        if !matches!(
+            area.threat_status.as_str(),
+            "issued" | "continued" | "ended" | "cancelled"
+        ) {
+            warnings.push(format!(
+                "{prefix}.area[{index}]: invalid ECCC threat status {}",
+                area.threat_status
+            ));
+        }
+        if area.polygons.is_empty() {
+            warnings.push(format!(
+                "{prefix}.area[{index}]: ECCC threat area has no polygon"
+            ));
+        }
+    }
+    for parameter in &info.parameters {
+        let name = parameter.name.trim();
+        let value = parameter.value.trim();
+        if name.eq_ignore_ascii_case(ECCC_STORM_SPEED) {
+            if parse_eccc_storm_speed(value).is_none() {
+                warnings.push(format!("{prefix}: invalid ECCC storm speed"));
+            }
+        } else if name.eq_ignore_ascii_case(ECCC_STORM_DIRECTION) {
+            if value
+                .parse::<f64>()
+                .ok()
+                .filter(|number| number.is_finite() && (0.0..=360.0).contains(number))
+                .is_none()
+            {
+                warnings.push(format!("{prefix}: invalid ECCC storm direction"));
+            }
+        } else if name.eq_ignore_ascii_case(ECCC_STORM_GEOMETRY_TYPE) {
+            if !matches!(
+                value.to_ascii_lowercase().as_str(),
+                "isolated_cell" | "area" | "line"
+            ) {
+                warnings.push(format!("{prefix}: invalid ECCC storm geometry type"));
+            }
+        } else if name.eq_ignore_ascii_case(ECCC_STORM_POINT) {
+            let points: Vec<_> = value.split_whitespace().collect();
+            if points.is_empty()
+                || points
+                    .iter()
+                    .any(|point| parse_eccc_storm_point(point).is_none())
+            {
+                warnings.push(format!("{prefix}: invalid ECCC storm point"));
+            }
+        } else if name.eq_ignore_ascii_case(ECCC_STORM_TIME) && !valid_eccc_storm_time(value) {
+            warnings.push(format!("{prefix}: invalid ECCC storm time"));
+        }
+    }
+}
+
+fn parse_eccc_storm_speed(raw: &str) -> Option<(f64, String)> {
+    let fields: Vec<_> = raw.split_whitespace().collect();
+    if fields.len() != 2 {
+        return None;
+    }
+    let value = fields[0].parse::<f64>().ok()?;
+    let unit = fields[1].to_ascii_lowercase();
+    if !value.is_finite() || value < 0.0 || !matches!(unit.as_str(), "km/h" | "knots") {
+        return None;
+    }
+    Some((value, unit))
+}
+
+fn parse_eccc_storm_point(raw: &str) -> Option<GeoPoint> {
+    let (latitude, longitude) = raw.trim().split_once(',')?;
+    let latitude = latitude.trim().parse::<f64>().ok()?;
+    let longitude = longitude.trim().parse::<f64>().ok()?;
+    if !latitude.is_finite()
+        || !longitude.is_finite()
+        || !(-90.0..=90.0).contains(&latitude)
+        || !(-180.0..=180.0).contains(&longitude)
+    {
+        return None;
+    }
+    Some(GeoPoint {
+        latitude,
+        longitude,
+    })
+}
+
+fn valid_eccc_storm_time(raw: &str) -> bool {
+    raw.len() == 17
+        && raw.bytes().all(|byte| byte.is_ascii_digit())
+        && NaiveDateTime::parse_from_str(&raw[..14], "%Y%m%d%H%M%S").is_ok()
+        && raw[14..].parse::<u16>().is_ok_and(|value| value <= 999)
 }
 
 fn clean_slice(values: Vec<String>) -> Vec<String> {
@@ -470,6 +638,57 @@ mod tests {
         assert_eq!(entries[0].id, "https://alerts.example/item/1");
         assert_eq!(entries[0].links[0], "https://alerts.example/item/1");
         assert_eq!(entries[0].links[1], "https://alerts.example/item/1.cap");
+    }
+
+    #[test]
+    fn parses_eccc_august_2026_threat_areas_and_storm_info() {
+        let raw =
+            include_bytes!("../../../services/go/testdata/cap/eccc_2026_true_threat_area.xml");
+        let alert = parse_cap(raw).expect("ECCC August 2026 CAP parsed");
+        let info = &alert.infos[0];
+        assert_eq!(info.areas.len(), 5);
+        assert_eq!(info.areas[0].threat_status, "");
+        assert_eq!(info.areas[1].threat_status, "issued");
+        assert_eq!(info.areas[2].threat_status, "continued");
+        assert_eq!(info.areas[3].threat_status, "ended");
+        assert_eq!(info.areas[4].threat_status, "cancelled");
+        let storm = info.storm.as_ref().expect("storm info");
+        assert_eq!(storm.speed_value, Some(40.0));
+        assert_eq!(storm.speed_unit, "km/h");
+        assert_eq!(storm.direction_degrees, Some(90.12841));
+        assert_eq!(storm.geometry_type, "isolated_cell");
+        assert_eq!(storm.points.len(), 1);
+        assert_eq!(storm.points[0].latitude, 52.1433);
+        assert_eq!(storm.points[0].longitude, -106.6732);
+        assert_eq!(storm.time, "20260811153000000");
+        assert!(alert.warnings.is_empty(), "warnings: {:?}", alert.warnings);
+    }
+
+    #[test]
+    fn warns_on_non_finite_eccc_storm_values() {
+        let raw = br#"
+<alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
+  <identifier>invalid-eccc-storm</identifier>
+  <sender>cap-pac@canada.ca</sender>
+  <sent>2026-08-11T15:30:00Z</sent>
+  <status>Actual</status>
+  <msgType>Alert</msgType>
+  <scope>Public</scope>
+  <info>
+    <language>en-CA</language>
+    <category>Met</category>
+    <event>tornado warning</event>
+    <parameter><valueName>layer:EC-MSC-SMC:1.1:Storm_Speed</valueName><value>NaN km/h</value></parameter>
+    <parameter><valueName>layer:EC-MSC-SMC:1.1:Storm_Direction</valueName><value>NaN</value></parameter>
+    <parameter><valueName>layer:EC-MSC-SMC:1.1:Storm_Point</valueName><value>NaN,-106.67</value></parameter>
+  </info>
+</alert>
+"#;
+        let alert = parse_cap(raw).expect("invalid typed values remain non-fatal");
+        let warnings = alert.warnings.join(" | ");
+        assert!(warnings.contains("invalid ECCC storm speed"));
+        assert!(warnings.contains("invalid ECCC storm direction"));
+        assert!(warnings.contains("invalid ECCC storm point"));
     }
 
     #[test]

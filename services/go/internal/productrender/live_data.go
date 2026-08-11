@@ -332,6 +332,9 @@ func (r renderer) loadLiveAirQualitySnapshot(feed feedXML, lang string, snapshot
 		var raw liveAirQualityFile
 		input, ok := r.loadStoreProductPayload("air_quality", loc.Source, loc.ID, &raw)
 		if !ok {
+			input, ok = r.fetchLiveAQHI(loc, &raw)
+		}
+		if !ok {
 			continue
 		}
 		aqhi, ok := numberFromAny(raw.AQHI)
@@ -405,6 +408,9 @@ func (r renderer) loadLiveMarineForecastSnapshot(feed feedXML, lang string, snap
 	for _, loc := range feedMarineForecastLocations(feed) {
 		var raw liveMarineForecastFile
 		input, ok := r.loadStoreProductPayload("marine_forecast", loc.Source, loc.ID, &raw)
+		if !ok {
+			input, ok = r.fetchLiveMarineForecast(loc, &raw)
+		}
 		if !ok {
 			continue
 		}
@@ -1135,6 +1141,11 @@ func (r renderer) loadStoreProductPayload(kind string, sourceRaw string, id stri
 }
 
 func (r renderer) loadSpecialtyProductSnapshot(kind string, feed feedXML, snapshot *liveSpecialtyProductFile) (string, bool) {
+	if feed.OnDemand && strings.EqualFold(strings.TrimSpace(kind), "hydrometric") {
+		if input, ok := r.fetchLiveHydrometric(feed, snapshot); ok {
+			return input, true
+		}
+	}
 	input, ok := r.loadStoreProductPayload(kind, "eccc", feed.ID, snapshot)
 	if !ok {
 		return "", false
@@ -1143,6 +1154,193 @@ func (r renderer) loadSpecialtyProductSnapshot(kind string, feed feedXML, snapsh
 		return "", false
 	}
 	return input, true
+}
+
+func (r renderer) fetchLiveAQHI(loc locationXML, target *liveAirQualityFile) (string, bool) {
+	return r.fetchLiveAQHIFromBase(loc, target, "https://api.weather.gc.ca")
+}
+
+func (r renderer) fetchLiveAQHIFromBase(loc locationXML, target *liveAirQualityFile, apiBase string) (string, bool) {
+	id := strings.TrimSpace(loc.ID)
+	if canonicalSource(loc.Source) != "eccc" || id == "" || target == nil {
+		return "", false
+	}
+	apiBase = strings.TrimRight(strings.TrimSpace(apiBase), "/")
+	if apiBase == "" {
+		return "", false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	observationURL := fmt.Sprintf("%s/collections/aqhi-observations-realtime/items?offset=0&limit=1000&sortby=-latest&location_id=%s&f=json", apiBase, url.QueryEscape(id))
+	forecastURL := fmt.Sprintf("%s/collections/aqhi-forecasts-realtime/items?limit=1000&offset=0&f=json&sortby=-publication_datetime&aqhi_type=-Period&location_id=%s", apiBase, url.QueryEscape(id))
+	var observationRaw map[string]any
+	var forecastRaw map[string]any
+	observationErr := fetchJSON(ctx, observationURL, &observationRaw)
+	forecastErr := fetchJSON(ctx, forecastURL, &forecastRaw)
+	if observationErr != nil && forecastErr != nil {
+		return "", false
+	}
+	payload := map[string]any{"source": "eccc"}
+	if properties := liveFirstFeatureProperties(observationRaw); properties != nil {
+		payload["location"] = map[string]any{"en": liveText(properties["location_name_en"]), "fr": liveText(properties["location_name_fr"])}
+		payload["observed_at"] = properties["observation_datetime"]
+		payload["aqhi"] = properties["aqhi"]
+		payload["special_notes"] = map[string]any{"en": liveText(properties["special_notes_en"]), "fr": liveText(properties["special_notes_fr"])}
+	}
+	if properties := liveFirstFeatureProperties(forecastRaw); properties != nil {
+		payload["forecast"] = map[string]any{
+			"published_at": properties["publication_datetime"],
+			"periods":      liveAQHIPeriods(properties),
+		}
+	}
+	if len(payload) <= 1 || !decodeLiveValue(payload, target) {
+		return "", false
+	}
+	return "eccc:aqhi/" + id, true
+}
+
+func (r renderer) fetchLiveMarineForecast(loc locationXML, target *liveMarineForecastFile) (string, bool) {
+	return r.fetchLiveMarineForecastFromBase(loc, target, "https://api.weather.gc.ca")
+}
+
+func (r renderer) fetchLiveMarineForecastFromBase(loc locationXML, target *liveMarineForecastFile, apiBase string) (string, bool) {
+	id := strings.TrimSpace(loc.ID)
+	if canonicalSource(loc.Source) != "eccc" || id == "" || target == nil {
+		return "", false
+	}
+	apiBase = strings.TrimRight(strings.TrimSpace(apiBase), "/")
+	if apiBase == "" {
+		return "", false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	endpoint := fmt.Sprintf("%s/collections/marineweather-realtime/items/%s?lang=en", apiBase, url.QueryEscape(id))
+	if err := fetchJSON(ctx, endpoint, target); err != nil {
+		return "", false
+	}
+	return "eccc:marine/" + id, true
+}
+
+func (r renderer) fetchLiveHydrometric(feed feedXML, target *liveSpecialtyProductFile) (string, bool) {
+	return r.fetchLiveHydrometricFromBase(feed, target, "https://api.weather.gc.ca")
+}
+
+func (r renderer) fetchLiveHydrometricFromBase(feed feedXML, target *liveSpecialtyProductFile, apiBase string) (string, bool) {
+	if target == nil {
+		return "", false
+	}
+	apiBase = strings.TrimRight(strings.TrimSpace(apiBase), "/")
+	if apiBase == "" {
+		return "", false
+	}
+	items := make([]map[string]any, 0)
+	inputs := make([]string, 0)
+	appendLocations := func(relation string, locations []locationXML) {
+		for _, loc := range locations {
+			id := strings.TrimSpace(loc.ID)
+			if canonicalSource(loc.Source) != "eccc" || id == "" {
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			endpoint := apiBase + "/collections/hydrometric-realtime/items?limit=1&sortby=-DATETIME&STATION_NUMBER=" + url.QueryEscape(id) + "&f=json"
+			var raw map[string]any
+			err := fetchJSON(ctx, endpoint, &raw)
+			cancel()
+			if err != nil {
+				continue
+			}
+			properties := liveFirstFeatureProperties(raw)
+			if properties == nil {
+				continue
+			}
+			items = append(items, map[string]any{
+				"id":           liveFirstNonBlank(liveText(properties["IDENTIFIER"]), id),
+				"station_id":   liveFirstNonBlank(liveText(properties["STATION_NUMBER"]), id),
+				"canonical_id": loc.CanonicalID,
+				"raw_source":   loc.Source,
+				"raw_id":       id,
+				"station":      liveFirstNonBlank(loc.NameOverride, liveText(properties["STATION_NAME"]), id),
+				"relation":     relation,
+				"order":        len(items),
+				"observed_at":  liveFirstNonBlank(liveText(properties["DATETIME_LST"]), liveText(properties["DATETIME"])),
+				"level_m":      properties["LEVEL"],
+				"discharge":    properties["DISCHARGE"],
+				"level_note":   liveText(properties["LEVEL_SYMBOL_EN"]),
+				"flow_note":    liveText(properties["DISCHARGE_SYMBOL_EN"]),
+				"published_at": liveFirstNonBlank(liveText(properties["DATETIME_LST"]), liveText(properties["DATETIME"])),
+			})
+			inputs = append(inputs, "eccc:hydrometric/"+id)
+		}
+	}
+	appendLocations("primary", feed.Locations.HydrometricLocations.Locations)
+	appendLocations("upstream", feed.Locations.HydrometricLocations.Upstream.Locations)
+	appendLocations("downstream", feed.Locations.HydrometricLocations.Downstream.Locations)
+	if len(items) == 0 {
+		return "", false
+	}
+	*target = liveSpecialtyProductFile{
+		Source:     "eccc",
+		Collection: "hydrometric-realtime",
+		Title:      "River Conditions",
+		UpdatedAt:  time.Now().UTC().Format(time.RFC3339),
+		Items:      items,
+	}
+	return strings.Join(inputs, ";"), true
+}
+
+func liveFirstFeatureProperties(raw map[string]any) map[string]any {
+	features, _ := raw["features"].([]any)
+	if len(features) == 0 {
+		return nil
+	}
+	feature, _ := features[0].(map[string]any)
+	return mapAt(feature, "properties")
+}
+
+func liveAQHIPeriods(properties map[string]any) []map[string]any {
+	group := mapAt(properties, "forecast_period")
+	keys := []string{"period_1", "period1", "period_2", "period2", "period_3", "period3", "period_4", "period4", "period_5", "period5", "period_6", "period6"}
+	out := make([]map[string]any, 0, 6)
+	seen := make(map[string]struct{})
+	for _, key := range keys {
+		period := mapAt(group, key)
+		if len(period) == 0 {
+			continue
+		}
+		normalized := strings.ReplaceAll(key, "_", "")
+		if _, exists := seen[normalized]; exists {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		out = append(out, map[string]any{
+			"period":       map[string]any{"en": liveText(period["forecast_period_en"]), "fr": liveText(period["forecast_period_fr"])},
+			"aqhi":         period["aqhi"],
+			"aqhi_insmoke": period["aqhi_insmoke"],
+		})
+	}
+	return out
+}
+
+func decodeLiveValue(source any, target any) bool {
+	raw, err := json.Marshal(source)
+	if err != nil {
+		return false
+	}
+	return json.Unmarshal(raw, target) == nil
+}
+
+func liveText(value any) string {
+	text, _ := value.(string)
+	return strings.TrimSpace(text)
+}
+
+func liveFirstNonBlank(values ...string) string {
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func canonicalSource(raw string) string {

@@ -16,12 +16,25 @@ type sipSearchInput struct {
 	voice bool
 }
 
+type locationSearchChoiceAction uint8
+
+const (
+	locationSearchChoiceWait locationSearchChoiceAction = iota
+	locationSearchChoiceBack
+	locationSearchChoiceAccept
+)
+
 func (c *sipCall) searchLocation(language string, region string) (ResolvedLocation, bool) {
 	if c == nil || c.service == nil || c.service.searchIndex == nil || !c.service.cfg.IVR.Search.enabled() {
 		c.playPrompt("location_number", "search_unavailable", map[string]string{"lang": language})
 		return ResolvedLocation{}, false
 	}
-	contextHint := locationSearchContext{Region: searchRegionFromSelector(region), Language: language}
+	contextHint := sipLocationSearchContext(
+		language,
+		region,
+		c.callerProvince,
+		c.service.cfg.IVR.Search.CallerHintEnabled,
+	)
 	for attempt := 0; attempt < c.service.cfg.IVR.Search.MaxAttempts && c.ctx.Err() == nil; attempt++ {
 		decision, voiceFailed := c.runSearchAttempt(language, contextHint, c.service.cfg.IVR.Search.voiceEnabled())
 		if voiceFailed {
@@ -150,13 +163,27 @@ func (c *sipCall) confirmSearchDecision(language string, decision locationSearch
 		return ResolvedLocation{}, false
 	case locationSearchChoices:
 		c.service.metrics.SearchAmbiguities.Add(1)
-		text := localizedChoicePrompt(language, decision.Matches)
-		digit, ok := c.promptTextAndWaitDigit("location_search_choices", text, 10*time.Second)
-		if !ok || len(digit) != 1 || digit[0] < '1' || int(digit[0]-'1') >= len(decision.Matches) {
+		if len(decision.Matches) == 0 {
 			return ResolvedLocation{}, false
 		}
-		c.service.metrics.SearchAccepted.Add(1)
-		return localizedSearchLocation(decision.Matches[int(digit[0]-'1')], language), true
+		current := 0
+		for c.ctx.Err() == nil {
+			text := localizedAmbiguityPrompt(language, decision.Matches[current])
+			digit, ok := c.promptTextAndWaitDigit("location_search_choices", text, 10*time.Second)
+			if !ok {
+				return ResolvedLocation{}, false
+			}
+			var action locationSearchChoiceAction
+			current, action = advanceLocationSearchChoice(current, len(decision.Matches), digit)
+			switch action {
+			case locationSearchChoiceBack:
+				return ResolvedLocation{}, false
+			case locationSearchChoiceAccept:
+				c.service.metrics.SearchAccepted.Add(1)
+				return localizedSearchLocation(decision.Matches[current], language), true
+			}
+		}
+		return ResolvedLocation{}, false
 	case locationSearchRefine:
 		c.service.metrics.SearchAmbiguities.Add(1)
 	default:
@@ -282,20 +309,90 @@ func localizedConfirmPrompt(language string, name string, region string) string 
 	return fmt.Sprintf("Did you mean %s? Press 1 for yes, or 2 for no.", location)
 }
 
-func localizedChoicePrompt(language string, matches []locationSearchMatch) string {
-	parts := make([]string, 0, len(matches)+1)
+func regionalLocationSearchContext(language string, selector string) locationSearchContext {
+	region := searchRegionFromSelector(selector)
+	return locationSearchContext{
+		Region:         region,
+		ExplicitRegion: region != "",
+		Language:       language,
+	}
+}
+
+func sipLocationSearchContext(language string, selector string, callerProvince string, callerHintEnabled bool) locationSearchContext {
+	hint := regionalLocationSearchContext(language, selector)
+	if !hint.ExplicitRegion && callerHintEnabled {
+		hint.Region = searchRegionFromSelector(callerProvince)
+	}
+	return hint
+}
+
+func advanceLocationSearchChoice(current int, count int, digit string) (int, locationSearchChoiceAction) {
+	if count <= 0 {
+		return 0, locationSearchChoiceBack
+	}
+	if current < 0 || current >= count {
+		current = 0
+	}
+	switch digit {
+	case "1":
+		return current, locationSearchChoiceBack
+	case "2":
+		return current, locationSearchChoiceAccept
+	case "3":
+		return (current + 1) % count, locationSearchChoiceWait
+	default:
+		return current, locationSearchChoiceWait
+	}
+}
+
+func localizedAmbiguityPrompt(language string, match locationSearchMatch) string {
+	location := localizedAmbiguityDisplay(language, match.DisplayName, match.Target.Location.Province)
 	if strings.HasPrefix(strings.ToLower(language), "fr") {
-		parts = append(parts, "Plusieurs lieux correspondent.")
-		for index, match := range matches {
-			parts = append(parts, fmt.Sprintf("Pour %s, appuyez sur %d.", localizedSearchDisplay(match.DisplayName, match.Target.Location.Province), index+1))
-		}
-		return strings.Join(parts, " ")
+		return fmt.Sprintf("%s. Appuyez sur 2 pour choisir ce lieu, sur 3 pour le lieu suivant, ou sur 1 pour revenir en arrière.", location)
 	}
-	parts = append(parts, "Several locations match.")
-	for index, match := range matches {
-		parts = append(parts, fmt.Sprintf("For %s, press %d.", localizedSearchDisplay(match.DisplayName, match.Target.Location.Province), index+1))
+	return fmt.Sprintf("%s. Press 2 to choose this location, 3 for the next match, or 1 to go back.", location)
+}
+
+func localizedChoicePrompt(language string, matches []locationSearchMatch) string {
+	if len(matches) == 0 {
+		return ""
 	}
-	return strings.Join(parts, " ")
+	return localizedAmbiguityPrompt(language, matches[0])
+}
+
+func localizedAmbiguityDisplay(language string, name string, region string) string {
+	name = strings.TrimSpace(name)
+	region = localizedSearchRegionDisplayName(language, region)
+	if region == "" {
+		return name
+	}
+	return name + ", " + region
+}
+
+func localizedSearchRegionDisplayName(language string, region string) string {
+	if !strings.HasPrefix(strings.ToLower(language), "fr") {
+		return searchRegionDisplayName(region)
+	}
+	if name := frenchCanadianRegionDisplayNames[strings.ToUpper(strings.TrimSpace(region))]; name != "" {
+		return name
+	}
+	return searchRegionDisplayName(region)
+}
+
+var frenchCanadianRegionDisplayNames = map[string]string{
+	"AB": "Alberta",
+	"BC": "Colombie-Britannique",
+	"MB": "Manitoba",
+	"NB": "Nouveau-Brunswick",
+	"NL": "Terre-Neuve-et-Labrador",
+	"NS": "Nouvelle-Écosse",
+	"NT": "Territoires du Nord-Ouest",
+	"NU": "Nunavut",
+	"ON": "Ontario",
+	"PE": "Île-du-Prince-Édouard",
+	"QC": "Québec",
+	"SK": "Saskatchewan",
+	"YT": "Yukon",
 }
 
 func localizedSearchDisplay(name string, region string) string {

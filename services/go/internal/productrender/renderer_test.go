@@ -2452,3 +2452,42 @@ func mustJSONMap(t *testing.T, raw string) map[string]any {
 	}
 	return payload
 }
+
+func TestOnDemandFeedOverridesCapabilitySpecificLocations(t *testing.T) {
+	t.Parallel()
+	request := wxOnDemandRequest{
+		LocationName:     "Test Municipality",
+		ForecastID:       "SK-40",
+		StationID:        "CYXE",
+		AirQualityID:     "AQSASK",
+		ClimateID:        "4057120",
+		HydrometricID:    "05HG001",
+		MarineForecastID: "088800",
+		Latitude:         "52.17",
+		Longitude:        "-106.70",
+		Language:         "en-CA",
+		Telephone:        true,
+	}
+	feed, err := newRenderer(loadedConfig{}).onDemandFeed(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := feed.Locations.Coverage.Regions[0].DeriveForecast; got != "SK-40" {
+		t.Fatalf("forecast = %q", got)
+	}
+	if got := feed.Locations.ObservationLocations.Locations[0].ID; got != "CYXE" {
+		t.Fatalf("observation = %q", got)
+	}
+	if got := feed.Locations.AirQualityLocations.Locations[0].ID; got != "AQSASK" {
+		t.Fatalf("air quality = %q", got)
+	}
+	if got := feed.Locations.ClimateLocations.Locations[0].ID; got != "4057120" {
+		t.Fatalf("climate = %q", got)
+	}
+	if got := feed.Locations.HydrometricLocations.Locations[0].ID; got != "05HG001" {
+		t.Fatalf("hydrometric = %q", got)
+	}
+	if got := feed.Locations.MarineForecastLocations.Locations[0].ID; got != "088800" {
+		t.Fatalf("marine forecast = %q", got)
+	}
+}

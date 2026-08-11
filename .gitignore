@@ -62,6 +62,7 @@ scripts/util/*.sqlite
 bundle/managed/locations/*.sqlite
 bundle/managed/locations/*.sqlite-*
 bundle/managed/locations/*.sha256
+bundle/managed/locations/*.manifest.json
 bundle/managed/.alert-location-*-candidate.sqlite
 bundle/managed/alert_location_map.sqlite-*
 bundle/managed/location-catalog-backups/
@@ -87,3 +88,4 @@ services/go/internal/ivr/runtime/ivr/sip-debug.log
 
 # AI Slop
 .agents/
+.codex-deploy/*

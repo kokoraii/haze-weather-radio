@@ -30,6 +30,13 @@ from typing import Any, Iterable, Iterator
 LOCATION_NAMESPACE = uuid.UUID("f987bc4e-56fe-5f41-8bcf-fdcf8c5a8e3e")
 USER_AGENT = "haze-location-catalog-builder/1.0"
 SCHEMA = Path(__file__).resolve().parents[2] / "crates" / "haze-location" / "schema" / "v1.sql"
+GEOMETRY_SCHEMA = (
+    Path(__file__).resolve().parents[2]
+    / "crates"
+    / "haze-location"
+    / "schema"
+    / "geometry_v1.sql"
+)
 
 
 def normalize_name(value: Any) -> str:
@@ -208,6 +215,106 @@ def geometry_bbox(geometry: dict[str, Any]) -> tuple[float, float, float, float]
     return min(longitudes), max(longitudes), min(latitudes), max(latitudes)
 
 
+def normalize_longitude(longitude: float) -> float:
+    normalized = (longitude + 180.0) % 360.0 - 180.0
+    if normalized == -180.0 and longitude > 0:
+        return 180.0
+    return normalized
+
+
+def unwrap_ring(ring: Iterable[Iterable[float]]) -> list[tuple[float, float]]:
+    points = [(float(point[0]), float(point[1])) for point in ring]
+    if not points:
+        return []
+    unwrapped = [points[0]]
+    for longitude, latitude in points[1:]:
+        previous = unwrapped[-1][0]
+        while longitude - previous > 180.0:
+            longitude -= 360.0
+        while longitude - previous < -180.0:
+            longitude += 360.0
+        unwrapped.append((longitude, latitude))
+    if unwrapped[0] != unwrapped[-1]:
+        unwrapped.append(unwrapped[0])
+    return unwrapped
+
+
+def ring_centroid(ring: Iterable[Iterable[float]]) -> tuple[float, float, float] | None:
+    points = unwrap_ring(ring)
+    if len(points) < 4:
+        return None
+    twice_area = 0.0
+    longitude_sum = 0.0
+    latitude_sum = 0.0
+    for current, following in zip(points, points[1:]):
+        cross = current[0] * following[1] - following[0] * current[1]
+        twice_area += cross
+        longitude_sum += (current[0] + following[0]) * cross
+        latitude_sum += (current[1] + following[1]) * cross
+    if abs(twice_area) <= 1e-12:
+        return None
+    return (
+        longitude_sum / (3.0 * twice_area),
+        latitude_sum / (3.0 * twice_area),
+        abs(twice_area) / 2.0,
+    )
+
+
+def align_longitude(longitude: float, reference: float) -> float:
+    while longitude - reference > 180.0:
+        longitude -= 360.0
+    while longitude - reference < -180.0:
+        longitude += 360.0
+    return longitude
+
+
+def polygon_centroid(polygon: Iterable[Iterable[Iterable[float]]]) -> tuple[float, float, float]:
+    rings = list(polygon)
+    if not rings:
+        raise ValueError("polygon has no rings")
+    exterior = ring_centroid(rings[0])
+    if exterior is None:
+        raise ValueError("polygon exterior has zero area")
+    reference = exterior[0]
+    weighted_longitude = exterior[0] * exterior[2]
+    weighted_latitude = exterior[1] * exterior[2]
+    net_area = exterior[2]
+    for ring in rings[1:]:
+        hole = ring_centroid(ring)
+        if hole is None:
+            continue
+        hole_longitude = align_longitude(hole[0], reference)
+        weighted_longitude -= hole_longitude * hole[2]
+        weighted_latitude -= hole[1] * hole[2]
+        net_area -= hole[2]
+    if net_area <= 1e-12:
+        raise ValueError("polygon has no positive area after holes")
+    return weighted_longitude / net_area, weighted_latitude / net_area, net_area
+
+
+def geometry_centroid(geometry: dict[str, Any]) -> tuple[float, float]:
+    geometry_type = geometry.get("type")
+    coordinates = geometry.get("coordinates")
+    if geometry_type == "Polygon":
+        longitude, latitude, _ = polygon_centroid(coordinates)
+    elif geometry_type == "MultiPolygon":
+        polygons = [polygon_centroid(polygon) for polygon in coordinates]
+        if not polygons:
+            raise ValueError("multipolygon has no polygons")
+        reference = polygons[0][0]
+        total_area = sum(polygon[2] for polygon in polygons)
+        longitude = sum(
+            align_longitude(polygon[0], reference) * polygon[2] for polygon in polygons
+        ) / total_area
+        latitude = sum(polygon[1] * polygon[2] for polygon in polygons) / total_area
+    else:
+        raise ValueError(f"unsupported centroid geometry type {geometry_type!r}")
+    longitude = normalize_longitude(longitude)
+    if not (-180.0 <= longitude <= 180.0 and -90.0 <= latitude <= 90.0):
+        raise ValueError(f"geometry centroid outside WGS84: {longitude},{latitude}")
+    return longitude, latitude
+
+
 def ring_wkb(ring: Iterable[Iterable[float]]) -> bytes:
     points = [(float(point[0]), float(point[1])) for point in ring]
     if points and points[0] != points[-1]:
@@ -262,37 +369,73 @@ def identifier_value(properties: dict[str, Any], specification: dict[str, Any]) 
 
 
 class Catalog:
-    def __init__(self, path: Path, pack_id: str, retrieved_at: str) -> None:
+    def __init__(
+        self,
+        path: Path,
+        pack_id: str,
+        retrieved_at: str,
+        geometry_path: Path | None = None,
+    ) -> None:
+        self.path = path
         self.connection = sqlite3.connect(path)
         self.connection.executescript(SCHEMA.read_text(encoding="utf-8"))
         self.pack_id = pack_id
         self.retrieved_at = retrieved_at
         self.source_counts: dict[str, int] = {}
+        self.source_metadata: dict[str, dict[str, Any]] = {}
+        self.geometry_path = geometry_path
+        self.geometry_connection: sqlite3.Connection | None = None
         self.connection.executemany(
             "INSERT OR REPLACE INTO catalog_metadata(key, value) VALUES(?, ?)",
             [("pack_id", pack_id), ("schema_version", "1"), ("retrieved_at", retrieved_at)],
         )
+        if geometry_path is not None:
+            self.connection.execute(
+                "INSERT OR REPLACE INTO catalog_metadata(key, value) VALUES('pack_kind', 'core')"
+            )
+            self.geometry_connection = sqlite3.connect(geometry_path)
+            self.geometry_connection.executescript(GEOMETRY_SCHEMA.read_text(encoding="utf-8"))
+            self.geometry_connection.executemany(
+                "INSERT OR REPLACE INTO catalog_metadata(key, value) VALUES(?, ?)",
+                [
+                    ("pack_id", f"{pack_id}-geometry"),
+                    ("pack_kind", "geometry"),
+                    ("core_pack_id", pack_id),
+                    ("schema_version", "1"),
+                    ("retrieved_at", retrieved_at),
+                ],
+            )
 
     def add_source(self, source: dict[str, Any], digest: str) -> None:
         source_id = source["id"]
+        self.source_metadata[source_id] = source
+        source_row = (
+            source_id,
+            source.get("title", source_id),
+            source.get("version"),
+            self.retrieved_at,
+            source.get("valid_from"),
+            source.get("valid_to"),
+            source.get("licence"),
+            source.get("attribution"),
+            digest,
+            json.dumps(source.get("attributes", {}), sort_keys=True, separators=(",", ":")),
+        )
         self.connection.execute(
             """INSERT OR REPLACE INTO sources(
                    source_id, title, source_version, retrieved_at, valid_from, valid_to,
                    licence, attribution, source_sha256, attributes_json
                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                source_id,
-                source.get("title", source_id),
-                source.get("version"),
-                self.retrieved_at,
-                source.get("valid_from"),
-                source.get("valid_to"),
-                source.get("licence"),
-                source.get("attribution"),
-                digest,
-                json.dumps(source.get("attributes", {}), sort_keys=True, separators=(",", ":")),
-            ),
+            source_row,
         )
+        if self.geometry_connection is not None:
+            self.geometry_connection.execute(
+                """INSERT OR REPLACE INTO sources(
+                       source_id, title, source_version, retrieved_at, valid_from, valid_to,
+                       licence, attribution, source_sha256, attributes_json
+                   ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                source_row,
+            )
         self.source_counts[source_id] = 0
 
     def add_entity(
@@ -398,52 +541,184 @@ class Catalog:
             minimum_lon, maximum_lon, minimum_lat, maximum_lat = geometry_bbox(geometry)
             point = geometry.get("coordinates") if geometry.get("type") == "Point" else None
             encoded_geometry = geometry_wkb(geometry)
-            existing_geometry = self.connection.execute(
-                """SELECT geometry_pk FROM geometries
-                   WHERE entity_pk = ? AND geometry_type = ? AND geometry_wkb = ?
-                     AND COALESCE(valid_from, '') = COALESCE(?, '')
-                     AND COALESCE(valid_to, '') = COALESCE(?, '')
-                     AND source_id = ?
-                   LIMIT 1""",
-                (
-                    entity_pk,
-                    geometry["type"].lower(),
-                    encoded_geometry,
-                    valid_from,
-                    valid_to,
-                    source_id,
-                ),
-            ).fetchone()
-            if existing_geometry is not None:
-                self.source_counts[source_id] += 1
-                return canonical_id
-            cursor = self.connection.execute(
-                """INSERT INTO geometries(
-                       entity_pk, geometry_type, geometry_wkb, latitude, longitude,
-                       min_lon, max_lon, min_lat, max_lat, valid_from, valid_to, source_id
-                   ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    entity_pk,
-                    geometry["type"].lower(),
-                    encoded_geometry,
-                    float(point[1]) if point else None,
-                    float(point[0]) if point else None,
-                    minimum_lon,
-                    maximum_lon,
-                    minimum_lat,
-                    maximum_lat,
-                    valid_from,
-                    valid_to,
-                    source_id,
-                ),
-            )
-            geometry_pk = int(cursor.lastrowid)
-            self.connection.execute(
-                "INSERT INTO entity_rtree VALUES(?, ?, ?, ?, ?)",
-                (geometry_pk, minimum_lon, maximum_lon, minimum_lat, maximum_lat),
-            )
+            geometry_type = geometry["type"].lower()
+            if self.geometry_connection is not None and geometry_type in {
+                "polygon",
+                "multipolygon",
+            }:
+                self._add_area_geometry(
+                    canonical_id=canonical_id,
+                    source_id=source_id,
+                    geometry_type=geometry_type,
+                    encoded_geometry=encoded_geometry,
+                    minimum_lon=minimum_lon,
+                    maximum_lon=maximum_lon,
+                    minimum_lat=minimum_lat,
+                    maximum_lat=maximum_lat,
+                    valid_from=valid_from,
+                    valid_to=valid_to,
+                    attributes=attributes,
+                )
+                centroid_longitude, centroid_latitude = geometry_centroid(geometry)
+                centroid_geometry = {
+                    "type": "Point",
+                    "coordinates": [centroid_longitude, centroid_latitude],
+                }
+                centroid_wkb = geometry_wkb(centroid_geometry)
+                existing_centroid = self.connection.execute(
+                    """SELECT geometry_pk FROM geometries
+                       WHERE entity_pk = ? AND geometry_type = 'point' AND geometry_wkb = ?
+                         AND COALESCE(valid_from, '') = COALESCE(?, '')
+                         AND COALESCE(valid_to, '') = COALESCE(?, '')
+                         AND source_id = ?
+                       LIMIT 1""",
+                    (entity_pk, centroid_wkb, valid_from, valid_to, source_id),
+                ).fetchone()
+                if existing_centroid is None:
+                    cursor = self.connection.execute(
+                        """INSERT INTO geometries(
+                               entity_pk, geometry_type, geometry_wkb, latitude, longitude,
+                               min_lon, max_lon, min_lat, max_lat, valid_from, valid_to, source_id
+                           ) VALUES(?, 'point', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            entity_pk,
+                            centroid_wkb,
+                            centroid_latitude,
+                            centroid_longitude,
+                            centroid_longitude,
+                            centroid_longitude,
+                            centroid_latitude,
+                            centroid_latitude,
+                            valid_from,
+                            valid_to,
+                            source_id,
+                        ),
+                    )
+                    geometry_pk = int(cursor.lastrowid)
+                    self.connection.execute(
+                        "INSERT INTO entity_rtree VALUES(?, ?, ?, ?, ?)",
+                        (
+                            geometry_pk,
+                            centroid_longitude,
+                            centroid_longitude,
+                            centroid_latitude,
+                            centroid_latitude,
+                        ),
+                    )
+            else:
+                existing_geometry = self.connection.execute(
+                    """SELECT geometry_pk FROM geometries
+                       WHERE entity_pk = ? AND geometry_type = ? AND geometry_wkb = ?
+                         AND COALESCE(valid_from, '') = COALESCE(?, '')
+                         AND COALESCE(valid_to, '') = COALESCE(?, '')
+                         AND source_id = ?
+                       LIMIT 1""",
+                    (
+                        entity_pk,
+                        geometry_type,
+                        encoded_geometry,
+                        valid_from,
+                        valid_to,
+                        source_id,
+                    ),
+                ).fetchone()
+                if existing_geometry is not None:
+                    self.source_counts[source_id] += 1
+                    return canonical_id
+                cursor = self.connection.execute(
+                    """INSERT INTO geometries(
+                           entity_pk, geometry_type, geometry_wkb, latitude, longitude,
+                           min_lon, max_lon, min_lat, max_lat, valid_from, valid_to, source_id
+                       ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        entity_pk,
+                        geometry_type,
+                        encoded_geometry,
+                        float(point[1]) if point else None,
+                        float(point[0]) if point else None,
+                        minimum_lon,
+                        maximum_lon,
+                        minimum_lat,
+                        maximum_lat,
+                        valid_from,
+                        valid_to,
+                        source_id,
+                    ),
+                )
+                geometry_pk = int(cursor.lastrowid)
+                self.connection.execute(
+                    "INSERT INTO entity_rtree VALUES(?, ?, ?, ?, ?)",
+                    (geometry_pk, minimum_lon, maximum_lon, minimum_lat, maximum_lat),
+                )
         self.source_counts[source_id] += 1
         return canonical_id
+
+    def _add_area_geometry(
+        self,
+        *,
+        canonical_id: str,
+        source_id: str,
+        geometry_type: str,
+        encoded_geometry: bytes,
+        minimum_lon: float,
+        maximum_lon: float,
+        minimum_lat: float,
+        maximum_lat: float,
+        valid_from: str | None,
+        valid_to: str | None,
+        attributes: dict[str, Any] | None,
+    ) -> None:
+        connection = self.geometry_connection
+        if connection is None:
+            raise RuntimeError("geometry catalog is not configured")
+        existing_geometry = connection.execute(
+            """SELECT geometry_pk FROM area_geometries
+               WHERE canonical_id = ? AND geometry_type = ? AND geometry_wkb = ?
+                 AND COALESCE(valid_from, '') = COALESCE(?, '')
+                 AND COALESCE(valid_to, '') = COALESCE(?, '')
+                 AND source_id = ?
+               LIMIT 1""",
+            (
+                canonical_id,
+                geometry_type,
+                encoded_geometry,
+                valid_from,
+                valid_to,
+                source_id,
+            ),
+        ).fetchone()
+        if existing_geometry is not None:
+            return
+        source = self.source_metadata.get(source_id, {})
+        cursor = connection.execute(
+            """INSERT INTO area_geometries(
+                   canonical_id, source, code, same_code, geometry_type, geometry_wkb,
+                   latitude, longitude, min_lon, max_lon, min_lat, max_lat, accuracy_m,
+                   valid_from, valid_to, is_current, source_id, provider_version,
+                   source_url, updated_at, attributes_json
+               ) VALUES(?, NULL, NULL, NULL, ?, ?, NULL, NULL, ?, ?, ?, ?, NULL, ?, ?, 1, ?, ?, ?, ?, ?)""",
+            (
+                canonical_id,
+                geometry_type,
+                encoded_geometry,
+                minimum_lon,
+                maximum_lon,
+                minimum_lat,
+                maximum_lat,
+                valid_from,
+                valid_to,
+                source_id,
+                source.get("version"),
+                source.get("location"),
+                self.retrieved_at,
+                json.dumps(attributes or {}, sort_keys=True, separators=(",", ":")),
+            ),
+        )
+        geometry_pk = int(cursor.lastrowid)
+        connection.execute(
+            "INSERT INTO area_geometry_rtree VALUES(?, ?, ?, ?, ?)",
+            (geometry_pk, minimum_lon, maximum_lon, minimum_lat, maximum_lat),
+        )
 
     def finish(self, expected_counts: dict[str, int]) -> None:
         for source_id, minimum in expected_counts.items():
@@ -466,7 +741,30 @@ class Catalog:
                 "INSERT OR REPLACE INTO catalog_metadata(key, value) VALUES(?, ?)",
                 (f"count.source.{source_id}", str(value)),
             )
+        if self.geometry_connection is not None:
+            geometry_count = int(
+                self.geometry_connection.execute(
+                    "SELECT COUNT(*) FROM area_geometries"
+                ).fetchone()[0]
+            )
+            self.geometry_connection.execute(
+                "INSERT OR REPLACE INTO catalog_metadata(key, value) VALUES('count.geometries', ?)",
+                (str(geometry_count),),
+            )
+            for source_id in sorted(self.source_counts):
+                source_geometry_count = int(
+                    self.geometry_connection.execute(
+                        "SELECT COUNT(*) FROM area_geometries WHERE source_id = ?",
+                        (source_id,),
+                    ).fetchone()[0]
+                )
+                self.geometry_connection.execute(
+                    "INSERT OR REPLACE INTO catalog_metadata(key, value) VALUES(?, ?)",
+                    (f"count.source.{source_id}", str(source_geometry_count)),
+                )
         self.connection.commit()
+        if self.geometry_connection is not None:
+            self.geometry_connection.commit()
         integrity = self.connection.execute("PRAGMA integrity_check").fetchone()[0]
         rtree = self.connection.execute("SELECT rtreecheck('entity_rtree')").fetchone()[0]
         name_count = counts["names"]
@@ -477,11 +775,60 @@ class Catalog:
                 f"catalog validation failed: integrity={integrity}, rtree={rtree}, "
                 f"names={name_count}, fts={fts_count}, trigram={trigram_count}"
             )
+        if self.geometry_connection is not None:
+            self._validate_geometry_catalog()
         self.connection.execute("VACUUM")
+        if self.geometry_connection is not None:
+            self.geometry_connection.close()
         self.connection.close()
 
     def close(self) -> None:
+        if self.geometry_connection is not None:
+            self.geometry_connection.close()
         self.connection.close()
+
+    def _validate_geometry_catalog(self) -> None:
+        connection = self.geometry_connection
+        if connection is None or self.geometry_path is None:
+            raise RuntimeError("geometry catalog is not configured")
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+        rtree = connection.execute("SELECT rtreecheck('area_geometry_rtree')").fetchone()[0]
+        geometry_count = int(connection.execute("SELECT COUNT(*) FROM area_geometries").fetchone()[0])
+        rtree_count = int(connection.execute("SELECT COUNT(*) FROM area_geometry_rtree").fetchone()[0])
+        invalid_geometry_count = int(
+            connection.execute(
+                """SELECT COUNT(*) FROM area_geometries
+                   WHERE geometry_type NOT IN ('polygon', 'multipolygon')
+                      OR geometry_wkb IS NULL OR length(geometry_wkb) < 5
+                      OR min_lon > max_lon OR min_lat > max_lat
+                      OR min_lon < -180 OR max_lon > 180
+                      OR min_lat < -90 OR max_lat > 90"""
+            ).fetchone()[0]
+        )
+        self.connection.execute("ATTACH DATABASE ? AS split_geometry", (str(self.geometry_path),))
+        try:
+            orphan_count = int(
+                self.connection.execute(
+                    """SELECT COUNT(*) FROM split_geometry.area_geometries AS geometry
+                       WHERE NOT EXISTS(
+                           SELECT 1 FROM entities WHERE canonical_id = geometry.canonical_id
+                       )"""
+                ).fetchone()[0]
+            )
+        finally:
+            self.connection.execute("DETACH DATABASE split_geometry")
+        if (
+            integrity != "ok"
+            or rtree != "ok"
+            or geometry_count != rtree_count
+            or invalid_geometry_count != 0
+            or orphan_count != 0
+        ):
+            raise RuntimeError(
+                "geometry catalog validation failed: "
+                f"integrity={integrity}, rtree={rtree}, geometries={geometry_count}, "
+                f"rtree_rows={rtree_count}, invalid={invalid_geometry_count}, orphans={orphan_count}"
+            )
 
 
 def swob_record(catalog: Catalog, source: dict[str, Any], feature: dict[str, Any]) -> None:
@@ -744,6 +1091,104 @@ def ingest_delimited_rows(
         if latitude is not None and longitude is not None:
             geometry = {"type": "Point", "coordinates": [float(longitude), float(latitude)]}
         generic_geojson_record(catalog, source, {"properties": properties, "geometry": geometry})
+
+
+def statcan_csd_population_source(
+    catalog: Catalog, source: dict[str, Any], allow_downloads: bool
+) -> None:
+    """Enrich existing Statistics Canada CSD entities with compact census ranks."""
+    raw = source_bytes(source["location"], allow_downloads)
+    catalog.add_source(source, hashlib.sha256(raw).hexdigest())
+    if not zipfile.is_zipfile(io.BytesIO(raw)):
+        raise RuntimeError(f"source {source['id']} is not a ZIP archive")
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        candidates = [
+            name
+            for name in archive.namelist()
+            if not name.endswith("/")
+            and name.lower().endswith(".csv")
+            and "metadata" not in name.lower()
+            and (
+                not source.get("archive_contains")
+                or source["archive_contains"].lower() in name.lower()
+            )
+        ]
+        if not candidates:
+            raise RuntimeError(
+                f"source {source['id']} archive has no matching population CSV"
+            )
+        with archive.open(sorted(candidates)[0]) as binary_stream:
+            with io.TextIOWrapper(
+                binary_stream, encoding=source.get("encoding", "utf-8-sig"), newline=""
+            ) as text_stream:
+                reader = csv.DictReader(text_stream)
+                for row in reader:
+                    dguid = normalize_identifier(
+                        "sgc_dguid", first(row, source.get("dguid_field", "DGUID"))
+                    )
+                    # 2021A0005 is the Statistics Canada DGUID level for census
+                    # subdivisions. Aggregate Canada, province, and division rows
+                    # in the same table are deliberately excluded.
+                    if not dguid.startswith("2021A0005"):
+                        continue
+                    population = census_integer(
+                        first(row, source.get("population_field", "Population, 2021"))
+                    )
+                    if population is None:
+                        continue
+                    entity = catalog.connection.execute(
+                        """SELECT entities.entity_pk, entities.attributes_json
+                           FROM identifiers
+                           JOIN entities USING(entity_pk)
+                           WHERE identifiers.authority = 'statcan'
+                             AND identifiers.scheme = 'sgc_dguid'
+                             AND identifiers.normalized_value = ?
+                           ORDER BY identifiers.is_primary DESC, entities.source_quality DESC
+                           LIMIT 1""",
+                        (dguid,),
+                    ).fetchone()
+                    if entity is None:
+                        continue
+                    try:
+                        attributes = json.loads(entity[1] or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        attributes = {}
+                    attributes.update(
+                        {
+                            "population": population,
+                            "census_population": population,
+                            "census_year": int(source.get("census_year", 2021)),
+                            "census_dguid": dguid,
+                            "population_source": source["id"],
+                        }
+                    )
+                    optional_fields = {
+                        "national_population_rank": source.get("national_rank_field"),
+                        "province_population_rank": source.get("province_rank_field"),
+                    }
+                    for attribute, field in optional_fields.items():
+                        value = census_integer(first(row, field)) if field else None
+                        if value is not None:
+                            attributes[attribute] = value
+                    catalog.connection.execute(
+                        "UPDATE entities SET attributes_json = ? WHERE entity_pk = ?",
+                        (
+                            json.dumps(attributes, sort_keys=True, separators=(",", ":")),
+                            int(entity[0]),
+                        ),
+                    )
+                    catalog.source_counts[source["id"]] += 1
+
+
+def census_integer(value: Any) -> int | None:
+    text = str(value or "").strip().replace(",", "")
+    if not text or text in {"..", "...", "x", "F"}:
+        return None
+    try:
+        parsed = int(float(text))
+    except ValueError:
+        return None
+    return parsed if parsed >= 0 else None
 
 
 def shapefile_source(catalog: Catalog, source: dict[str, Any], allow_downloads: bool) -> None:
@@ -1110,15 +1555,133 @@ def deployment_history_source(catalog: Catalog, source: dict[str, Any], allow_do
         catalog.source_counts[source["id"]] += 1
 
 
-def build(manifest_path: Path, pack_id: str, output: Path, retrieved_at: str, allow_downloads: bool) -> None:
+def database_counts(path: Path, tables: Iterable[str]) -> dict[str, int]:
+    connection = sqlite3.connect(path)
+    try:
+        return {
+            table: int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            for table in tables
+        }
+    finally:
+        connection.close()
+
+
+def member_manifest(
+    *,
+    pack_id: str,
+    retrieved_at: str,
+    output: Path,
+    output_digest: str,
+    geometry_output: Path | None,
+    geometry_digest: str | None,
+    temporary_output: Path,
+    temporary_geometry: Path | None,
+) -> dict[str, Any]:
+    members: dict[str, Any] = {
+        "core": {
+            "counts": database_counts(
+                temporary_output, ("entities", "identifiers", "names", "geometries")
+            ),
+            "file": output.name,
+            "pack_id": pack_id,
+            "pack_kind": "core",
+            "sha256": output_digest,
+            "size_bytes": temporary_output.stat().st_size,
+        }
+    }
+    generation_parts = [f"core:{output_digest}"]
+    if geometry_output is not None and geometry_digest is not None and temporary_geometry is not None:
+        members["geometry"] = {
+            "counts": database_counts(temporary_geometry, ("area_geometries",)),
+            "file": geometry_output.name,
+            "pack_id": f"{pack_id}-geometry",
+            "pack_kind": "geometry",
+            "sha256": geometry_digest,
+            "size_bytes": temporary_geometry.stat().st_size,
+        }
+        generation_parts.append(f"geometry:{geometry_digest}")
+    generation = uuid.uuid5(
+        LOCATION_NAMESPACE,
+        f"{pack_id}|{'|'.join(generation_parts)}",
+    )
+    return {
+        "generation": str(generation),
+        "members": members,
+        "pack_id": pack_id,
+        "retrieved_at": retrieved_at,
+        "schema_version": 1,
+    }
+
+
+def stage_checksum(path: Path, digest: str) -> Path:
+    checksum_path = path.with_suffix(path.suffix + ".sha256")
+    temporary = checksum_path.with_suffix(checksum_path.suffix + ".new")
+    temporary.write_text(f"{digest}  {path.name}\n", encoding="ascii")
+    return temporary
+
+
+def bind_geometry_to_core(geometry_path: Path, core_digest: str) -> None:
+    if not re.fullmatch(r"[0-9a-f]{64}", core_digest):
+        raise RuntimeError("core catalog SHA-256 is invalid")
+    connection = sqlite3.connect(geometry_path)
+    try:
+        connection.execute(
+            "INSERT OR REPLACE INTO catalog_metadata(key, value) VALUES('core_sha256', ?)",
+            (core_digest,),
+        )
+        connection.commit()
+        connection.execute("VACUUM")
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+        stored_digest = connection.execute(
+            "SELECT value FROM catalog_metadata WHERE key = 'core_sha256'"
+        ).fetchone()[0]
+        if integrity != "ok" or stored_digest != core_digest:
+            raise RuntimeError(
+                "geometry catalog core pairing failed: "
+                f"integrity={integrity}, expected={core_digest}, stored={stored_digest}"
+            )
+    finally:
+        connection.close()
+
+
+def build(
+    manifest_path: Path,
+    pack_id: str,
+    output: Path,
+    retrieved_at: str,
+    allow_downloads: bool,
+    geometry_output: Path | None = None,
+    member_manifest_output: Path | None = None,
+) -> None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     pack = next((item for item in manifest["packs"] if item["id"] == pack_id), None)
     if pack is None:
         raise RuntimeError(f"pack {pack_id!r} is not present in {manifest_path}")
+    destinations = [output, output.with_suffix(output.suffix + ".sha256")]
+    if geometry_output is not None:
+        destinations.extend(
+            [geometry_output, geometry_output.with_suffix(geometry_output.suffix + ".sha256")]
+        )
+    if member_manifest_output is not None:
+        destinations.append(member_manifest_output)
+    resolved_destinations = [str(path.resolve()).casefold() for path in destinations]
+    if len(set(resolved_destinations)) != len(resolved_destinations):
+        raise RuntimeError("catalog outputs and checksum paths must be distinct")
     output.parent.mkdir(parents=True, exist_ok=True)
+    if geometry_output is not None:
+        geometry_output.parent.mkdir(parents=True, exist_ok=True)
+    if member_manifest_output is not None:
+        member_manifest_output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="haze-location-build-", dir=output.parent) as directory:
-        temporary = Path(directory) / output.name
-        catalog = Catalog(temporary, pack_id, retrieved_at)
+        temporary = Path(directory) / (
+            output.name if geometry_output is None else f"core-{output.name}"
+        )
+        temporary_geometry = (
+            Path(directory) / f"geometry-{geometry_output.name}"
+            if geometry_output is not None
+            else None
+        )
+        catalog = Catalog(temporary, pack_id, retrieved_at, temporary_geometry)
         expected_counts: dict[str, int] = {}
         try:
             for source in pack.get("sources", []):
@@ -1130,6 +1693,8 @@ def build(manifest_path: Path, pack_id: str, output: Path, retrieved_at: str, al
                     shapefile_source(catalog, source, allow_downloads)
                 elif adapter in {"csv", "delimited"}:
                     delimited_source(catalog, source, allow_downloads)
+                elif adapter == "statcan_csd_population":
+                    statcan_csd_population_source(catalog, source, allow_downloads)
                 elif adapter == "ndbc_active":
                     ndbc_source(catalog, source, allow_downloads)
                 elif adapter == "ndbc_metadata":
@@ -1146,13 +1711,71 @@ def build(manifest_path: Path, pack_id: str, output: Path, retrieved_at: str, al
         finally:
             catalog.close()
         digest = hashlib.sha256(temporary.read_bytes()).hexdigest()
+        if geometry_output is None and member_manifest_output is None:
+            output_tmp = output.with_suffix(output.suffix + ".new")
+            shutil.copyfile(temporary, output_tmp)
+            os.replace(output_tmp, output)
+            checksum_tmp = output.with_suffix(output.suffix + ".sha256.new")
+            checksum_tmp.write_text(f"{digest}  {output.name}\n", encoding="ascii")
+            os.replace(checksum_tmp, output.with_suffix(output.suffix + ".sha256"))
+            print(json.dumps({"pack": pack_id, "output": str(output), "sha256": digest}, sort_keys=True))
+            return
+
+        if temporary_geometry is not None:
+            bind_geometry_to_core(temporary_geometry, digest)
+        geometry_digest = (
+            hashlib.sha256(temporary_geometry.read_bytes()).hexdigest()
+            if temporary_geometry is not None
+            else None
+        )
+        manifest_document = member_manifest(
+            pack_id=pack_id,
+            retrieved_at=retrieved_at,
+            output=output,
+            output_digest=digest,
+            geometry_output=geometry_output,
+            geometry_digest=geometry_digest,
+            temporary_output=temporary,
+            temporary_geometry=temporary_geometry,
+        )
         output_tmp = output.with_suffix(output.suffix + ".new")
         shutil.copyfile(temporary, output_tmp)
+        checksum_tmp = stage_checksum(output, digest)
+        geometry_tmp: Path | None = None
+        geometry_checksum_tmp: Path | None = None
+        if geometry_output is not None and temporary_geometry is not None and geometry_digest is not None:
+            geometry_tmp = geometry_output.with_suffix(geometry_output.suffix + ".new")
+            shutil.copyfile(temporary_geometry, geometry_tmp)
+            geometry_checksum_tmp = stage_checksum(geometry_output, geometry_digest)
+        manifest_tmp: Path | None = None
+        if member_manifest_output is not None:
+            manifest_tmp = member_manifest_output.with_suffix(member_manifest_output.suffix + ".new")
+            manifest_tmp.write_text(
+                json.dumps(manifest_document, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
         os.replace(output_tmp, output)
-        checksum_tmp = output.with_suffix(output.suffix + ".sha256.new")
-        checksum_tmp.write_text(f"{digest}  {output.name}\n", encoding="ascii")
         os.replace(checksum_tmp, output.with_suffix(output.suffix + ".sha256"))
-        print(json.dumps({"pack": pack_id, "output": str(output), "sha256": digest}, sort_keys=True))
+        if geometry_output is not None and geometry_tmp is not None and geometry_checksum_tmp is not None:
+            os.replace(geometry_tmp, geometry_output)
+            os.replace(
+                geometry_checksum_tmp,
+                geometry_output.with_suffix(geometry_output.suffix + ".sha256"),
+            )
+        if member_manifest_output is not None and manifest_tmp is not None:
+            os.replace(manifest_tmp, member_manifest_output)
+        response: dict[str, Any] = {
+            "output": str(output),
+            "pack": pack_id,
+            "sha256": digest,
+        }
+        if geometry_output is not None and geometry_digest is not None:
+            response["geometry_output"] = str(geometry_output)
+            response["geometry_sha256"] = geometry_digest
+        if member_manifest_output is not None:
+            response["member_manifest"] = str(member_manifest_output)
+        print(json.dumps(response, sort_keys=True))
 
 
 def parse_args() -> argparse.Namespace:
@@ -1160,6 +1783,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--pack", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--geometry-output", type=Path)
+    parser.add_argument("--member-manifest-output", type=Path)
     parser.add_argument("--retrieved-at", required=True, help="ISO 8601 source retrieval time")
     parser.add_argument("--allow-downloads", action="store_true")
     return parser.parse_args()
@@ -1173,4 +1798,6 @@ if __name__ == "__main__":
         arguments.output,
         arguments.retrieved_at,
         arguments.allow_downloads,
+        arguments.geometry_output,
+        arguments.member_manifest_output,
     )

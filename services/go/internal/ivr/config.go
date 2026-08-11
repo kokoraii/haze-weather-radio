@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/meowraii/haze-weather-radio/services/go/internal/datastore"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/locationdb"
@@ -81,6 +82,7 @@ type Config struct {
 type searchConfig struct {
 	Enabled           *bool         `yaml:"enabled"`
 	VoiceEnabled      *bool         `yaml:"voice_enabled"`
+	CallerHintEnabled bool          `yaml:"caller_hint_enabled"`
 	SpoolDir          string        `yaml:"spool_dir"`
 	MultitapWindowRaw string        `yaml:"multitap_window"`
 	IdleSubmitRaw     string        `yaml:"idle_submit"`
@@ -116,11 +118,13 @@ type twilioConfig struct {
 }
 
 type extensionConfig struct {
-	Extension    string `yaml:"extension"`
-	Name         any    `yaml:"name"`
-	NamePosition string `yaml:"name_position"`
-	Province     string `yaml:"province"`
-	Enabled      *bool  `yaml:"enabled"`
+	Extension    string   `yaml:"extension"`
+	DIDs         []string `yaml:"dids"`
+	Name         any      `yaml:"name"`
+	NamePosition string   `yaml:"name_position"`
+	CallerIDName string   `yaml:"caller_id_name"`
+	Province     string   `yaml:"province"`
+	Enabled      *bool    `yaml:"enabled"`
 }
 
 func (line extensionConfig) enabled() bool {
@@ -195,21 +199,22 @@ func (ports *sipListenPorts) UnmarshalYAML(value *yaml.Node) error {
 }
 
 type sipRegistrationConfig struct {
-	Enabled       bool   `yaml:"enabled"`
-	Server        string `yaml:"server"`
-	Domain        string `yaml:"domain"`
-	RegisterURI   string `yaml:"register_uri"`
-	Username      string `yaml:"username"`
-	AuthUsername  string `yaml:"auth_username"`
-	PasswordEnv   string `yaml:"password_env"`
-	FromUser      string `yaml:"from_user"`
-	ContactUser   string `yaml:"contact_user"`
-	ContactHost   string `yaml:"contact_host"`
-	ViaHost       string `yaml:"via_host"`
-	UserAgent     string `yaml:"user_agent"`
-	SupportedPath *bool  `yaml:"supported_path"`
-	Expires       int    `yaml:"expires"`
-	RetrySeconds  int    `yaml:"retry_seconds"`
+	Enabled                 bool   `yaml:"enabled"`
+	RestrictSourcesToServer bool   `yaml:"restrict_sources_to_server"`
+	Server                  string `yaml:"server"`
+	Domain                  string `yaml:"domain"`
+	RegisterURI             string `yaml:"register_uri"`
+	Username                string `yaml:"username"`
+	AuthUsername            string `yaml:"auth_username"`
+	PasswordEnv             string `yaml:"password_env"`
+	FromUser                string `yaml:"from_user"`
+	ContactUser             string `yaml:"contact_user"`
+	ContactHost             string `yaml:"contact_host"`
+	ViaHost                 string `yaml:"via_host"`
+	UserAgent               string `yaml:"user_agent"`
+	SupportedPath           *bool  `yaml:"supported_path"`
+	Expires                 int    `yaml:"expires"`
+	RetrySeconds            int    `yaml:"retry_seconds"`
 }
 
 type rtpConfig struct {
@@ -235,6 +240,8 @@ type loadedConfig struct {
 	Feeds             []feedXML
 	ForecastLocations map[string]locationRecord
 	HelloWeather      map[string]locationRecord
+	HelloPostalCodes  map[string]locationdb.PostalCodeSet
+	CensusPopulation  locationdb.CensusPopulationCatalog
 	CLCs              map[string]locationRecord
 	Geocodes          map[string]locationRecord
 	NWS               map[string]locationRecord
@@ -306,17 +313,20 @@ type feedLocationXML struct {
 }
 
 type locationRecord struct {
-	Code      string `json:"code"`
-	Source    string `json:"source"`
-	Name      string `json:"name"`
-	Province  string `json:"province,omitempty"`
-	Country   string `json:"country,omitempty"`
-	Kind      string `json:"kind,omitempty"`
-	FeedID    string `json:"feed_id,omitempty"`
-	Forecast  string `json:"forecast_id,omitempty"`
-	StationID string `json:"station_id,omitempty"`
-	Latitude  string `json:"latitude,omitempty"`
-	Longitude string `json:"longitude,omitempty"`
+	Code       string `json:"code"`
+	Source     string `json:"source"`
+	Name       string `json:"name"`
+	NameFR     string `json:"name_fr,omitempty"`
+	Province   string `json:"province,omitempty"`
+	Country    string `json:"country,omitempty"`
+	Kind       string `json:"kind,omitempty"`
+	FeedID     string `json:"feed_id,omitempty"`
+	Forecast   string `json:"forecast_id,omitempty"`
+	StationID  string `json:"station_id,omitempty"`
+	Latitude   string `json:"latitude,omitempty"`
+	Longitude  string `json:"longitude,omitempty"`
+	Population int64  `json:"population,omitempty"`
+	CensusYear int    `json:"census_year,omitempty"`
 }
 
 func loadConfig(path string, overrides Options) (loadedConfig, error) {
@@ -365,6 +375,8 @@ func loadConfig(path string, overrides Options) (loadedConfig, error) {
 			return loadedConfig{}, fmt.Errorf("IVR search spool must be a dedicated directory whose name contains asr")
 		}
 	}
+	helloPostalCodes, _ := locationdb.PostalCodesByHelloWeatherCode(baseDir, locationdb.MaxPostalCodesPerLocation)
+	censusPopulation, _ := locationdb.LoadCensusPopulationCatalog(baseDir)
 	return loadedConfig{
 		Root:              root,
 		IVR:               cfg,
@@ -372,7 +384,9 @@ func loadConfig(path string, overrides Options) (loadedConfig, error) {
 		PromptsPath:       promptsPath,
 		Feeds:             feeds,
 		ForecastLocations: loadForecastLocationsForBase(baseDir),
-		HelloWeather:      loadHelloWeatherForBase(baseDir),
+		HelloWeather:      loadHelloWeatherForBase(baseDir, censusPopulation),
+		HelloPostalCodes:  helloPostalCodes,
+		CensusPopulation:  censusPopulation,
 		CLCs:              loadCLCsForBase(baseDir),
 		Geocodes:          loadGeocodesForBase(baseDir),
 		NWS:               loadNWSForBase(baseDir),
@@ -552,7 +566,12 @@ func normalizeIVRExtensions(cfg *Config) {
 	for index := range cfg.Extensions {
 		line := &cfg.Extensions[index]
 		line.Extension = normalizeExtensionID(line.Extension)
+		for didIndex := range line.DIDs {
+			raw := strings.TrimSpace(line.DIDs[didIndex])
+			line.DIDs[didIndex] = fallbackText(normalizeCalledNumber(raw), raw)
+		}
 		line.Province = normalizeProvinceCode(line.Province)
+		line.CallerIDName = strings.TrimSpace(line.CallerIDName)
 		if line.Province == "CA" {
 			hasCanada = true
 		}
@@ -582,6 +601,7 @@ func defaultCanadaExtension() extensionConfig {
 
 func validateIVRExtensions(lines []extensionConfig) error {
 	seen := make(map[string]struct{}, len(lines))
+	seenDIDs := make(map[string]string)
 	for index, line := range lines {
 		if line.Extension == "" {
 			return fmt.Errorf("ivr extension %d has an empty extension", index+1)
@@ -596,8 +616,51 @@ func validateIVRExtensions(lines []extensionConfig) error {
 		if line.NamePosition != "before" && line.NamePosition != "after" {
 			return fmt.Errorf("ivr extension %q has unsupported name_position %q", line.Extension, line.NamePosition)
 		}
+		if !validCallerIDName(line.CallerIDName) {
+			return fmt.Errorf("ivr extension %q has an invalid caller_id_name", line.Extension)
+		}
+		for _, raw := range line.DIDs {
+			did := normalizeCalledNumber(raw)
+			if did == "" {
+				return fmt.Errorf("ivr extension %q has invalid DID %q", line.Extension, raw)
+			}
+			if existing, duplicate := seenDIDs[did]; duplicate {
+				return fmt.Errorf("ivr DID %q is configured for extensions %q and %q", did, existing, line.Extension)
+			}
+			seenDIDs[did] = line.Extension
+		}
 	}
 	return nil
+}
+
+func validCallerIDName(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return true
+	}
+	return len([]rune(value)) <= 80 && strings.IndexFunc(value, unicode.IsControl) < 0
+}
+
+func normalizeCalledNumber(value string) string {
+	if value = strings.TrimSpace(value); value == "" {
+		return ""
+	}
+	if normalized := normalizeNANPCaller(value); normalized != "" {
+		return normalized
+	}
+	if !strings.HasPrefix(value, "+") {
+		return ""
+	}
+	digits := value[1:]
+	if len(digits) < 8 || len(digits) > 15 {
+		return ""
+	}
+	for _, character := range digits {
+		if character < '0' || character > '9' {
+			return ""
+		}
+	}
+	return "+" + digits
 }
 
 func normalizeExtensionID(value string) string {
@@ -635,11 +698,11 @@ func provinceDisplayName(value string) string {
 }
 
 func (cfg Config) extensionLine(extension string) (extensionConfig, bool) {
-	extension = normalizeExtensionID(extension)
-	for _, line := range cfg.Extensions {
-		if line.Extension == extension {
-			return line, true
-		}
+	if line, matched := cfg.extensionLineByExtension(extension); matched {
+		return line, true
+	}
+	if line, matched := cfg.extensionLineByDID(extension); matched {
+		return line, true
 	}
 	for _, line := range cfg.Extensions {
 		if line.Province == "CA" {
@@ -647,6 +710,44 @@ func (cfg Config) extensionLine(extension string) (extensionConfig, bool) {
 		}
 	}
 	return defaultCanadaExtension(), false
+}
+
+func (cfg Config) extensionLineByExtension(extension string) (extensionConfig, bool) {
+	extension = normalizeExtensionID(extension)
+	for _, line := range cfg.Extensions {
+		if line.Extension == extension {
+			return line, true
+		}
+	}
+	return extensionConfig{}, false
+}
+
+func (cfg Config) extensionLineByDID(value string) (extensionConfig, bool) {
+	did := normalizeCalledNumber(value)
+	if did == "" {
+		return extensionConfig{}, false
+	}
+	for _, line := range cfg.Extensions {
+		for _, configured := range line.DIDs {
+			if normalizeCalledNumber(configured) == did {
+				return line, true
+			}
+		}
+	}
+	return extensionConfig{}, false
+}
+
+func (cfg Config) provinceLine(province string) (extensionConfig, bool) {
+	province = normalizeProvinceCode(province)
+	if province == "" || province == "CA" {
+		return extensionConfig{}, false
+	}
+	for _, line := range cfg.Extensions {
+		if normalizeProvinceCode(line.Province) == province {
+			return line, true
+		}
+	}
+	return extensionConfig{}, false
 }
 
 func (cfg sipConfig) listenBindings() []sipListenBinding {
@@ -862,24 +963,70 @@ func loadForecastLocationsForBase(baseDir string) map[string]locationRecord {
 	return loadForecastLocations(resolvePath(baseDir, "managed/csv/FORECAST_LOCATIONS.csv"))
 }
 
-func loadHelloWeatherForBase(baseDir string) map[string]locationRecord {
+func loadHelloWeatherForBase(baseDir string, censusCatalogs ...locationdb.CensusPopulationCatalog) map[string]locationRecord {
+	censusCatalog := locationdb.CensusPopulationCatalog{}
+	if len(censusCatalogs) > 0 {
+		censusCatalog = censusCatalogs[0]
+	} else {
+		censusCatalog, _ = locationdb.LoadCensusPopulationCatalog(baseDir)
+	}
+	frenchCityNames, _ := locationdb.LoadLocalizedNamesByIdentifier(baseDir, "eccc_citypage", "fr")
+	cityCoordinates, _ := locationdb.LoadCoordinatesByIdentifier(baseDir, "eccc_citypage")
+	cityPageIDs, _ := locationdb.LoadHelloWeatherCityPageIDs(baseDir)
 	if snap, ok := locationdb.Load(baseDir); ok {
 		out := map[string]locationRecord{}
 		for _, place := range snap.PlacesBySource("hello_weather") {
+			forecast := strings.TrimSpace(cityPageIDs[place.Code])
+			if derived, derivedOK := deriveHelloWeatherRecord(place.Code); forecast == "" && derivedOK {
+				forecast = derived.Forecast
+			}
+			population, censusYear := censusPopulationForCityPage(censusCatalog, forecast)
+			latitude := floatText(place.Lat)
+			longitude := floatText(place.Lon)
+			if coordinate, exists := cityCoordinates[strings.ToLower(forecast)]; exists {
+				latitude = floatText(coordinate.Latitude)
+				longitude = floatText(coordinate.Longitude)
+			}
 			out[place.Code] = locationRecord{
-				Code:      place.Code,
-				Source:    "hello_weather",
-				Name:      place.Name,
-				Province:  place.Region,
-				Latitude:  floatText(place.Lat),
-				Longitude: floatText(place.Lon),
+				Code:       place.Code,
+				Source:     "hello_weather",
+				Name:       place.Name,
+				NameFR:     firstNonBlank(place.NameFR, frenchCityNames[strings.ToLower(forecast)]),
+				Province:   place.Region,
+				Forecast:   forecast,
+				Latitude:   latitude,
+				Longitude:  longitude,
+				Population: population,
+				CensusYear: censusYear,
 			}
 		}
 		if len(out) > 0 {
 			return out
 		}
 	}
-	return loadHelloWeatherCSV(resolvePath(baseDir, "managed/csv/HELLO_WEATHER_LOCATIONS.csv"))
+	out := loadHelloWeatherCSV(resolvePath(baseDir, "managed/csv/HELLO_WEATHER_LOCATIONS.csv"))
+	for code, record := range out {
+		record.Forecast = strings.TrimSpace(cityPageIDs[code])
+		if derived, ok := deriveHelloWeatherRecord(code); record.Forecast == "" && ok {
+			record.Forecast = derived.Forecast
+		}
+		record.NameFR = firstNonBlank(record.NameFR, frenchCityNames[strings.ToLower(record.Forecast)])
+		record.Population, record.CensusYear = censusPopulationForCityPage(censusCatalog, record.Forecast)
+		if coordinate, exists := cityCoordinates[strings.ToLower(record.Forecast)]; exists {
+			record.Latitude = floatText(coordinate.Latitude)
+			record.Longitude = floatText(coordinate.Longitude)
+		}
+		out[code] = record
+	}
+	return out
+}
+
+func censusPopulationForCityPage(catalog locationdb.CensusPopulationCatalog, cityPageID string) (int64, int) {
+	population, ok := catalog.ByCityPageID[strings.ToLower(strings.TrimSpace(cityPageID))]
+	if !ok || population.Population <= 0 {
+		return 0, 0
+	}
+	return population.Population, population.CensusYear
 }
 
 func loadHelloWeatherCSV(path string) map[string]locationRecord {
@@ -896,6 +1043,13 @@ func loadHelloWeatherCSV(path string) map[string]locationRecord {
 	}
 	codeIndex := csvIndex(header, "CODE")
 	nameIndex := csvIndex(header, "NAME")
+	nameFRIndex := csvIndex(header, "NAME_FR")
+	if nameFRIndex < 0 {
+		nameFRIndex = csvIndex(header, "NAME_F")
+	}
+	if nameFRIndex < 0 {
+		nameFRIndex = csvIndex(header, "NOM")
+	}
 	provinceIndex := csvIndex(header, "PROVINCE")
 	out := map[string]locationRecord{}
 	for {
@@ -909,7 +1063,7 @@ func loadHelloWeatherCSV(path string) map[string]locationRecord {
 		if len(code) != 5 || name == "" || !validProvinceCode(province) || province == "CA" {
 			continue
 		}
-		out[code] = locationRecord{Code: code, Source: "hello_weather", Name: name, Province: province}
+		out[code] = locationRecord{Code: code, Source: "hello_weather", Name: name, NameFR: valueAt(row, nameFRIndex), Province: province}
 	}
 	return out
 }
@@ -1144,6 +1298,38 @@ func displayText(value any) string {
 	case map[string]any:
 		for _, key := range []string{"pronunciation", "text", "name", "value"} {
 			if text := displayText(typed[key]); text != "" {
+				return text
+			}
+		}
+	default:
+		return strings.TrimSpace(fmt.Sprint(value))
+	}
+	return ""
+}
+
+func writtenDisplayText(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return strings.TrimSpace(typed)
+	case []any:
+		merged := map[string]any{}
+		for _, item := range typed {
+			if child, ok := item.(map[string]any); ok {
+				for key, childValue := range child {
+					merged[key] = childValue
+				}
+			}
+		}
+		for _, key := range []string{"text", "name", "value", "pronunciation"} {
+			if text := writtenDisplayText(merged[key]); text != "" {
+				return text
+			}
+		}
+	case map[string]any:
+		for _, key := range []string{"text", "name", "value", "pronunciation"} {
+			if text := writtenDisplayText(typed[key]); text != "" {
 				return text
 			}
 		}

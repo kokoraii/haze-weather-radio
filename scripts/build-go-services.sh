@@ -110,12 +110,12 @@ copy_bundle_dir() {
     return 0
   fi
   if [[ "$name" == "managed" && -d "$target" ]]; then
-    preserve_dir="$(mktemp -d "${TMPDIR:-/tmp}/haze-preserve-onnx.XXXXXX")"
+    preserve_dir="$(mktemp -d "${TMPDIR:-/tmp}/haze-preserve-managed.XXXXXX")"
     while IFS= read -r -d '' file; do
       local rel="${file#"$target"/}"
       mkdir -p "$(dirname -- "$preserve_dir/$rel")"
       cp -p -- "$file" "$preserve_dir/$rel"
-    done < <(find "$target" \( -type f -name '*.onnx' -o -path "$target/voices/kokoro*/*" -type f \) -print0)
+    done < <(find "$target" \( -type f -name '*.onnx' -o -path "$target/voices/kokoro*/*" -type f -o -path "$target/locations/*" -type f \) -print0)
   fi
   rm -rf "$target"
   cp -a "$source" "$target"

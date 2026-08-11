@@ -115,7 +115,7 @@ func (s *Service) handleTwilioMedia(writer http.ResponseWriter, request *http.Re
 	readerDone := make(chan error, 1)
 	go func() { readerDone <- media.readLoop(readerCtx, start.SequenceNumber) }()
 
-	location, ok := media.searchLocation(ctx, session.Language, session.Region)
+	location, ok := media.searchLocation(ctx, session.Language, session.Region, session.callerProvince)
 	if !ok {
 		stopReader()
 		return
@@ -264,8 +264,12 @@ func validDTMFDigit(digit string) bool {
 	return len(digit) == 1 && strings.Contains("0123456789*#", digit)
 }
 
-func (connection *twilioMediaConnection) searchLocation(ctx context.Context, language string, region string) (ResolvedLocation, bool) {
-	hint := locationSearchContext{Region: searchRegionFromSelector(region), Language: language}
+func (connection *twilioMediaConnection) searchLocation(ctx context.Context, language string, region string, callerProvince ...string) (ResolvedLocation, bool) {
+	provinceHint := ""
+	if len(callerProvince) > 0 {
+		provinceHint = callerProvince[0]
+	}
+	hint := twilioLocationSearchContext(language, region, provinceHint, connection.service.cfg.IVR.Search.CallerHintEnabled)
 	for attempt := 0; attempt < connection.service.cfg.IVR.Search.MaxAttempts && ctx.Err() == nil; attempt++ {
 		decision, voiceFailed := connection.runSearchAttempt(ctx, language, hint, connection.service.cfg.IVR.Search.voiceEnabled())
 		if voiceFailed {
@@ -283,6 +287,14 @@ func (connection *twilioMediaConnection) searchLocation(ctx context.Context, lan
 	}
 	_ = connection.playConfiguredPrompt(ctx, "location_search", "fallback_numeric", language)
 	return ResolvedLocation{}, false
+}
+
+func twilioLocationSearchContext(language string, regionalSelector string, callerProvince string, callerHintEnabled bool) locationSearchContext {
+	hint := regionalLocationSearchContext(language, regionalSelector)
+	if !hint.ExplicitRegion && callerHintEnabled {
+		hint.Region = searchRegionFromSelector(callerProvince)
+	}
+	return hint
 }
 
 func (connection *twilioMediaConnection) runSearchAttempt(ctx context.Context, language string, hint locationSearchContext, allowVoice bool) (locationSearchDecision, bool) {
@@ -418,10 +430,24 @@ func (connection *twilioMediaConnection) confirmDecision(ctx context.Context, la
 		}
 	case locationSearchChoices:
 		connection.service.metrics.SearchAmbiguities.Add(1)
-		digit, ok := connection.playTextAndWaitDigit(ctx, "search-choices", localizedChoicePrompt(language, decision.Matches), language, 10*time.Second)
-		if ok && len(digit) == 1 && digit[0] >= '1' && int(digit[0]-'1') < len(decision.Matches) {
-			connection.service.metrics.SearchAccepted.Add(1)
-			return localizedSearchLocation(decision.Matches[int(digit[0]-'1')], language), true
+		if len(decision.Matches) == 0 {
+			return ResolvedLocation{}, false
+		}
+		current := 0
+		for ctx.Err() == nil {
+			digit, ok := connection.playTextAndWaitDigit(ctx, "search-choices", localizedAmbiguityPrompt(language, decision.Matches[current]), language, 10*time.Second)
+			if !ok {
+				return ResolvedLocation{}, false
+			}
+			var action locationSearchChoiceAction
+			current, action = advanceLocationSearchChoice(current, len(decision.Matches), digit)
+			switch action {
+			case locationSearchChoiceBack:
+				return ResolvedLocation{}, false
+			case locationSearchChoiceAccept:
+				connection.service.metrics.SearchAccepted.Add(1)
+				return localizedSearchLocation(decision.Matches[current], language), true
+			}
 		}
 	case locationSearchRefine:
 		connection.service.metrics.SearchAmbiguities.Add(1)

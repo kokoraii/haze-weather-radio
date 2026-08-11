@@ -20,17 +20,18 @@ import (
 
 // Server is the first-pass Go HTTP/WebSocket gateway for Haze.
 type Server struct {
-	startedAt  time.Time
-	config     Config
-	configPath string
-	webroot    string
-	surface    WebSurface
-	auth       *AuthManager
-	receiver   *ReceiverManager
-	media      *MediaHub
-	bannerHub  *BannerHub
-	breakIn    *OperatorBreakInManager
-	listeners  *ListenerTracker
+	startedAt           time.Time
+	config              Config
+	configPath          string
+	webroot             string
+	surface             WebSurface
+	auth                *AuthManager
+	receiver            *ReceiverManager
+	media               *MediaHub
+	bannerHub           *BannerHub
+	breakIn             *OperatorBreakInManager
+	listeners           *ListenerTracker
+	feedMapResolveSlots chan struct{}
 }
 
 // Close releases long-lived authentication and storage resources.
@@ -70,17 +71,18 @@ func NewServerWithSurface(config Config, configPath string, webroot string, surf
 	mediaHub.SetHTTPSource(mediaServiceURL)
 	bannerHub := NewBannerHub(configPath, hostBridgeAddr)
 	server := &Server{
-		startedAt:  time.Now().UTC(),
-		config:     config,
-		configPath: filepath.Clean(configPath),
-		webroot:    webroot,
-		surface:    normalizeSurface(surface),
-		auth:       NewAuthManagerWithPath(config, configPath),
-		receiver:   NewReceiverManager(config, configPath, mediaHub),
-		media:      mediaHub,
-		bannerHub:  bannerHub,
-		breakIn:    NewOperatorBreakInManager(),
-		listeners:  NewListenerTracker(),
+		startedAt:           time.Now().UTC(),
+		config:              config,
+		configPath:          filepath.Clean(configPath),
+		webroot:             webroot,
+		surface:             normalizeSurface(surface),
+		auth:                NewAuthManagerWithPath(config, configPath),
+		receiver:            NewReceiverManager(config, configPath, mediaHub),
+		media:               mediaHub,
+		bannerHub:           bannerHub,
+		breakIn:             NewOperatorBreakInManager(),
+		listeners:           NewListenerTracker(),
+		feedMapResolveSlots: make(chan struct{}, publicFeedMapResolveConcurrency),
 	}
 	if server.surface.allowsAdmin() {
 		server.startBannerStatePublisher(hostBridgeAddr)

@@ -18,18 +18,22 @@ use thiserror::Error;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::config::{PackConfig, PackFormat, ServiceConfig};
+use crate::config::{GeometryPackConfig, PackConfig, PackFormat, ServiceConfig};
 use crate::contract::{
-    Candidate, ConfidenceLevel, Deployment, Entity, Geometry, Identifier, LocationName, MatchInfo,
-    OverlayUpsert, QueryFilters, QueryOptions, RelationshipStep, StationMode,
+    Candidate, ConfidenceLevel, DedupeMode, Deployment, Entity, Geometry, Identifier, LocationName,
+    MatchInfo, OverlayUpsert, QueryFilters, QueryOptions, RelationshipStep, StationMode,
     StationModeRequirement, ALGORITHM_VERSION,
 };
-use crate::geometry::{bounding_box, contains_wkb, haversine_m, valid_point};
+use crate::geometry::{bounding_box, contains_wkb, haversine_m, valid_point, wkb_to_geojson};
 use crate::normalize::{normalize_identifier, normalize_name, normalize_station_mode, t9_digits};
 
 const LOCATION_NAMESPACE: Uuid = Uuid::from_u128(0xf987bc4e56fe5f418bcffdcf8c5a8e3e);
 const OVERLAY_SCHEMA: &str = include_str!("../schema/v1.sql");
+#[cfg(test)]
+const GEOMETRY_SCHEMA: &str = include_str!("../schema/geometry_v1.sql");
 const MAX_SEARCH_CANDIDATES: usize = 500;
+const MAX_LEGACY_NAME_SCAN_ROWS: usize = 100_000;
+type Attributes = BTreeMap<String, Value>;
 
 #[derive(Debug, Error)]
 pub enum CatalogError {
@@ -47,8 +51,12 @@ pub enum CatalogError {
 pub struct CatalogSnapshot {
     pub generation: String,
     pub packs: Vec<PackConfig>,
+    pub geometry_packs: Vec<GeometryPackConfig>,
     pub overlay_path: PathBuf,
     pub pack_ids: Vec<String>,
+    pack_checksums: Vec<String>,
+    geometry_pack_checksums: Vec<String>,
+    legacy_name_indexes: Vec<Option<Arc<LegacyNameIndex>>>,
 }
 
 #[derive(Clone)]
@@ -217,10 +225,35 @@ impl CatalogManager {
 fn validate_snapshot(config: &ServiceConfig) -> Result<CatalogSnapshot> {
     let mut generation_parts = Vec::new();
     let mut pack_ids = Vec::new();
+    let mut pack_checksums = Vec::with_capacity(config.packs.len());
     for pack in &config.packs {
         let checksum = validate_pack(pack)?;
         pack_ids.push(pack.id.clone());
-        generation_parts.push(format!("{}:{checksum}", pack.id));
+        generation_parts.push(format!("core:{}:{checksum}", pack.id));
+        pack_checksums.push(checksum);
+    }
+    let mut geometry_pack_checksums = Vec::with_capacity(config.geometry_packs.len());
+    for geometry_pack in &config.geometry_packs {
+        let core_index = config
+            .packs
+            .iter()
+            .position(|pack| pack.id == geometry_pack.core_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "geometry pack {} references unavailable core pack {}",
+                    geometry_pack.id,
+                    geometry_pack.core_id
+                )
+            })?;
+        let core_pack = &config.packs[core_index];
+        let core_checksum = &pack_checksums[core_index];
+        let checksum = validate_geometry_pack(geometry_pack, core_pack, core_checksum)?;
+        pack_ids.push(geometry_pack.id.clone());
+        generation_parts.push(format!(
+            "geometry:{}:{}:{checksum}",
+            geometry_pack.id, geometry_pack.core_id
+        ));
+        geometry_pack_checksums.push(checksum);
     }
     let generation = Uuid::new_v5(&LOCATION_NAMESPACE, generation_parts.join("|").as_bytes());
     info!(
@@ -232,13 +265,17 @@ fn validate_snapshot(config: &ServiceConfig) -> Result<CatalogSnapshot> {
     Ok(CatalogSnapshot {
         generation: generation.to_string(),
         packs: config.packs.clone(),
+        geometry_packs: config.geometry_packs.clone(),
         overlay_path: config.overlay_path.clone(),
         pack_ids,
+        pack_checksums,
+        geometry_pack_checksums,
+        legacy_name_indexes: Vec::new(),
     })
 }
 
 fn pin_snapshot(mut snapshot: CatalogSnapshot) -> Result<CatalogSnapshot> {
-    if snapshot.packs.is_empty() {
+    if snapshot.packs.is_empty() && snapshot.geometry_packs.is_empty() {
         return Ok(snapshot);
     }
     let state_root = snapshot
@@ -249,46 +286,97 @@ fn pin_snapshot(mut snapshot: CatalogSnapshot) -> Result<CatalogSnapshot> {
         .join(&snapshot.generation);
     fs::create_dir_all(&state_root)
         .with_context(|| format!("failed to create {}", state_root.display()))?;
-    for pack in &mut snapshot.packs {
-        let checksum = file_sha256(&pack.path)?;
-        let extension = pack
-            .path
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or("sqlite");
-        let target = state_root.join(format!(
-            "{}-{}.{}",
-            safe_filename(&pack.id),
-            &checksum[..16],
-            extension
-        ));
-        if !target.exists() {
-            let copied = if cfg!(windows) {
-                fs::copy(&pack.path, &target).map(|_| ())
-            } else {
-                fs::hard_link(&pack.path, &target)
-                    .or_else(|_| fs::copy(&pack.path, &target).map(|_| ()))
-            };
-            if let Err(error) = copied {
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to retain catalog generation {} at {}",
-                        snapshot.generation,
-                        target.display()
-                    )
-                });
-            }
-        }
-        let retained_checksum = file_sha256(&target)?;
-        if retained_checksum != checksum {
-            anyhow::bail!(
-                "retained location pack {} checksum mismatch",
-                target.display()
-            );
-        }
-        pack.path = target;
+    for (pack, checksum) in snapshot
+        .packs
+        .iter_mut()
+        .zip(snapshot.pack_checksums.iter())
+    {
+        pack.path = retain_pack(
+            &state_root,
+            &snapshot.generation,
+            &pack.id,
+            &pack.path,
+            checksum,
+        )?;
     }
+    for (pack, checksum) in snapshot
+        .geometry_packs
+        .iter_mut()
+        .zip(snapshot.geometry_pack_checksums.iter())
+    {
+        pack.path = retain_pack(
+            &state_root,
+            &snapshot.generation,
+            &pack.id,
+            &pack.path,
+            checksum,
+        )?;
+    }
+    snapshot.legacy_name_indexes = snapshot
+        .packs
+        .iter()
+        .map(|pack| {
+            (pack.format == PackFormat::Legacy)
+                .then(|| LegacyNameIndex::open(&pack.path))
+                .transpose()
+                .with_context(|| {
+                    format!(
+                        "failed to build legacy name index for location pack {}",
+                        pack.id
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(snapshot)
+}
+
+fn retain_pack(
+    state_root: &Path,
+    generation: &str,
+    id: &str,
+    source: &Path,
+    expected_checksum: &str,
+) -> Result<PathBuf> {
+    let source_checksum = file_sha256(source)?;
+    if source_checksum != expected_checksum {
+        anyhow::bail!(
+            "location pack {} changed while generation {generation} was being retained",
+            source.display()
+        );
+    }
+    let extension = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("sqlite");
+    let target = state_root.join(format!(
+        "{}-{}.{}",
+        safe_filename(id),
+        &expected_checksum[..16],
+        extension
+    ));
+    if !target.exists() {
+        let copied = if cfg!(windows) {
+            fs::copy(source, &target).map(|_| ())
+        } else {
+            fs::hard_link(source, &target).or_else(|_| fs::copy(source, &target).map(|_| ()))
+        };
+        if let Err(error) = copied {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to retain catalog generation {generation} at {}",
+                    target.display()
+                )
+            });
+        }
+    }
+    let retained_checksum = file_sha256(&target)?;
+    if retained_checksum != expected_checksum {
+        anyhow::bail!(
+            "retained location pack {} checksum mismatch",
+            target.display()
+        );
+    }
+    Ok(target)
 }
 
 fn safe_filename(value: &str) -> String {
@@ -359,6 +447,279 @@ fn validate_pack(pack: &PackConfig) -> Result<String> {
         validate_normalized_counts(&connection, &pack.path)?;
     }
     Ok(checksum)
+}
+
+fn validate_geometry_pack(
+    pack: &GeometryPackConfig,
+    core: &PackConfig,
+    core_checksum: &str,
+) -> Result<String> {
+    let checksum = file_sha256(&pack.path)?;
+    if pack.format == PackFormat::Normalized {
+        validate_checksum_sidecar(&pack.path, &checksum)?;
+    }
+    let connection = open_read_only(&pack.path).with_context(|| {
+        format!(
+            "failed to open location geometry pack {}",
+            pack.path.display()
+        )
+    })?;
+    let integrity: String = connection
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .with_context(|| format!("failed to validate {}", pack.path.display()))?;
+    if integrity != "ok" {
+        anyhow::bail!(
+            "location geometry pack {} failed integrity check: {integrity}",
+            pack.path.display()
+        );
+    }
+    let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != 1 {
+        anyhow::bail!(
+            "location geometry pack {} has unsupported schema version {version}",
+            pack.path.display()
+        );
+    }
+    for table in [
+        "catalog_metadata",
+        "sources",
+        "area_geometries",
+        "area_geometry_rtree",
+    ] {
+        if !table_exists(&connection, table)? {
+            anyhow::bail!(
+                "location geometry pack {} is missing required table {table}",
+                pack.path.display()
+            );
+        }
+    }
+    let pack_kind = metadata_value(&connection, "pack_kind")?.unwrap_or_default();
+    if pack_kind != "geometry" {
+        anyhow::bail!(
+            "location geometry pack {} has invalid pack_kind metadata",
+            pack.path.display()
+        );
+    }
+    let metadata_pack_id = metadata_value(&connection, "pack_id")?.unwrap_or_default();
+    if metadata_pack_id != pack.id {
+        anyhow::bail!(
+            "location geometry pack {} declares pack id {metadata_pack_id}, expected {}",
+            pack.path.display(),
+            pack.id
+        );
+    }
+    let metadata_core_id = metadata_value(&connection, "core_pack_id")?.unwrap_or_default();
+    if metadata_core_id != pack.core_id {
+        anyhow::bail!(
+            "location geometry pack {} declares core pack {metadata_core_id}, expected {}",
+            pack.path.display(),
+            pack.core_id
+        );
+    }
+    let metadata_core_checksum = metadata_value(&connection, "core_sha256")?.unwrap_or_default();
+    if metadata_core_checksum.len() != 64
+        || !metadata_core_checksum
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        anyhow::bail!(
+            "location geometry pack {} has invalid core_sha256 metadata",
+            pack.path.display()
+        );
+    }
+    if !metadata_core_checksum.eq_ignore_ascii_case(core_checksum) {
+        anyhow::bail!(
+            "location geometry pack {} was built for core SHA-256 {metadata_core_checksum}, but paired core {} is {core_checksum}",
+            pack.path.display(),
+            core.path.display()
+        );
+    }
+    let rtree: String =
+        connection.query_row("SELECT rtreecheck('area_geometry_rtree')", [], |row| {
+            row.get(0)
+        })?;
+    if rtree != "ok" {
+        anyhow::bail!(
+            "location geometry pack {} failed RTree validation: {rtree}",
+            pack.path.display()
+        );
+    }
+    validate_geometry_counts(&connection, &pack.path)?;
+    validate_geometry_members(&connection, core, &pack.path)?;
+    Ok(checksum)
+}
+
+fn table_exists(connection: &Connection, table: &str) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') AND name = ?1)",
+        [table],
+        |row| row.get(0),
+    )
+}
+
+fn metadata_value(connection: &Connection, key: &str) -> rusqlite::Result<Option<String>> {
+    connection
+        .query_row(
+            "SELECT value FROM catalog_metadata WHERE key = ?1",
+            [key],
+            |row| row.get(0),
+        )
+        .optional()
+}
+
+fn validate_geometry_counts(connection: &Connection, path: &Path) -> Result<()> {
+    let actual: i64 =
+        connection.query_row("SELECT COUNT(*) FROM area_geometries", [], |row| row.get(0))?;
+    let expected =
+        metadata_value(connection, "count.geometries")?.and_then(|value| value.parse::<i64>().ok());
+    if expected != Some(actual) {
+        anyhow::bail!(
+            "location geometry pack {} has invalid count metadata for geometries",
+            path.display()
+        );
+    }
+    let indexed: i64 =
+        connection.query_row("SELECT COUNT(*) FROM area_geometry_rtree", [], |row| {
+            row.get(0)
+        })?;
+    if indexed != actual {
+        anyhow::bail!(
+            "location geometry pack {} has {actual} geometries but {indexed} RTree rows",
+            path.display()
+        );
+    }
+    let source_ids = connection
+        .prepare("SELECT source_id FROM sources ORDER BY source_id")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if source_ids.is_empty() {
+        anyhow::bail!(
+            "location geometry pack {} contains no source metadata",
+            path.display()
+        );
+    }
+    for source_id in source_ids {
+        let actual: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM area_geometries WHERE source_id = ?1",
+            [&source_id],
+            |row| row.get(0),
+        )?;
+        let expected = metadata_value(connection, &format!("count.source.{source_id}"))?
+            .and_then(|value| value.parse::<i64>().ok());
+        if expected != Some(actual) {
+            anyhow::bail!(
+                "location geometry pack {} has invalid source count metadata for {source_id}",
+                path.display()
+            );
+        }
+    }
+    let invalid: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM area_geometries
+         WHERE canonical_id = '' OR min_lon > max_lon OR min_lat > max_lat
+            OR min_lon < -180 OR max_lon > 180 OR min_lat < -90 OR max_lat > 90
+            OR (latitude IS NOT NULL AND (latitude < -90 OR latitude > 90))
+            OR (longitude IS NOT NULL AND (longitude < -180 OR longitude > 180))",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid != 0 {
+        anyhow::bail!(
+            "location geometry pack {} contains {invalid} invalid geometry rows",
+            path.display()
+        );
+    }
+    let mut statement = connection.prepare(
+        "SELECT geometry_pk, geometry_type, geometry_wkb FROM area_geometries ORDER BY geometry_pk",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (geometry_pk, geometry_type, wkb) = row?;
+        let decoded = wkb_to_geojson(&wkb).with_context(|| {
+            format!(
+                "location geometry pack {} has invalid WKB for geometry {geometry_pk}",
+                path.display()
+            )
+        })?;
+        let decoded_type = decoded
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !decoded_type.eq_ignore_ascii_case(&geometry_type) {
+            anyhow::bail!(
+                "location geometry pack {} geometry {geometry_pk} type does not match its WKB",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_geometry_members(
+    geometry: &Connection,
+    core: &PackConfig,
+    geometry_path: &Path,
+) -> Result<()> {
+    let core_connection = open_read_only(&core.path)
+        .with_context(|| format!("failed to open paired core pack {}", core.path.display()))?;
+    let mut valid_ids = HashSet::new();
+    match core.format {
+        PackFormat::Normalized => {
+            let mut statement = core_connection.prepare("SELECT canonical_id FROM entities")?;
+            valid_ids.extend(
+                statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?,
+            );
+        }
+        PackFormat::Legacy => {
+            let mut statement = core_connection.prepare("SELECT source, code FROM places")?;
+            for row in statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })? {
+                let (source, code) = row?;
+                valid_ids.insert(stable_id(&format!("legacy:{source}:{code}")));
+            }
+        }
+    }
+    let mut statement = geometry
+        .prepare("SELECT canonical_id, source, code FROM area_geometries ORDER BY geometry_pk")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (canonical_id, source, code) = row?;
+        if !valid_ids.contains(&canonical_id) {
+            anyhow::bail!(
+                "location geometry pack {} contains orphan entity {canonical_id}",
+                geometry_path.display()
+            );
+        }
+        if core.format == PackFormat::Legacy {
+            let (Some(source), Some(code)) = (source, code) else {
+                anyhow::bail!(
+                    "legacy geometry entity {canonical_id} in {} is missing source-qualified identity",
+                    geometry_path.display()
+                );
+            };
+            if stable_id(&format!("legacy:{source}:{code}")) != canonical_id {
+                anyhow::bail!(
+                    "legacy geometry entity {canonical_id} in {} has mismatched source-qualified identity",
+                    geometry_path.display()
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_checksum_sidecar(path: &Path, actual: &str) -> Result<()> {
@@ -579,11 +940,30 @@ struct OpenPack {
     priority: i32,
     format: PackFormat,
     connection: Connection,
+    legacy_name_index: Option<Arc<LegacyNameIndex>>,
+}
+
+struct OpenGeometryPack {
+    id: String,
+    core_id: String,
+    priority: i32,
+    connection: Connection,
+}
+
+struct ExternalAreaGeometry {
+    geometry: Value,
+    same_code: Option<String>,
+    provider_version: Option<String>,
+    source_url: Option<String>,
+    updated_at: Option<String>,
+    bbox: [f64; 4],
+    attributes: BTreeMap<String, Value>,
 }
 
 pub struct WorkerCatalog {
     generation: String,
     packs: Vec<OpenPack>,
+    geometry_packs: Vec<OpenGeometryPack>,
     feed_bound_entities: HashSet<String>,
 }
 
@@ -593,6 +973,7 @@ impl WorkerCatalog {
         Self {
             generation: String::new(),
             packs: Vec::new(),
+            geometry_packs: Vec::new(),
             feed_bound_entities: HashSet::new(),
         }
     }
@@ -602,11 +983,24 @@ impl WorkerCatalog {
             return Ok(());
         }
         let mut packs = Vec::with_capacity(snapshot.packs.len() + 1);
-        for pack in &snapshot.packs {
+        for (index, pack) in snapshot.packs.iter().enumerate() {
             packs.push(OpenPack {
                 id: pack.id.clone(),
                 priority: pack.priority,
                 format: pack.format,
+                connection: open_read_only(&pack.path)?,
+                legacy_name_index: snapshot
+                    .legacy_name_indexes
+                    .get(index)
+                    .and_then(Clone::clone),
+            });
+        }
+        let mut geometry_packs = Vec::with_capacity(snapshot.geometry_packs.len());
+        for pack in &snapshot.geometry_packs {
+            geometry_packs.push(OpenGeometryPack {
+                id: pack.id.clone(),
+                core_id: pack.core_id.clone(),
+                priority: pack.priority,
                 connection: open_read_only(&pack.path)?,
             });
         }
@@ -615,6 +1009,7 @@ impl WorkerCatalog {
             priority: i32::MIN,
             format: PackFormat::Normalized,
             connection: open_read_only(&snapshot.overlay_path)?,
+            legacy_name_index: None,
         });
         let feed_bound_entities = packs
             .last()
@@ -628,6 +1023,7 @@ impl WorkerCatalog {
             .collect::<rusqlite::Result<HashSet<_>>>()?;
         self.generation.clone_from(&snapshot.generation);
         self.packs = packs;
+        self.geometry_packs = geometry_packs;
         self.feed_bound_entities = feed_bound_entities;
         Ok(())
     }
@@ -637,7 +1033,7 @@ impl WorkerCatalog {
         mut candidates: Vec<Candidate>,
         filters: &QueryFilters,
         options: &QueryOptions,
-    ) -> Vec<Candidate> {
+    ) -> Result<Vec<Candidate>, CatalogError> {
         for candidate in &mut candidates {
             if self.feed_bound_entities.contains(&candidate.entity.id) {
                 candidate
@@ -646,7 +1042,67 @@ impl WorkerCatalog {
                     .insert("configured_feed_binding".to_string(), json!(true));
             }
         }
-        finalize_candidates(candidates, filters, options)
+        let mut candidates = finalize_candidates(candidates, filters, options);
+        if options.include_area_geometry {
+            self.enrich_area_geometries(&mut candidates, options.as_of.as_deref())?;
+        }
+        Ok(candidates)
+    }
+
+    fn enrich_area_geometries(
+        &self,
+        candidates: &mut [Candidate],
+        as_of: Option<&str>,
+    ) -> Result<(), CatalogError> {
+        for candidate in candidates {
+            let core_id = candidate
+                .match_info
+                .evidence
+                .get("pack")
+                .and_then(Value::as_str);
+            let mut external = None;
+            for pack in self.geometry_packs.iter().filter(|pack| {
+                core_id.is_none_or(|wanted| pack.core_id.eq_ignore_ascii_case(wanted))
+            }) {
+                if let Some(mut geometry) =
+                    external_area_geometry(&pack.connection, &candidate.entity.id, as_of)?
+                {
+                    geometry.attributes.insert(
+                        "geometry_pack".to_string(),
+                        json!({"id": pack.id, "priority": pack.priority}),
+                    );
+                    external = Some(geometry);
+                    break;
+                }
+            }
+            if external.is_none() {
+                if let Some((source, code)) = legacy_identity(&candidate.entity) {
+                    for pack in self.packs.iter().filter(|pack| {
+                        pack.format == PackFormat::Legacy
+                            && core_id.is_none_or(|wanted| pack.id.eq_ignore_ascii_case(wanted))
+                    }) {
+                        if let Some(legacy) =
+                            load_legacy_area_geometry(&pack.connection, source, code)?
+                        {
+                            external = Some(ExternalAreaGeometry {
+                                geometry: legacy.geometry,
+                                same_code: Some(legacy.same_code),
+                                provider_version: Some(legacy.provider_version),
+                                source_url: Some(legacy.source_url),
+                                updated_at: Some(legacy.updated_at),
+                                bbox: legacy.bbox,
+                                attributes: BTreeMap::new(),
+                            });
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Some(geometry) = external {
+                apply_area_geometry(&mut candidate.entity, geometry);
+            }
+        }
+        Ok(())
     }
 
     pub fn resolve_identifier(
@@ -690,7 +1146,7 @@ impl WorkerCatalog {
             }
             candidates.extend(found);
         }
-        Ok(self.finalize(candidates, filters, options))
+        self.finalize(candidates, filters, options)
     }
 
     pub fn entity_by_id(
@@ -720,7 +1176,7 @@ impl WorkerCatalog {
                 });
             }
         }
-        Ok(self.finalize(candidates, filters, options))
+        self.finalize(candidates, filters, options)
     }
 
     pub fn search(
@@ -745,6 +1201,22 @@ impl WorkerCatalog {
             .limit
             .saturating_mul(20)
             .clamp(50, MAX_SEARCH_CANDIDATES);
+        let legacy_candidate_limit = if options.dedupe_mode == DedupeMode::SimilarName {
+            options
+                .limit
+                .saturating_mul(2)
+                .clamp(20, MAX_SEARCH_CANDIDATES)
+        } else if options.geographic_bias.is_some()
+            || options.station_mode_preference.is_some()
+            || options.locale.is_some()
+        {
+            options
+                .limit
+                .saturating_mul(5)
+                .clamp(50, MAX_SEARCH_CANDIDATES)
+        } else {
+            options.limit.clamp(10, MAX_SEARCH_CANDIDATES)
+        };
         let mut candidates = Vec::new();
         for pack in &self.packs {
             let mut found = match pack.format {
@@ -760,9 +1232,20 @@ impl WorkerCatalog {
                     candidate_limit,
                     options.as_of.as_deref(),
                 )?,
-                PackFormat::Legacy => {
-                    legacy_name_candidates(&pack.connection, &normalized, candidate_limit)?
-                }
+                PackFormat::Legacy => legacy_name_candidates(
+                    &pack.connection,
+                    pack.legacy_name_index.as_deref().ok_or_else(|| {
+                        CatalogError::Unavailable(format!(
+                            "legacy name index for pack {} is unavailable",
+                            pack.id
+                        ))
+                    })?,
+                    &normalized,
+                    legacy_candidate_limit,
+                    t9,
+                    filters,
+                    options,
+                )?,
             };
             if pack.format == PackFormat::Normalized {
                 found.extend(normalized_unqualified_identifier_candidates(
@@ -794,7 +1277,7 @@ impl WorkerCatalog {
             }
             candidates.extend(found);
         }
-        Ok(self.finalize(candidates, filters, options))
+        self.finalize(candidates, filters, options)
     }
 
     pub fn nearest(
@@ -840,7 +1323,7 @@ impl WorkerCatalog {
                 }
                 candidates.extend(found);
             }
-            let filtered = self.finalize(candidates.clone(), filters, options);
+            let filtered = self.finalize(candidates.clone(), filters, options)?;
             if filtered.len() >= options.limit || radius_km >= maximum_radius {
                 candidates = filtered;
                 break;
@@ -883,7 +1366,31 @@ impl WorkerCatalog {
             }
             candidates.extend(found);
         }
+        for geometry_pack in &self.geometry_packs {
+            let Some(core_pack) = self
+                .packs
+                .iter()
+                .find(|pack| pack.id == geometry_pack.core_id)
+            else {
+                return Err(CatalogError::Unavailable(format!(
+                    "geometry pack {} lost its paired core {}",
+                    geometry_pack.id, geometry_pack.core_id
+                )));
+            };
+            let mut found = external_containing_candidates(
+                core_pack,
+                geometry_pack,
+                latitude,
+                longitude,
+                options.as_of.as_deref(),
+            )?;
+            for candidate in &mut found {
+                candidate.facet = Some(facet_for_kind(&candidate.entity.kind).to_string());
+            }
+            candidates.extend(found);
+        }
         let mut nearest_options = options.clone();
+        nearest_options.include_area_geometry = false;
         nearest_options.limit = options.limit.saturating_mul(8).clamp(16, 200);
         nearest_options.max_distance_km = options.max_distance_km.or(Some(250.0));
         for mut candidate in self.nearest(latitude, longitude, filters, &nearest_options)? {
@@ -898,7 +1405,7 @@ impl WorkerCatalog {
             candidates.push(candidate);
         }
         let mut per_facet = HashMap::<String, usize>::new();
-        let mut finalized = self.finalize(candidates, filters, options);
+        let mut finalized = self.finalize(candidates, filters, options)?;
         finalized.retain(|candidate| {
             let facet = candidate
                 .facet
@@ -1007,7 +1514,13 @@ impl WorkerCatalog {
                 break;
             }
         }
-        Ok(self.finalize(candidates, filters, options))
+        self.finalize(candidates, filters, options)
+    }
+}
+
+impl Default for WorkerCatalog {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1462,6 +1975,90 @@ fn normalized_containing_candidates(
     Ok(out)
 }
 
+fn external_containing_candidates(
+    core: &OpenPack,
+    geometry_pack: &OpenGeometryPack,
+    latitude: f64,
+    longitude: f64,
+    as_of: Option<&str>,
+) -> Result<Vec<Candidate>, CatalogError> {
+    let as_of = as_of.unwrap_or("");
+    let mut statement = geometry_pack.connection.prepare(
+        "SELECT DISTINCT g.canonical_id, g.source, g.code, g.geometry_wkb, g.geometry_type
+         FROM area_geometry_rtree r
+         JOIN area_geometries g ON g.geometry_pk = r.geometry_pk
+         WHERE r.min_lon <= ?1 AND r.max_lon >= ?1
+           AND r.min_lat <= ?2 AND r.max_lat >= ?2
+           AND (?3 != '' OR g.is_current = 1)
+           AND (g.valid_from IS NULL OR date(g.valid_from) <= date(CASE WHEN ?3 = '' THEN 'now' ELSE ?3 END))
+           AND (g.valid_to IS NULL OR date(g.valid_to) >= date(CASE WHEN ?3 = '' THEN 'now' ELSE ?3 END))",
+    )?;
+    let rows = statement.query_map(params![longitude, latitude, as_of], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Vec<u8>>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (canonical_id, source, code, wkb, geometry_type) = row?;
+        if !matches!(
+            geometry_type.to_ascii_lowercase().as_str(),
+            "polygon" | "multipolygon"
+        ) {
+            continue;
+        }
+        let contained = contains_wkb(&wkb, longitude, latitude).map_err(|error| {
+            CatalogError::Unavailable(format!(
+                "geometry pack {} contains invalid WKB for {canonical_id}: {error}",
+                geometry_pack.id
+            ))
+        })?;
+        if !contained {
+            continue;
+        }
+        let entity = match core.format {
+            PackFormat::Normalized => {
+                normalized_entity_by_id(&core.connection, &canonical_id, Some(as_of))?
+            }
+            PackFormat::Legacy => match (source.as_deref(), code.as_deref()) {
+                (Some(source), Some(code)) => {
+                    let entity = load_legacy_entity(&core.connection, source, code)?;
+                    entity.filter(|entity| entity.id == canonical_id)
+                }
+                _ => None,
+            },
+        };
+        let Some(entity) = entity else {
+            continue;
+        };
+        out.push(Candidate {
+            entity,
+            match_info: MatchInfo {
+                score: 1.0,
+                confidence: ConfidenceLevel::High,
+                method: "spatial_contains".to_string(),
+                algorithm: ALGORITHM_VERSION.to_string(),
+                evidence: BTreeMap::from([
+                    ("latitude".to_string(), json!(latitude)),
+                    ("longitude".to_string(), json!(longitude)),
+                    ("pack".to_string(), json!(core.id)),
+                    ("pack_priority".to_string(), json!(core.priority)),
+                    ("geometry_pack".to_string(), json!(geometry_pack.id)),
+                ]),
+            },
+            facet: None,
+            distance_m: Some(0.0),
+            relationship_path: Vec::new(),
+            grouping: None,
+        });
+    }
+    Ok(out)
+}
+
 fn normalized_relationships(
     connection: &Connection,
     current: &str,
@@ -1508,12 +2105,13 @@ fn legacy_identifier_candidates(
     let source = legacy_source_for_scheme(scheme);
     let mut rows = Vec::new();
     if let Some(source) = source {
-        let mut statement = connection.prepare(
-            "SELECT source, code FROM places WHERE lower(source) = ?1 AND upper(code) = ?2",
-        )?;
+        let source = source.trim().to_ascii_lowercase();
+        let code = normalized.trim().to_ascii_uppercase();
+        let mut statement = connection
+            .prepare("SELECT source, code FROM places WHERE source = ?1 AND code = ?2")?;
         rows.extend(
             statement
-                .query_map(params![source, normalized], |row| {
+                .query_map(params![source, code], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?,
@@ -1670,14 +2268,6 @@ fn load_legacy_entity(
     };
     let kind = legacy_kind_name(source, &legacy_kind);
     let mut attributes = parse_attributes(&attrs_json);
-    if let Some(area) = load_legacy_area_geometry(connection, source, code)? {
-        attributes.insert("area_geometry".to_string(), area.geometry);
-        attributes.insert("same_code".to_string(), json!(area.same_code));
-        attributes.insert("provider_version".to_string(), json!(area.provider_version));
-        attributes.insert("geometry_source_url".to_string(), json!(area.source_url));
-        attributes.insert("geometry_updated_at".to_string(), json!(area.updated_at));
-        attributes.insert("area_bbox".to_string(), json!(area.bbox));
-    }
     enrich_legacy_location_codes(connection, source, code, &mut attributes)?;
     if let Some(mode) = attributes
         .get("mode")
@@ -1770,6 +2360,102 @@ struct LegacyAreaGeometry {
     source_url: String,
     updated_at: String,
     bbox: [f64; 4],
+}
+
+fn external_area_geometry(
+    connection: &Connection,
+    canonical_id: &str,
+    as_of: Option<&str>,
+) -> Result<Option<ExternalAreaGeometry>, CatalogError> {
+    let as_of = as_of.unwrap_or("");
+    let row = connection
+        .query_row(
+            "SELECT geometry_wkb, same_code, provider_version, source_url, updated_at,
+                    min_lon, min_lat, max_lon, max_lat, attributes_json
+             FROM area_geometries
+             WHERE canonical_id = ?1 AND (?2 != '' OR is_current = 1)
+               AND (valid_from IS NULL OR date(valid_from) <= date(CASE WHEN ?2 = '' THEN 'now' ELSE ?2 END))
+               AND (valid_to IS NULL OR date(valid_to) >= date(CASE WHEN ?2 = '' THEN 'now' ELSE ?2 END))
+             ORDER BY is_current DESC, valid_from DESC, geometry_pk DESC LIMIT 1",
+            params![canonical_id, as_of],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, f64>(5)?,
+                    row.get::<_, f64>(6)?,
+                    row.get::<_, f64>(7)?,
+                    row.get::<_, f64>(8)?,
+                    row.get::<_, String>(9)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        wkb,
+        same_code,
+        provider_version,
+        source_url,
+        updated_at,
+        min_lon,
+        min_lat,
+        max_lon,
+        max_lat,
+        attributes_json,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let geometry = wkb_to_geojson(&wkb).map_err(|error| {
+        CatalogError::Unavailable(format!(
+            "external geometry for {canonical_id} is invalid: {error}"
+        ))
+    })?;
+    Ok(Some(ExternalAreaGeometry {
+        geometry,
+        same_code,
+        provider_version,
+        source_url,
+        updated_at,
+        bbox: [min_lon, min_lat, max_lon, max_lat],
+        attributes: parse_attributes(&attributes_json),
+    }))
+}
+
+fn legacy_identity(entity: &Entity) -> Option<(&str, &str)> {
+    entity
+        .identifiers
+        .iter()
+        .find(|identifier| {
+            identifier.primary
+                && identifier.source_id.as_deref() == Some("legacy-alert-location-map")
+        })
+        .map(|identifier| (identifier.scheme.as_str(), identifier.value.as_str()))
+}
+
+fn apply_area_geometry(entity: &mut Entity, geometry: ExternalAreaGeometry) {
+    entity
+        .attributes
+        .insert("area_geometry".to_string(), geometry.geometry);
+    entity
+        .attributes
+        .insert("area_bbox".to_string(), json!(geometry.bbox));
+    for (key, value) in geometry.attributes {
+        entity.attributes.entry(key).or_insert(value);
+    }
+    for (key, value) in [
+        ("same_code", geometry.same_code),
+        ("provider_version", geometry.provider_version),
+        ("geometry_source_url", geometry.source_url),
+        ("geometry_updated_at", geometry.updated_at),
+    ] {
+        if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+            entity.attributes.insert(key.to_string(), json!(value));
+        }
+    }
 }
 
 fn load_legacy_area_geometry(
@@ -1920,16 +2606,17 @@ fn legacy_related_codes(
     if !legacy_table_exists(connection, "links")? {
         return Ok(Vec::new());
     }
+    let source = source.trim().to_ascii_lowercase();
+    let code = code.trim().to_ascii_uppercase();
+    let related_source = related_source.trim().to_ascii_lowercase();
     let mut statement = connection.prepare(
         "SELECT CASE
-             WHEN lower(from_source) = lower(?1) AND upper(from_code) = upper(?2)
+             WHEN from_source = ?1 AND from_code = ?2
              THEN to_code ELSE from_code
          END
          FROM links
-         WHERE (lower(from_source) = lower(?1) AND upper(from_code) = upper(?2)
-                AND lower(to_source) = lower(?3))
-            OR (lower(to_source) = lower(?1) AND upper(to_code) = upper(?2)
-                AND lower(from_source) = lower(?3))
+         WHERE (from_source = ?1 AND from_code = ?2 AND to_source = ?3)
+            OR (to_source = ?1 AND to_code = ?2 AND from_source = ?3)
          ORDER BY 1",
     )?;
     let values = statement
@@ -1948,10 +2635,12 @@ fn legacy_place_region_attributes(
     connection: &Connection,
     source: &str,
     code: &str,
-) -> Result<Option<(String, BTreeMap<String, Value>)>, CatalogError> {
+) -> Result<Option<(String, Attributes)>, CatalogError> {
+    let source = source.trim().to_ascii_lowercase();
+    let code = code.trim().to_ascii_uppercase();
     connection
         .query_row(
-            "SELECT region, attrs_json FROM places WHERE lower(source) = lower(?1) AND upper(code) = upper(?2)",
+            "SELECT region, attrs_json FROM places WHERE source = ?1 AND code = ?2",
             params![source, code],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
@@ -1998,50 +2687,437 @@ fn nws_county_ugc(region: &str, fips: &str) -> Option<String> {
     (region.len() == 2 && fips.len() == 5).then(|| format!("{region}C{}", &fips[2..]))
 }
 
-fn legacy_name_candidates(
-    connection: &Connection,
-    normalized: &str,
-    limit: usize,
-) -> Result<Vec<Candidate>, CatalogError> {
-    let first_token = normalized.split_whitespace().next().unwrap_or(normalized);
-    let pattern = format!("%{first_token}%");
-    let mut statement = connection.prepare(
-        "SELECT source, code FROM places
-         WHERE lower(name) LIKE ?1 OR lower(name_fr) LIKE ?1
-         ORDER BY source, code LIMIT ?2",
-    )?;
-    let mut rows = statement
-        .query_map(params![pattern, limit as i64], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    if rows.len() < limit.min(50) {
-        let mut scan =
-            connection.prepare("SELECT source, code FROM places ORDER BY source, code")?;
-        rows.extend(
-            scan.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?,
-        );
+#[derive(Debug)]
+struct LegacyNameEntry {
+    source: String,
+    code: String,
+    kind: String,
+    country: Option<String>,
+    region: Option<String>,
+    capabilities: Box<[String]>,
+    station_mode: Option<StationMode>,
+    normalized_name: String,
+    normalized_name_fr: String,
+    t9_name: String,
+    t9_name_fr: String,
+    normal_gram_counts: [u16; 2],
+    t9_gram_counts: [u16; 2],
+}
+
+#[derive(Debug)]
+struct LegacyNameIndex {
+    entries: Box<[LegacyNameEntry]>,
+    normalized_names: BTreeMap<String, Box<[usize]>>,
+    normalized_grams: HashMap<u64, Box<[usize]>>,
+    t9_names: BTreeMap<String, Box<[usize]>>,
+    t9_grams: HashMap<u64, Box<[usize]>>,
+}
+
+#[derive(Debug, Default)]
+struct LegacyRetrievalHit {
+    exact: bool,
+    prefix: bool,
+    gram_similarity: f64,
+    gram_overlap: u16,
+}
+
+impl LegacyNameIndex {
+    fn open(path: &Path) -> Result<Arc<Self>, CatalogError> {
+        let connection = open_read_only(path)?;
+        Self::load(&connection).map(Arc::new)
     }
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for (source, code) in rows {
-        if !seen.insert((source.clone(), code.clone())) {
+
+    fn load(connection: &Connection) -> Result<Self, CatalogError> {
+        // Legacy packs predate the normalized FTS schema. Normalize each name
+        // once per immutable catalog generation so concurrent searches only do
+        // bounded in-memory ranking and candidate hydration.
+        // The extra row makes an oversized pack fail instead of silently
+        // omitting entries beyond the compatibility limit.
+        let mut statement = connection.prepare(
+            "SELECT source, code, name, name_fr, region, country, kind, attrs_json
+             FROM places LIMIT ?1",
+        )?;
+        let rows = statement.query_map(params![MAX_LEGACY_NAME_SCAN_ROWS as i64 + 1], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+            ))
+        })?;
+        let mut entries = Vec::new();
+        let mut normalized_names = BTreeMap::<String, Vec<usize>>::new();
+        let mut normalized_grams = HashMap::<u64, Vec<usize>>::new();
+        let mut indexed_t9_names = BTreeMap::<String, Vec<usize>>::new();
+        let mut indexed_t9_grams = HashMap::<u64, Vec<usize>>::new();
+        for (index, row) in rows.enumerate() {
+            if index == MAX_LEGACY_NAME_SCAN_ROWS {
+                return Err(CatalogError::Unavailable(format!(
+                    "legacy catalog exceeds the {MAX_LEGACY_NAME_SCAN_ROWS}-place fuzzy search limit; rebuild it in normalized format"
+                )));
+            }
+            let (source, code, name, name_fr, region, country, legacy_kind, attrs_json) = row?;
+            let kind = legacy_kind_name(&source, &legacy_kind);
+            let attributes = parse_attributes(&attrs_json);
+            let station_mode = attributes
+                .get("mode")
+                .and_then(Value::as_str)
+                .and_then(normalize_station_mode);
+            let normalized_name = normalize_name(&name);
+            let normalized_name_fr = normalize_name(&name_fr);
+            let t9_name = t9_digits(&normalized_name);
+            let t9_name_fr = t9_digits(&normalized_name_fr);
+            let entry_index = entries.len();
+            let normal_gram_counts = index_legacy_name_variants(
+                entry_index,
+                [&normalized_name, &normalized_name_fr],
+                &mut normalized_names,
+                &mut normalized_grams,
+            );
+            let t9_gram_counts = index_legacy_name_variants(
+                entry_index,
+                [&t9_name, &t9_name_fr],
+                &mut indexed_t9_names,
+                &mut indexed_t9_grams,
+            );
+            entries.push(LegacyNameEntry {
+                source,
+                code,
+                capabilities: capabilities_for_kind(&kind).into_boxed_slice(),
+                kind,
+                country: non_empty(&country).map(|value| value.to_ascii_uppercase()),
+                region: non_empty(&region).map(|value| value.to_ascii_uppercase()),
+                station_mode,
+                normalized_name,
+                normalized_name_fr,
+                t9_name,
+                t9_name_fr,
+                normal_gram_counts,
+                t9_gram_counts,
+            });
+        }
+        Ok(Self {
+            entries: entries.into_boxed_slice(),
+            normalized_names: freeze_legacy_name_map(normalized_names),
+            normalized_grams: freeze_legacy_gram_map(normalized_grams),
+            t9_names: freeze_legacy_name_map(indexed_t9_names),
+            t9_grams: freeze_legacy_gram_map(indexed_t9_grams),
+        })
+    }
+
+    #[cfg(test)]
+    fn ranked(&self, query: &str, limit: usize, t9: bool) -> Vec<&LegacyNameEntry> {
+        self.ranked_filtered(
+            query,
+            limit,
+            t9,
+            &QueryFilters::default(),
+            &QueryOptions::default(),
+        )
+    }
+
+    fn ranked_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        t9: bool,
+        filters: &QueryFilters,
+        options: &QueryOptions,
+    ) -> Vec<&LegacyNameEntry> {
+        let limit = limit.clamp(1, MAX_SEARCH_CANDIDATES);
+        let candidate_indices = self.candidate_indices_filtered(query, limit, t9, filters, options);
+        let mut ranked = Vec::with_capacity(limit.saturating_mul(2));
+        for entry_index in candidate_indices {
+            let entry = &self.entries[entry_index];
+            let (name, name_fr) = if t9 {
+                (&entry.t9_name, &entry.t9_name_fr)
+            } else {
+                (&entry.normalized_name, &entry.normalized_name_fr)
+            };
+            let score = legacy_normalized_name_retrieval_score(name, name_fr, query);
+            ranked.push((entry, score));
+            if ranked.len() == limit.saturating_mul(2) {
+                rank_legacy_name_hits(&mut ranked, limit);
+            }
+        }
+        rank_legacy_name_hits(&mut ranked, limit);
+        ranked.into_iter().map(|(entry, _)| entry).collect()
+    }
+
+    #[cfg(test)]
+    fn candidate_indices(&self, query: &str, limit: usize, t9: bool) -> Vec<usize> {
+        self.candidate_indices_filtered(
+            query,
+            limit,
+            t9,
+            &QueryFilters::default(),
+            &QueryOptions::default(),
+        )
+    }
+
+    fn candidate_indices_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        t9: bool,
+        filters: &QueryFilters,
+        options: &QueryOptions,
+    ) -> Vec<usize> {
+        let (names, grams) = if t9 {
+            (&self.t9_names, &self.t9_grams)
+        } else {
+            (&self.normalized_names, &self.normalized_grams)
+        };
+        let mut hits = HashMap::<usize, LegacyRetrievalHit>::new();
+        if let Some(references) = names.get(query) {
+            for &name_reference in references.iter() {
+                hits.entry(name_reference / 2).or_default().exact = true;
+            }
+        }
+
+        for (name, references) in names.range(query.to_string()..) {
+            if !name.starts_with(query) {
+                break;
+            }
+            for &name_reference in references.iter() {
+                hits.entry(name_reference / 2).or_default().prefix = true;
+            }
+        }
+
+        let query_grams = legacy_query_grams(query);
+        let mut overlaps = HashMap::<usize, u16>::new();
+        for gram in &query_grams {
+            if let Some(references) = grams.get(gram) {
+                for &name_reference in references.iter() {
+                    let overlap = overlaps.entry(name_reference).or_default();
+                    *overlap = overlap.saturating_add(1);
+                }
+            }
+        }
+        for (name_reference, overlap) in overlaps {
+            let entry_index = name_reference / 2;
+            let alternate = name_reference % 2;
+            let entry = &self.entries[entry_index];
+            let gram_count = if t9 {
+                entry.t9_gram_counts[alternate]
+            } else {
+                entry.normal_gram_counts[alternate]
+            };
+            let denominator = query_grams.len().saturating_add(usize::from(gram_count));
+            if denominator == 0 {
+                continue;
+            }
+            let similarity = 2.0 * f64::from(overlap) / denominator as f64;
+            let hit = hits.entry(entry_index).or_default();
+            if similarity > hit.gram_similarity
+                || (similarity == hit.gram_similarity && overlap > hit.gram_overlap)
+            {
+                hit.gram_similarity = similarity;
+                hit.gram_overlap = overlap;
+            }
+        }
+
+        let mut candidates: Vec<_> = hits.into_iter().collect();
+        candidates.sort_by(|left, right| {
+            right
+                .1
+                .exact
+                .cmp(&left.1.exact)
+                .then_with(|| right.1.prefix.cmp(&left.1.prefix))
+                .then_with(|| right.1.gram_similarity.total_cmp(&left.1.gram_similarity))
+                .then_with(|| right.1.gram_overlap.cmp(&left.1.gram_overlap))
+                .then_with(|| {
+                    self.entries[left.0]
+                        .source
+                        .cmp(&self.entries[right.0].source)
+                })
+                .then_with(|| self.entries[left.0].code.cmp(&self.entries[right.0].code))
+        });
+        candidates
+            .into_iter()
+            .filter(|(entry_index, _)| {
+                legacy_name_entry_matches(&self.entries[*entry_index], filters, options)
+            })
+            .take(self.candidate_pool_limit(limit))
+            .map(|(entry_index, _)| entry_index)
+            .collect()
+    }
+
+    fn candidate_pool_limit(&self, limit: usize) -> usize {
+        limit
+            .clamp(1, MAX_SEARCH_CANDIDATES)
+            .saturating_mul(8)
+            .clamp(64, 2_000)
+            .min(self.entries.len())
+    }
+}
+
+fn legacy_name_entry_matches(
+    entry: &LegacyNameEntry,
+    filters: &QueryFilters,
+    options: &QueryOptions,
+) -> bool {
+    if !filters.kinds.is_empty()
+        && !filters
+            .kinds
+            .iter()
+            .any(|kind| kind.eq_ignore_ascii_case(&entry.kind))
+    {
+        return false;
+    }
+    if !filters.capabilities.is_empty()
+        && !filters.capabilities.iter().all(|wanted| {
+            entry
+                .capabilities
+                .iter()
+                .any(|actual| actual.eq_ignore_ascii_case(wanted))
+        })
+    {
+        return false;
+    }
+    if filters.country.as_deref().is_some_and(|country| {
+        !entry
+            .country
+            .as_deref()
+            .is_some_and(|actual| actual.eq_ignore_ascii_case(country))
+    }) {
+        return false;
+    }
+    if filters.region.as_deref().is_some_and(|region| {
+        !entry
+            .region
+            .as_deref()
+            .is_some_and(|actual| actual.eq_ignore_ascii_case(region))
+    }) {
+        return false;
+    }
+    match options.station_mode_requirement {
+        StationModeRequirement::Any => true,
+        StationModeRequirement::Auto => entry.station_mode == Some(StationMode::Auto),
+        StationModeRequirement::Manual => entry.station_mode == Some(StationMode::Manual),
+    }
+}
+
+fn index_legacy_name_variants(
+    entry_index: usize,
+    values: [&str; 2],
+    names: &mut BTreeMap<String, Vec<usize>>,
+    grams: &mut HashMap<u64, Vec<usize>>,
+) -> [u16; 2] {
+    let mut gram_counts = [0; 2];
+    for (alternate, value) in values.into_iter().enumerate() {
+        if value.is_empty() {
             continue;
         }
-        if let Some(entity) = load_legacy_entity(connection, &source, &code)? {
+        let name_reference = entry_index.saturating_mul(2).saturating_add(alternate);
+        names
+            .entry(value.to_string())
+            .or_default()
+            .push(name_reference);
+        for gram in legacy_index_grams(value) {
+            grams.entry(gram).or_default().push(name_reference);
+        }
+        gram_counts[alternate] = u16::try_from(legacy_query_grams(value).len()).unwrap_or(u16::MAX);
+    }
+    gram_counts
+}
+
+fn freeze_legacy_name_map(values: BTreeMap<String, Vec<usize>>) -> BTreeMap<String, Box<[usize]>> {
+    values
+        .into_iter()
+        .map(|(key, postings)| (key, postings.into_boxed_slice()))
+        .collect()
+}
+
+fn freeze_legacy_gram_map(values: HashMap<u64, Vec<usize>>) -> HashMap<u64, Box<[usize]>> {
+    values
+        .into_iter()
+        .map(|(key, postings)| (key, postings.into_boxed_slice()))
+        .collect()
+}
+
+fn legacy_index_grams(value: &str) -> Vec<u64> {
+    legacy_name_grams(value, true)
+}
+
+fn legacy_query_grams(value: &str) -> Vec<u64> {
+    legacy_name_grams(value, value.chars().count() <= 4)
+}
+
+fn legacy_name_grams(value: &str, include_unigrams: bool) -> Vec<u64> {
+    let characters: Vec<_> = value.chars().collect();
+    let mut grams = Vec::with_capacity(characters.len().saturating_mul(3));
+    let first_width = if include_unigrams { 1 } else { 2 };
+    for width in first_width..=3.min(characters.len()) {
+        grams.extend(
+            characters
+                .windows(width)
+                .map(|window| legacy_gram_hash(width, window)),
+        );
+    }
+    grams.sort_unstable();
+    grams.dedup();
+    grams
+}
+
+fn legacy_gram_hash(width: usize, characters: &[char]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET ^ width as u64;
+    for character in characters {
+        hash ^= u64::from(u32::from(*character));
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+fn legacy_name_candidates(
+    connection: &Connection,
+    index: &LegacyNameIndex,
+    normalized: &str,
+    limit: usize,
+    t9: bool,
+    filters: &QueryFilters,
+    options: &QueryOptions,
+) -> Result<Vec<Candidate>, CatalogError> {
+    let ranked = index.ranked_filtered(normalized, limit, t9, filters, options);
+    let mut out = Vec::with_capacity(ranked.len());
+    for entry in ranked {
+        if let Some(entity) = load_legacy_entity(connection, &entry.source, &entry.code)? {
             out.push(name_candidate(entity));
         }
     }
-    out.sort_by(|left, right| {
-        best_name_similarity(&right.entity, normalized)
-            .partial_cmp(&best_name_similarity(&left.entity, normalized))
-            .unwrap_or(Ordering::Equal)
-    });
-    out.truncate(limit);
     Ok(out)
+}
+
+fn rank_legacy_name_hits(ranked: &mut Vec<(&LegacyNameEntry, f64)>, limit: usize) {
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.source.cmp(&right.0.source))
+            .then_with(|| left.0.code.cmp(&right.0.code))
+    });
+    ranked.truncate(limit);
+}
+
+fn legacy_normalized_name_retrieval_score(name: &str, name_fr: &str, query: &str) -> f64 {
+    [name, name_fr]
+        .into_iter()
+        .map(|candidate| {
+            if candidate == query {
+                1.0
+            } else if candidate.starts_with(query) {
+                jaro_winkler(candidate, query).max(0.94)
+            } else {
+                jaro_winkler(candidate, query)
+            }
+        })
+        .fold(0.0, f64::max)
 }
 
 fn legacy_spatial_candidates(
@@ -2897,6 +3973,7 @@ fn fts_phrase(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::time::{Duration, Instant};
 
     use tempfile::tempdir;
 
@@ -3054,10 +4131,182 @@ mod tests {
         let entity = load_legacy_entity(&connection, "clc", "065100")
             .expect("legacy query")
             .expect("legacy entity");
+        assert_eq!(entity.attributes["sgc_codes"], json!(["4711066"]));
+        assert!(!entity.attributes.contains_key("area_geometry"));
+        let worker = WorkerCatalog {
+            generation: "fixture".to_string(),
+            packs: vec![OpenPack {
+                id: "legacy".to_string(),
+                priority: 10,
+                format: PackFormat::Legacy,
+                connection,
+                legacy_name_index: None,
+            }],
+            geometry_packs: Vec::new(),
+            feed_bound_entities: HashSet::new(),
+        };
+        let options = QueryOptions {
+            include_area_geometry: true,
+            ..QueryOptions::default()
+        };
+        let candidates = worker
+            .finalize(
+                vec![Candidate {
+                    entity,
+                    match_info: exact_match("fixture", &worker.packs[0]),
+                    facet: None,
+                    distance_m: None,
+                    relationship_path: Vec::new(),
+                    grouping: None,
+                }],
+                &QueryFilters::default(),
+                &options,
+            )
+            .expect("geometry enrichment");
+        let entity = &candidates[0].entity;
         assert_eq!(entity.attributes["provider_version"], json!("6.15.0"));
         assert_eq!(entity.attributes["same_code"], json!("065100"));
-        assert_eq!(entity.attributes["sgc_codes"], json!(["4711066"]));
         assert_eq!(entity.attributes["area_geometry"]["type"], json!("Polygon"));
+    }
+
+    #[test]
+    fn external_geometry_pack_enriches_and_contains_legacy_entity_on_request() {
+        let directory = tempdir().expect("temp dir");
+        let core_path = directory.path().join("core.sqlite");
+        let geometry_path = directory.path().join("geometry.sqlite");
+        let overlay_path = directory.path().join("state/overlay.sqlite");
+        write_legacy_core(&core_path);
+        let core_checksum = file_sha256(&core_path).expect("core checksum");
+        write_geometry_pack(
+            &geometry_path,
+            "boundaries",
+            "core",
+            &core_checksum,
+            "6.15.0",
+        );
+        let config = split_test_config(core_path, geometry_path, overlay_path, "boundaries");
+        initialize_overlay(&config.overlay_path).expect("overlay");
+        let snapshot =
+            pin_snapshot(validate_snapshot(&config).expect("snapshot")).expect("pinned snapshot");
+        assert!(snapshot.packs[0].path.exists());
+        assert!(snapshot.geometry_packs[0].path.exists());
+        assert_eq!(
+            snapshot.packs[0].path.parent(),
+            snapshot.geometry_packs[0].path.parent()
+        );
+        let mut worker = WorkerCatalog::new();
+        worker.prepare(&snapshot).expect("worker catalog");
+
+        let hidden = worker
+            .resolve_identifier(
+                "clc",
+                Some("eccc"),
+                "065100",
+                &QueryFilters::default(),
+                &QueryOptions::default(),
+            )
+            .expect("core-only result");
+        assert!(!hidden[0].entity.attributes.contains_key("area_geometry"));
+
+        let options = QueryOptions {
+            limit: 10,
+            include_area_geometry: true,
+            ..QueryOptions::default()
+        };
+        let enriched = worker
+            .resolve_identifier(
+                "clc",
+                Some("eccc"),
+                "065100",
+                &QueryFilters::default(),
+                &options,
+            )
+            .expect("enriched result");
+        assert_eq!(
+            enriched[0].entity.attributes["area_geometry"]["type"],
+            json!("Polygon")
+        );
+        assert_eq!(
+            enriched[0].entity.attributes["provider_version"],
+            json!("6.15.0")
+        );
+
+        let facets = worker
+            .point_facets(52.25, -106.75, &QueryFilters::default(), &options)
+            .expect("external containment");
+        assert!(facets.iter().any(|candidate| {
+            candidate.entity.id == stable_id("legacy:clc:065100")
+                && candidate.match_info.method == "spatial_contains"
+        }));
+    }
+
+    #[test]
+    fn geometry_checksum_changes_generation_and_pins_complete_set() {
+        let directory = tempdir().expect("temp dir");
+        let core_path = directory.path().join("core.sqlite");
+        let first_geometry = directory.path().join("geometry-one.sqlite");
+        let second_geometry = directory.path().join("geometry-two.sqlite");
+        write_legacy_core(&core_path);
+        let core_checksum = file_sha256(&core_path).expect("core checksum");
+        write_geometry_pack(&first_geometry, "boundaries", "core", &core_checksum, "one");
+        write_geometry_pack(
+            &second_geometry,
+            "boundaries",
+            "core",
+            &core_checksum,
+            "two",
+        );
+        let mut config = split_test_config(
+            core_path,
+            first_geometry,
+            directory.path().join("state/overlay.sqlite"),
+            "boundaries",
+        );
+        initialize_overlay(&config.overlay_path).expect("overlay");
+        let first =
+            pin_snapshot(validate_snapshot(&config).expect("first snapshot")).expect("first pin");
+        config.geometry_packs[0].path = second_geometry;
+        let second =
+            pin_snapshot(validate_snapshot(&config).expect("second snapshot")).expect("second pin");
+        assert_ne!(first.generation, second.generation);
+        assert_eq!(first.pack_ids, vec!["core", "boundaries"]);
+        assert_eq!(second.pack_ids, vec!["core", "boundaries"]);
+        assert!(first.packs[0].path.starts_with(
+            directory
+                .path()
+                .join("state/location-catalog-generations")
+                .join(&first.generation)
+        ));
+        assert!(first.geometry_packs[0].path.starts_with(
+            directory
+                .path()
+                .join("state/location-catalog-generations")
+                .join(&first.generation)
+        ));
+    }
+
+    #[test]
+    fn geometry_pack_rejects_a_different_core_generation() {
+        let directory = tempdir().expect("temp dir");
+        let core_path = directory.path().join("core.sqlite");
+        let geometry_path = directory.path().join("geometry.sqlite");
+        write_legacy_core(&core_path);
+        write_geometry_pack(
+            &geometry_path,
+            "boundaries",
+            "core",
+            &"0".repeat(64),
+            "stale",
+        );
+        let config = split_test_config(
+            core_path,
+            geometry_path,
+            directory.path().join("state/overlay.sqlite"),
+            "boundaries",
+        );
+
+        let error = validate_snapshot(&config).expect_err("mismatched core generation");
+        assert!(error.to_string().contains("was built for core SHA-256"));
     }
 
     #[test]
@@ -3196,5 +4445,300 @@ mod tests {
             relationship_path: Vec::new(),
             grouping: None,
         }
+    }
+
+    fn split_test_config(
+        core_path: PathBuf,
+        geometry_path: PathBuf,
+        overlay_path: PathBuf,
+        geometry_id: &str,
+    ) -> ServiceConfig {
+        ServiceConfig {
+            rollout_mode: "test".to_string(),
+            workers: 1,
+            queue_size: 1,
+            default_limit: 10,
+            maximum_limit: 100,
+            packs: vec![PackConfig {
+                id: "core".to_string(),
+                path: core_path,
+                priority: 10,
+                format: PackFormat::Legacy,
+                required: true,
+            }],
+            geometry_packs: vec![GeometryPackConfig {
+                id: geometry_id.to_string(),
+                path: geometry_path,
+                core_id: "core".to_string(),
+                priority: 10,
+                format: PackFormat::Legacy,
+                required: true,
+            }],
+            overlay_path,
+            allowed_overlay_sources: Vec::new(),
+            feed_bindings_path: None,
+            force_groups: Vec::new(),
+            never_groups: Vec::new(),
+        }
+    }
+
+    fn write_legacy_core(path: &Path) {
+        let connection = Connection::open(path).expect("legacy core");
+        connection
+            .execute_batch(
+                "CREATE TABLE places(
+                    source TEXT, code TEXT, name TEXT, name_fr TEXT, region TEXT, country TEXT,
+                    kind TEXT, lat REAL, lon REAL, attrs_json TEXT
+                 );
+                 INSERT INTO places VALUES(
+                    'clc', '065100', 'City of Saskatoon', 'Ville de Saskatoon', 'SK', 'CA',
+                    'land', 52.13, -106.67, '{}'
+                 );",
+            )
+            .expect("legacy schema");
+    }
+
+    #[test]
+    fn legacy_name_search_is_bounded_at_catalog_scale() {
+        let mut connection = Connection::open_in_memory().expect("legacy catalog");
+        connection
+            .execute_batch(
+                "CREATE TABLE places(
+                    source TEXT, code TEXT, name TEXT, name_fr TEXT, region TEXT, country TEXT,
+                    kind TEXT, lat REAL, lon REAL, attrs_json TEXT
+                 );",
+            )
+            .expect("legacy schema");
+        let transaction = connection.transaction().expect("transaction");
+        {
+            let mut insert = transaction
+                .prepare(
+                    "INSERT INTO places VALUES(?1, ?2, ?3, '', 'SK', 'CA', 'land', 50, -105, '{}')",
+                )
+                .expect("insert");
+            for index in 0..20_124 {
+                insert
+                    .execute(params![
+                        "station",
+                        format!("{index:06}"),
+                        format!("Fixture Place {index}")
+                    ])
+                    .expect("decoy");
+            }
+            insert
+                .execute(params!["station", "CYXE", "Saskatoon Airport"])
+                .expect("airport");
+            insert
+                .execute(params!["station", "CPOX", "SASKATOON RCS"])
+                .expect("rcs");
+        }
+        transaction.commit().expect("commit");
+
+        let index = LegacyNameIndex::load(&connection).expect("legacy name index");
+        let started = Instant::now();
+        let candidates = legacy_name_candidates(
+            &connection,
+            &index,
+            "saskatoon",
+            10,
+            false,
+            &QueryFilters::default(),
+            &QueryOptions::default(),
+        )
+        .expect("legacy search");
+        let elapsed = started.elapsed();
+        eprintln!("20,126-place legacy search completed in {elapsed:?}");
+        let names: Vec<_> = candidates
+            .iter()
+            .map(|candidate| candidate.entity.display_name())
+            .collect();
+        assert!(names.contains(&"Saskatoon Airport"));
+        assert!(names.contains(&"SASKATOON RCS"));
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(index.ranked("saskatoon", 10, false).len(), 2);
+        assert_eq!(
+            index.ranked("fixture", usize::MAX, false).len(),
+            MAX_SEARCH_CANDIDATES
+        );
+        let broad_pool = index.candidate_indices("fixture", 10, false);
+        assert_eq!(broad_pool.len(), index.candidate_pool_limit(10));
+        assert!(broad_pool.len() < index.entries.len());
+        let typo_codes: Vec<_> = index
+            .ranked("saskaton", 2, false)
+            .into_iter()
+            .map(|entry| entry.code.as_str())
+            .collect();
+        assert!(typo_codes.contains(&"CYXE"));
+        assert!(typo_codes.contains(&"CPOX"));
+        let t9_codes: Vec<_> = index
+            .ranked("727528666", 2, true)
+            .into_iter()
+            .map(|entry| entry.code.as_str())
+            .collect();
+        assert!(t9_codes.contains(&"CYXE"));
+        assert!(t9_codes.contains(&"CPOX"));
+        let fuzzy_t9_codes: Vec<_> = index
+            .ranked("727528660", 2, true)
+            .into_iter()
+            .map(|entry| entry.code.as_str())
+            .collect();
+        assert!(fuzzy_t9_codes.contains(&"CYXE"));
+        assert!(fuzzy_t9_codes.contains(&"CPOX"));
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "legacy name search took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_name_index_applies_filters_before_candidate_truncation() {
+        let mut connection = Connection::open_in_memory().expect("legacy catalog");
+        connection
+            .execute_batch(
+                "CREATE TABLE places(
+                    source TEXT, code TEXT, name TEXT, name_fr TEXT, region TEXT, country TEXT,
+                    kind TEXT, lat REAL, lon REAL, attrs_json TEXT
+                 );",
+            )
+            .expect("legacy schema");
+        let transaction = connection.transaction().expect("transaction");
+        {
+            let mut insert = transaction
+                .prepare(
+                    "INSERT INTO places VALUES('clc', ?1, 'Washington', '', ?2, 'US',
+                                                'land', 38, -77, '{}')",
+                )
+                .expect("insert");
+            for index in 0..30 {
+                let region = if index == 25 { "MD" } else { "WA" };
+                insert
+                    .execute(params![format!("{index:06}"), region])
+                    .expect("homonym");
+            }
+        }
+        transaction.commit().expect("commit");
+
+        let index = LegacyNameIndex::load(&connection).expect("legacy name index");
+        let filters = QueryFilters {
+            region: Some("MD".to_string()),
+            ..QueryFilters::default()
+        };
+        let candidates = legacy_name_candidates(
+            &connection,
+            &index,
+            "washington",
+            1,
+            false,
+            &filters,
+            &QueryOptions::default(),
+        )
+        .expect("filtered legacy search");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].entity.region.as_deref(), Some("MD"));
+    }
+
+    #[test]
+    fn legacy_name_index_preserves_unicode_and_localized_lookup() {
+        let connection = Connection::open_in_memory().expect("legacy catalog");
+        connection
+            .execute_batch(
+                "CREATE TABLE places(
+                    source TEXT, code TEXT, name TEXT, name_fr TEXT, region TEXT, country TEXT,
+                    kind TEXT, lat REAL, lon REAL, attrs_json TEXT
+                 );
+                 INSERT INTO places VALUES(
+                    'station', 'CYUL', 'Montreal Airport', 'Aeroport de Montreal', 'QC', 'CA',
+                    'land', 45.47, -73.74, '{}'
+                 );",
+            )
+            .expect("legacy schema");
+        let index = LegacyNameIndex::load(&connection).expect("legacy name index");
+
+        let english = index.ranked(&normalize_name("Montréal Airport"), 1, false);
+        let french = index.ranked(&normalize_name("Aéroport de Montréal"), 1, false);
+        let localized_prefix = index.ranked(&normalize_name("Aéroport de Mont"), 1, false);
+        let misspelled = index.ranked(&normalize_name("Montrel Airport"), 1, false);
+
+        assert_eq!(english[0].code, "CYUL");
+        assert_eq!(french[0].code, "CYUL");
+        assert_eq!(localized_prefix[0].code, "CYUL");
+        assert_eq!(misspelled[0].code, "CYUL");
+    }
+
+    #[test]
+    fn legacy_name_retrieval_supports_t9() {
+        let exact = legacy_normalized_name_retrieval_score("727528666", "", "727528666");
+        let unrelated = legacy_normalized_name_retrieval_score("734462", "", "727528666");
+        assert_eq!(exact, 1.0);
+        assert!(exact > unrelated);
+    }
+
+    fn write_geometry_pack(
+        path: &Path,
+        pack_id: &str,
+        core_id: &str,
+        core_checksum: &str,
+        version: &str,
+    ) {
+        let connection = Connection::open(path).expect("geometry pack");
+        connection.execute_batch(GEOMETRY_SCHEMA).expect("schema");
+        connection
+            .execute(
+                "INSERT INTO sources(source_id, title, source_version) VALUES('fixture', 'Fixture', ?1)",
+                [version],
+            )
+            .expect("source");
+        for (key, value) in [
+            ("pack_kind", "geometry"),
+            ("pack_id", pack_id),
+            ("core_pack_id", core_id),
+            ("core_sha256", core_checksum),
+            ("schema_version", "1"),
+            ("count.geometries", "1"),
+            ("count.source.fixture", "1"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO catalog_metadata(key, value) VALUES(?1, ?2)",
+                    params![key, value],
+                )
+                .expect("metadata");
+        }
+        let wkb = test_polygon_wkb();
+        connection
+            .execute(
+                "INSERT INTO area_geometries(
+                    geometry_pk, canonical_id, source, code, same_code, geometry_type,
+                    geometry_wkb, latitude, longitude, min_lon, max_lon, min_lat, max_lat,
+                    source_id, provider_version, source_url, updated_at
+                 ) VALUES(1, ?1, 'clc', '065100', '065100', 'polygon', ?2, 52.13, -106.67,
+                          -107, -106, 52, 53, 'fixture', ?3, 'https://example.invalid',
+                          '2026-08-02T00:00:00Z')",
+                params![stable_id("legacy:clc:065100"), wkb, version],
+            )
+            .expect("geometry");
+        connection
+            .execute(
+                "INSERT INTO area_geometry_rtree VALUES(1, -107, -106, 52, 53)",
+                [],
+            )
+            .expect("rtree");
+    }
+
+    fn test_polygon_wkb() -> Vec<u8> {
+        let mut bytes = vec![1];
+        bytes.extend_from_slice(&3_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&4_u32.to_le_bytes());
+        for (longitude, latitude) in [
+            (-107.0_f64, 52.0_f64),
+            (-106.0, 52.0),
+            (-106.0, 53.0),
+            (-107.0, 52.0),
+        ] {
+            bytes.extend_from_slice(&longitude.to_le_bytes());
+            bytes.extend_from_slice(&latitude.to_le_bytes());
+        }
+        bytes
     }
 }

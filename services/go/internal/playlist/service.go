@@ -1222,6 +1222,7 @@ func (p *feedPlanner) synthesizeSegmentPCM(ctx context.Context, queueID string, 
 	defer cancel()
 	wavPath, err := p.bridge.Synthesize(synthCtx, synthJob{
 		ID:               fmt.Sprintf("%s-seg-%02d", queueID, index),
+		VoiceRouteKey:    queueID,
 		Text:             text,
 		ReaderID:         product.ReaderID,
 		Language:         fallbackText(product.Language, feedLanguage(p.feed)),

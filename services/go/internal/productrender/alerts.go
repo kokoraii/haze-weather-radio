@@ -797,6 +797,10 @@ func capAlertPacket(alert capmodel.Alert, feed feedXML, headline string, eventNa
 	packet, _ := alertmodel.FromMap(data)
 	packet.Presentation.SpeechText = strings.TrimSpace(alertText)
 	packet.Areas.Locations = append([]alertmodel.LocationReference(nil), canonicalLocations...)
+	if info := chooseAlertInfo(alert, feedLanguage(feed)); info != nil {
+		packet.Areas.ThreatAreas = capPacketThreatAreas(*info)
+		packet.Storm = capPacketStormInfo(*info)
+	}
 	for _, location := range canonicalLocations {
 		if location.Actionable && strings.TrimSpace(location.CanonicalID) != "" && location.Name != "" {
 			packet.Areas.Names = append(packet.Areas.Names, location.Name)
@@ -1063,36 +1067,51 @@ func capLocationKeysOverlap(db alertGeoDB, left string, right string) bool {
 }
 
 func capLocationKeyForArea(area capmodel.AlertArea) string {
-	clc := ""
-	ugc := ""
-	location := ""
-	same := ""
-	fallback := ""
+	keys := capLocationKeysForArea(area)
+	if len(keys) > 0 {
+		return keys[0]
+	}
+	return ""
+}
+
+func capLocationKeysForArea(area capmodel.AlertArea) []string {
+	if capmodel.IsECCCThreatArea(area) {
+		return nil
+	}
+	clc := []string{}
+	ugc := []string{}
+	location := []string{}
+	same := []string{}
+	fallback := []string{}
 	for _, geocode := range area.Geocodes {
+		if capmodel.IsECCCThreatAreaGeocode(geocode) {
+			continue
+		}
 		value := canonicalCAPLocation(geocode.Value)
 		if value == "" {
 			continue
 		}
 		name := strings.ToLower(strings.TrimSpace(geocode.Name))
 		switch {
-		case strings.Contains(name, "clc") && clc == "":
-			clc = value
-		case strings.Contains(name, "ugc") && ugc == "":
-			ugc = value
-		case strings.Contains(name, "location") && location == "":
-			location = value
-		case strings.Contains(name, "same") && same == "":
-			same = value
-		case fallback == "":
-			fallback = value
+		case strings.Contains(name, "clc"):
+			clc = appendCAPLocationKey(clc, value)
+		case strings.Contains(name, "ugc"):
+			ugc = appendCAPLocationKey(ugc, value)
+		case strings.Contains(name, "location"):
+			location = appendCAPLocationKey(location, value)
+		case strings.Contains(name, "same"):
+			same = appendCAPLocationKey(same, value)
+		default:
+			fallback = appendCAPLocationKey(fallback, value)
 		}
 	}
-	for _, value := range []string{clc, ugc, location, same, fallback} {
-		if value != "" {
-			return value
+	out := []string{}
+	for _, values := range [][]string{clc, ugc, location, same, fallback} {
+		for _, value := range values {
+			out = appendCAPLocationKey(out, value)
 		}
 	}
-	return ""
+	return out
 }
 
 func capLocationParameterCodes(info capmodel.AlertInfo) []string {
@@ -1107,6 +1126,9 @@ func capLocationParameterCodes(info capmodel.AlertInfo) []string {
 		}
 	}
 	for _, param := range info.Parameters {
+		if capmodel.IsECCCStormParameter(param.Name) {
+			continue
+		}
 		name := strings.ToLower(strings.TrimSpace(param.Name))
 		if strings.Contains(name, "status") || strings.Contains(name, "coverage") {
 			continue
@@ -1126,7 +1148,7 @@ func capLocationParameterCodes(info capmodel.AlertInfo) []string {
 func capAlertInfoLocationKeys(info capmodel.AlertInfo) []string {
 	keys := []string{}
 	for _, area := range info.Areas {
-		if key := capLocationKeyForArea(area); key != "" {
+		for _, key := range capLocationKeysForArea(area) {
 			keys = appendCAPLocationKey(keys, key)
 		}
 	}
@@ -1140,7 +1162,7 @@ func capAlertInfoLocationKeysForDB(info capmodel.AlertInfo, db alertGeoDB) []str
 	keys := []string{}
 	areaKeys := []string{}
 	for _, area := range info.Areas {
-		if key := capLocationKeyForArea(area); key != "" {
+		for _, key := range capLocationKeysForArea(area) {
 			areaKeys = appendCAPLocationKey(areaKeys, key)
 			keys = appendCAPLocationKey(keys, key)
 		}
@@ -3139,6 +3161,9 @@ func alertCodeName(db alertGeoDB, code string, lang string) string {
 }
 
 func alertAreaNameFromGeocodes(db alertGeoDB, area capmodel.AlertArea, lang string) string {
+	if capmodel.IsECCCThreatArea(area) {
+		return ""
+	}
 	if desc := cleanAreaName(area.Description); desc != "" {
 		return desc
 	}
@@ -3344,6 +3369,9 @@ func alertAreas(info capmodel.AlertInfo, feed feedXML, lang string, baseDir stri
 	_, wildcardAssignment := capLocationSet(assignments)["*"]
 	assignmentRestricted := len(assignments) > 0 && !wildcardAssignment
 	for _, area := range info.Areas {
+		if capmodel.IsECCCThreatArea(area) {
+			continue
+		}
 		areaLocation := capLocationKeyForArea(area)
 		if assignmentRestricted {
 			if areaLocation == "" {
@@ -3394,6 +3422,9 @@ func fastAlertAreas(info capmodel.AlertInfo, assignments []string) string {
 	seenAll := map[string]struct{}{}
 	seenMatched := map[string]struct{}{}
 	for _, area := range info.Areas {
+		if capmodel.IsECCCThreatArea(area) {
+			continue
+		}
 		desc := cleanAreaName(area.Description)
 		if desc == "" {
 			continue
@@ -3563,6 +3594,9 @@ func alertInfoCoverageCodes(info capmodel.AlertInfo) map[string]struct{} {
 		codes[code] = struct{}{}
 	}
 	for _, area := range info.Areas {
+		if capmodel.IsECCCThreatArea(area) {
+			continue
+		}
 		for _, geocode := range area.Geocodes {
 			if code := canonicalCAPLocation(geocode.Value); code != "" {
 				codes[code] = struct{}{}

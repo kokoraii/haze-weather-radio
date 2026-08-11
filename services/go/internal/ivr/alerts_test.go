@@ -303,6 +303,27 @@ func storeIVRTestCAP(t *testing.T, store datastore.Store, id string, feedID stri
 	}
 }
 
+func TestECCCAugust2026ThreatAreasDoNotAlterIVRLocations(t *testing.T) {
+	info := capmodel.AlertInfo{
+		Areas: []capmodel.AlertArea{
+			{Description: "City of Saskatoon", Geocodes: []capmodel.NameValue{{Name: "layer:EC-MSC-SMC:1.0:CLC", Value: "065100"}}},
+			{Description: "new active threat area", ThreatStatus: "issued", Geocodes: []capmodel.NameValue{{Name: "profile:CAP-CP:Location:0.3", Value: "4711066"}}},
+		},
+		Parameters: []capmodel.NameValue{{Name: "layer:EC-MSC-SMC:1.1:Reference_Location_Points", Value: "Saskatoon, Warman"}},
+	}
+	codes := ivrAlertCoverageCodes(info)
+	if len(codes) != 1 {
+		t.Fatalf("IVR coverage codes = %#v", codes)
+	}
+	if _, ok := codes["065100"]; !ok {
+		t.Fatalf("IVR coverage codes = %#v, missing zone code", codes)
+	}
+	names := ivrAlertAreaNames(info)
+	if len(names) != 1 || names[0] != "City of Saskatoon" {
+		t.Fatalf("IVR area names = %#v", names)
+	}
+}
+
 func ivrTestCAPXML(id string, event string, headline string, severity string, urgency string, certainty string, impact string) string {
 	return `<?xml version="1.0" encoding="UTF-8"?>
 <alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">

@@ -157,6 +157,7 @@ func validateCAP(alert Alert) []string {
 				}
 			}
 		}
+		warnings = append(warnings, validateECCC2026Info(info, prefix)...)
 	}
 	return warnings
 }
@@ -230,6 +231,7 @@ func normalizeInfo(info infoXML) AlertInfo {
 			DerefURI:    clean(resource.DerefURI),
 		})
 	}
+	normalizeECCC2026Info(&result)
 	return result
 }
 

@@ -108,13 +108,17 @@ func (r renderer) RenderWxOnDemand(request wxOnDemandRequest) (Product, error) {
 		Inputs:      inputs,
 		GeneratedAt: now,
 		Metadata: map[string]string{
-			"canonical_id":  request.CanonicalID,
-			"location_code": request.Code,
-			"location_name": locationName,
-			"source":        request.Source,
-			"forecast_id":   request.ForecastID,
-			"station_id":    request.StationID,
-			"packages":      strings.Join(packages, ","),
+			"canonical_id":       request.CanonicalID,
+			"location_code":      request.Code,
+			"location_name":      locationName,
+			"source":             request.Source,
+			"forecast_id":        request.ForecastID,
+			"station_id":         request.StationID,
+			"air_quality_id":     request.AirQualityID,
+			"climate_id":         request.ClimateID,
+			"hydrometric_id":     request.HydrometricID,
+			"marine_forecast_id": request.MarineForecastID,
+			"packages":           strings.Join(packages, ","),
 		},
 	}, nil
 }
@@ -202,6 +206,7 @@ func (r renderer) onDemandFeed(request wxOnDemandRequest) (feedXML, error) {
 		}
 		feed = configured
 	}
+	feed.OnDemand = true
 
 	locationName := firstNonBlank(request.LocationName, request.Code, request.ForecastID, request.StationID)
 	nameOverride := onDemandNameOverride(locationName, request)
@@ -230,6 +235,21 @@ func (r renderer) onDemandFeed(request wxOnDemandRequest) (feedXML, error) {
 			Latitude:     latitude,
 			Longitude:    longitude,
 		}}
+	}
+	if id := strings.TrimSpace(request.AirQualityID); id != "" {
+		feed.Locations.AirQualityLocations.Locations = []locationXML{{ID: id, Source: "eccc"}}
+	}
+	if id := strings.TrimSpace(request.ClimateID); id != "" {
+		feed.Locations.ClimateLocations.Locations = []locationXML{{ID: id, Source: "eccc"}}
+	}
+	if id := strings.TrimSpace(request.HydrometricID); id != "" {
+		feed.Locations.HydrometricLocations.Locations = []locationXML{{ID: id, Source: "eccc"}}
+		feed.Locations.HydrometricLocations.Upstream.Locations = nil
+		feed.Locations.HydrometricLocations.Downstream.Locations = nil
+	}
+	if id := strings.TrimSpace(request.MarineForecastID); id != "" {
+		feed.Locations.MarineForecastLocations.Locations = []locationXML{{ID: id, Source: "eccc"}}
+		feed.Locations.MarineForecastLocations.Subregions = nil
 	}
 	if strings.TrimSpace(request.Timezone) != "" {
 		feed.Timezone = strings.TrimSpace(request.Timezone)

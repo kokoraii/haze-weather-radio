@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
+  <identifier>urn:oid:2.49.0.1.124.20260811.1</identifier>
+  <sender>cap-pac@canada.ca</sender>
+  <sent>2026-08-11T15:30:00Z</sent>
+  <status>Actual</status>
+  <msgType>Update</msgType>
+  <scope>Public</scope>
+  <code>profile:CAP-CP:0.4</code>
+  <info>
+    <language>en-CA</language>
+    <category>Met</category>
+    <event>severe thunderstorm warning</event>
+    <responseType>Shelter</responseType>
+    <urgency>Immediate</urgency>
+    <severity>Severe</severity>
+    <certainty>Observed</certainty>
+    <effective>2026-08-11T15:30:00Z</effective>
+    <onset>2026-08-11T15:30:00Z</onset>
+    <expires>2026-08-11T16:15:00Z</expires>
+    <senderName>Environment and Climate Change Canada</senderName>
+    <headline>Severe thunderstorm warning - updated</headline>
+    <description>A dangerous severe thunderstorm is moving through the warned area.</description>
+    <instruction>Take cover immediately.</instruction>
+    <parameter>
+      <valueName>layer:EC-MSC-SMC:1.1:Storm_Speed</valueName>
+      <value>40 km/h</value>
+    </parameter>
+    <parameter>
+      <valueName>layer:EC-MSC-SMC:1.1:Storm_Direction</valueName>
+      <value>90.12841</value>
+    </parameter>
+    <parameter>
+      <valueName>layer:EC-MSC-SMC:1.1:Storm_Geometry_Type</valueName>
+      <value>isolated_cell</value>
+    </parameter>
+    <parameter>
+      <valueName>layer:EC-MSC-SMC:1.1:Storm_Point</valueName>
+      <value>52.1433,-106.6732</value>
+    </parameter>
+    <parameter>
+      <valueName>layer:EC-MSC-SMC:1.1:Storm_Time</valueName>
+      <value>20260811153000000</value>
+    </parameter>
+    <parameter>
+      <valueName>layer:EC-MSC-SMC:1.1:Motion_Description</valueName>
+      <value>east at 40 km/h</value>
+    </parameter>
+    <parameter>
+      <valueName>layer:EC-MSC-SMC:1.1:Storm_Position_Description</valueName>
+      <value>about 10 km west of Saskatoon</value>
+    </parameter>
+    <parameter>
+      <valueName>layer:EC-MSC-SMC:1.1:Reference_Location_Points</valueName>
+      <value>Saskatoon, Warman</value>
+    </parameter>
+    <area>
+      <areaDesc>City of Saskatoon</areaDesc>
+      <polygon>52.05,-106.80 52.05,-106.50 52.25,-106.50 52.25,-106.80 52.05,-106.80</polygon>
+      <geocode>
+        <valueName>layer:EC-MSC-SMC:1.0:CLC</valueName>
+        <value>065100</value>
+      </geocode>
+      <geocode>
+        <valueName>profile:CAP-CP:Location:0.3</valueName>
+        <value>4711066</value>
+      </geocode>
+    </area>
+    <area>
+      <areaDesc>new active threat area</areaDesc>
+      <polygon>52.10,-106.75 52.11,-106.62 52.20,-106.60 52.18,-106.74 52.10,-106.75</polygon>
+      <geocode>
+        <valueName>layer:EC-MSC-SMC:DLC:1.1</valueName>
+        <value>issued</value>
+      </geocode>
+      <geocode>
+        <valueName>profile:CAP-CP:Location:0.3</valueName>
+        <value>4711066</value>
+      </geocode>
+    </area>
+    <area>
+      <areaDesc>continued active threat area</areaDesc>
+      <polygon>52.13,-106.62 52.14,-106.50 52.22,-106.48 52.20,-106.60 52.13,-106.62</polygon>
+      <geocode>
+        <valueName>layer:EC-MSC-SMC:DLC:1.1</valueName>
+        <value>continued</value>
+      </geocode>
+      <geocode>
+        <valueName>profile:CAP-CP:Location:0.3</valueName>
+        <value>4711067</value>
+      </geocode>
+    </area>
+    <area>
+      <areaDesc>ended threat area</areaDesc>
+      <polygon>52.08,-106.90 52.09,-106.78 52.16,-106.76 52.15,-106.88 52.08,-106.90</polygon>
+      <geocode>
+        <valueName>layer:EC-MSC-SMC:DLC:1.1</valueName>
+        <value>ended</value>
+      </geocode>
+      <geocode>
+        <valueName>profile:CAP-CP:Location:0.3</valueName>
+        <value>4711070</value>
+      </geocode>
+    </area>
+    <area>
+      <areaDesc>cancelled threat area</areaDesc>
+      <polygon>52.00,-106.90 52.01,-106.78 52.07,-106.76 52.06,-106.88 52.00,-106.90</polygon>
+      <geocode>
+        <valueName>layer:EC-MSC-SMC:DLC:1.1</valueName>
+        <value>cancelled</value>
+      </geocode>
+      <geocode>
+        <valueName>profile:CAP-CP:Location:0.3</valueName>
+        <value>4711075</value>
+      </geocode>
+    </area>
+  </info>
+</alert>

@@ -94,3 +94,45 @@ func TestLocationReferencesKeepRawIdentifiersButRejectWeakAuthority(t *testing.T
 		t.Fatalf("raw identifier was not preserved: %#v", location.RawIdentifiers)
 	}
 }
+
+func TestThreatAreasAndStormInfoSurviveCompatibilityFields(t *testing.T) {
+	speed := 40.0
+	direction := 90.12841
+	packet := Packet{
+		ID: "eccc-threat-1",
+		Areas: Areas{ThreatAreas: []ThreatArea{{
+			Status:         "ISSUED",
+			Description:    "new active threat area",
+			Polygons:       []string{"52.1,-106.7 52.2,-106.6 52.1,-106.7"},
+			CAPCPLocations: []string{"4711066", "4711066"},
+		}}},
+		Storm: &StormInfo{
+			Speed:                   "40 km/h",
+			SpeedValue:              &speed,
+			SpeedUnit:               "KM/H",
+			DirectionDegrees:        &direction,
+			GeometryType:            "ISOLATED_CELL",
+			Points:                  []GeoPoint{{Latitude: 52.1433, Longitude: -106.6732}},
+			Time:                    "20260811153000000",
+			MotionDescription:       "east at 40 km/h",
+			ReferenceLocationPoints: "Saskatoon, Warman",
+		},
+	}
+	fields := WithLegacyFields(packet, nil)
+	resolved, ok := FromMap(fields)
+	if !ok {
+		t.Fatal("packet was not resolved")
+	}
+	if len(resolved.Areas.ThreatAreas) != 1 || resolved.Areas.ThreatAreas[0].Status != "issued" || len(resolved.Areas.ThreatAreas[0].CAPCPLocations) != 1 {
+		t.Fatalf("threat areas = %#v", resolved.Areas.ThreatAreas)
+	}
+	if resolved.Storm == nil || resolved.Storm.SpeedUnit != "km/h" || resolved.Storm.GeometryType != "isolated_cell" || resolved.Storm.DirectionDegrees == nil || *resolved.Storm.DirectionDegrees != direction {
+		t.Fatalf("storm = %#v", resolved.Storm)
+	}
+	if _, ok := fields["threat_areas"]; !ok {
+		t.Fatalf("legacy threat_areas missing: %#v", fields)
+	}
+	if _, ok := fields["storm"]; !ok {
+		t.Fatalf("legacy storm missing: %#v", fields)
+	}
+}

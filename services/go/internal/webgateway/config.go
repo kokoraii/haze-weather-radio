@@ -87,6 +87,7 @@ type Config struct {
 			SecureCookies               bool     `yaml:"secure_cookies"`
 			LoginRateLimit              int      `yaml:"login_rate_limit"`
 			LoginRateWindowSeconds      int      `yaml:"login_rate_window_seconds"`
+			AccountLockDurationSeconds  int      `yaml:"account_lock_duration_seconds"`
 			OriginationRatePerSecond    int      `yaml:"origination_rate_per_second"`
 			EnforceMFA                  bool     `yaml:"enforce_mfa"`
 			RedisRequired               bool     `yaml:"redis_required"`

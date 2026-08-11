@@ -39,14 +39,37 @@ type AlertInfo struct {
 	Areas       []AlertArea `json:"areas,omitempty"`
 	Parameters  []NameValue `json:"parameters,omitempty"`
 	Resources   []Resource  `json:"resources,omitempty"`
+	Storm       *StormInfo  `json:"storm,omitempty"`
 }
 
 // AlertArea captures CAP area metadata.
 type AlertArea struct {
-	Description string      `json:"description,omitempty"`
-	Polygons    []string    `json:"polygons,omitempty"`
-	Circles     []string    `json:"circles,omitempty"`
-	Geocodes    []NameValue `json:"geocodes,omitempty"`
+	Description  string      `json:"description,omitempty"`
+	Polygons     []string    `json:"polygons,omitempty"`
+	Circles      []string    `json:"circles,omitempty"`
+	Geocodes     []NameValue `json:"geocodes,omitempty"`
+	ThreatStatus string      `json:"threat_status,omitempty"`
+}
+
+// StormInfo contains ECCC's August 2026 storm-specific CAP parameters. Raw
+// values remain available in AlertInfo.Parameters.
+type StormInfo struct {
+	Speed                   string     `json:"speed,omitempty"`
+	SpeedValue              *float64   `json:"speed_value,omitempty"`
+	SpeedUnit               string     `json:"speed_unit,omitempty"`
+	DirectionDegrees        *float64   `json:"direction_degrees,omitempty"`
+	GeometryType            string     `json:"geometry_type,omitempty"`
+	Points                  []GeoPoint `json:"points,omitempty"`
+	Time                    string     `json:"time,omitempty"`
+	MotionDescription       string     `json:"motion_description,omitempty"`
+	PositionDescription     string     `json:"position_description,omitempty"`
+	ReferenceLocationPoints string     `json:"reference_location_points,omitempty"`
+}
+
+// GeoPoint is a CAP latitude/longitude coordinate.
+type GeoPoint struct {
+	Latitude  float64 `json:"latitude"`
+	Longitude float64 `json:"longitude"`
 }
 
 // NameValue is a generic CAP name/value pair.

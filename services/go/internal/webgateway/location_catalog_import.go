@@ -1,9 +1,13 @@
 package webgateway
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -19,7 +23,9 @@ import (
 const (
 	locationCatalogUploadMaxBytes = int64(96 << 20)
 	locationCatalogImportTimeout  = 2 * time.Minute
+	locationCatalogReloadTimeout  = 30 * time.Second
 	ecccCLCCatalogSourceURL       = "https://dd.weather.gc.ca/meteocode/geodata/"
+	legacyWeatherGeometryRelPath  = "managed/locations/legacy-weather-geometry.sqlite"
 )
 
 var locationCatalogImportMu sync.Mutex
@@ -81,12 +87,17 @@ func (s *Server) locationCatalogImport(writer http.ResponseWriter, request *http
 	}
 
 	baseDir := filepath.Dir(filepath.Clean(s.configPath))
-	activePath := locationdb.Path(baseDir)
-	if stat, err := os.Stat(activePath); err != nil || stat.IsDir() {
-		writeJSONStatus(writer, http.StatusServiceUnavailable, map[string]any{"detail": "active location catalog is unavailable"})
+	corePath := locationdb.Path(baseDir)
+	if stat, err := os.Stat(corePath); err != nil || stat.IsDir() {
+		writeJSONStatus(writer, http.StatusServiceUnavailable, map[string]any{"detail": "paired core location catalog is unavailable"})
 		return
 	}
-	candidate, err := os.CreateTemp(filepath.Dir(activePath), ".alert-location-candidate-*.sqlite")
+	activePath := filepath.Join(baseDir, filepath.FromSlash(legacyWeatherGeometryRelPath))
+	if err := os.MkdirAll(filepath.Dir(activePath), 0o750); err != nil {
+		writeJSONStatus(writer, http.StatusInternalServerError, map[string]any{"detail": "geometry catalog directory is unavailable"})
+		return
+	}
+	candidate, err := os.CreateTemp(filepath.Dir(activePath), ".legacy-weather-geometry-candidate-*.sqlite")
 	if err != nil {
 		writeJSONStatus(writer, http.StatusInternalServerError, map[string]any{"detail": "catalog candidate could not be created"})
 		return
@@ -98,8 +109,8 @@ func (s *Server) locationCatalogImport(writer http.ResponseWriter, request *http
 
 	ctx, cancel := context.WithTimeout(request.Context(), locationCatalogImportTimeout)
 	defer cancel()
-	if err := locationimport.CloneDatabase(ctx, activePath, candidatePath); err != nil {
-		writeJSONStatus(writer, http.StatusInternalServerError, map[string]any{"detail": "active location catalog could not be cloned"})
+	if err := locationimport.PrepareGeometryCandidate(ctx, activePath, candidatePath); err != nil {
+		writeJSONStatus(writer, http.StatusInternalServerError, map[string]any{"detail": "geometry catalog candidate could not be prepared"})
 		return
 	}
 	result, err := locationimport.ImportECCCArchive(ctx, candidatePath, uploadPath, filepath.Base(header.Filename), ecccCLCCatalogSourceURL, time.Now().UTC())
@@ -107,46 +118,146 @@ func (s *Server) locationCatalogImport(writer http.ResponseWriter, request *http
 		writeJSONStatus(writer, http.StatusBadRequest, map[string]any{"detail": err.Error()})
 		return
 	}
-	backupName, err := locationimport.ActivateDatabase(
-		ctx, activePath, candidatePath,
-		filepath.Join(filepath.Dir(activePath), "location-catalog-backups"),
+	if err := locationimport.BindGeometryToLegacyCore(ctx, candidatePath, corePath); err != nil {
+		writeJSONStatus(writer, http.StatusConflict, map[string]any{
+			"detail": "The geometry package contains locations absent from the paired core catalog. Refresh the core catalog before importing this geometry generation.",
+		})
+		return
+	}
+	backupDir := filepath.Join(filepath.Dir(activePath), "location-catalog-backups")
+	backupName, err := locationimport.ActivateGeometryDatabase(
+		ctx, activePath, candidatePath, corePath, backupDir,
 		"eccc-clc-"+result.ProviderVersion, time.Now().UTC(),
 	)
 	if err != nil {
 		writeJSONStatus(writer, http.StatusInternalServerError, map[string]any{"detail": "validated catalog could not be activated"})
 		return
 	}
-	reloadRequested, reloadWarning := requestLocationCatalogReload(result)
+	reload, err := requestLocationCatalogReload(ctx, result, "operator_catalog_import")
+	if err != nil {
+		rollbackCtx, rollbackCancel := context.WithTimeout(context.Background(), locationCatalogReloadTimeout)
+		defer rollbackCancel()
+		if rollbackErr := locationimport.RollbackDatabaseActivation(rollbackCtx, activePath, backupDir, backupName); rollbackErr != nil {
+			writeJSONStatus(writer, http.StatusInternalServerError, map[string]any{
+				"accepted": false,
+				"detail":   "haze-location rejected the imported catalog, and the previous managed geometry generation could not be restored",
+				"error":    errors.Join(err, rollbackErr).Error(),
+			})
+			return
+		}
+		_, restoreErr := requestLocationCatalogReload(rollbackCtx, result, "operator_catalog_import_rollback")
+		response := map[string]any{
+			"accepted":    false,
+			"rolled_back": true,
+			"detail":      "haze-location did not confirm the imported catalog, so the previous managed geometry generation was restored",
+			"error":       err.Error(),
+		}
+		if restoreErr != nil {
+			response["reload_warning"] = "The previous catalog is restored on disk, but haze-location did not confirm reloading it. Restart haze-location before continuing."
+		}
+		writeJSONStatus(writer, http.StatusServiceUnavailable, response)
+		return
+	}
 	response := map[string]any{
 		"accepted": true, "source": result.Source, "provider_version": result.ProviderVersion,
 		"record_count": result.RecordCount, "imported_at": result.ImportedAt,
-		"previous_generation": backupName, "reload_requested": reloadRequested,
-	}
-	if reloadWarning != "" {
-		response["warning"] = reloadWarning
-		writeJSONStatus(writer, http.StatusAccepted, response)
-		return
+		"pack_id": "legacy-weather-geometry", "previous_generation": backupName,
+		"reload_confirmed": true, "catalog_generation": reload.CatalogGeneration,
+		"catalog_packs": reload.CatalogPacks,
 	}
 	writeJSON(writer, response)
 }
 
-func requestLocationCatalogReload(result locationimport.Result) (bool, string) {
+type locationCatalogReloadResult struct {
+	CatalogGeneration string   `json:"catalog_generation"`
+	CatalogPacks      []string `json:"catalog_packs"`
+}
+
+func requestLocationCatalogReload(ctx context.Context, result locationimport.Result, reason string) (locationCatalogReloadResult, error) {
 	bridgeAddr := strings.TrimSpace(os.Getenv("HAZE_HOST_BRIDGE_ADDR"))
 	if bridgeAddr == "" {
-		return false, "The catalog is active on disk, but the location service bridge is unavailable. Restart or reload haze-location before querying it."
+		return locationCatalogReloadResult{}, errors.New("location service bridge is unavailable")
 	}
-	publisher := events.NewHostBridgePublisher(bridgeAddr)
-	defer publisher.Close()
-	err := publisher.Publish(events.Event{
-		Type: "location.catalog.reload.request", Source: "haze-web", Target: "haze-location",
+	reloadCtx, cancel := context.WithTimeout(ctx, locationCatalogReloadTimeout)
+	defer cancel()
+	connection, err := (&net.Dialer{Timeout: 3 * time.Second}).DialContext(reloadCtx, "tcp", bridgeAddr)
+	if err != nil {
+		return locationCatalogReloadResult{}, fmt.Errorf("connect to location service bridge: %w", err)
+	}
+	defer connection.Close()
+	deadline := time.Now().Add(locationCatalogReloadTimeout)
+	if contextDeadline, ok := reloadCtx.Deadline(); ok && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
+	if err := connection.SetDeadline(deadline); err != nil {
+		return locationCatalogReloadResult{}, err
+	}
+	clientID := fmt.Sprintf("haze-web-location-import-%d", time.Now().UnixNano())
+	encoder := json.NewEncoder(connection)
+	if err := encoder.Encode(map[string]any{
+		"type": "bridge.client",
+		"data": map[string]any{
+			"client_id": clientID, "receive_events": true,
+			"subscriptions": []string{"location.catalog.reloaded", "location.catalog.reload_failed"},
+		},
+	}); err != nil {
+		return locationCatalogReloadResult{}, fmt.Errorf("register location catalog reload client: %w", err)
+	}
+	if err := encoder.Encode(events.Event{
+		Type: "location.catalog.reload.request", Source: clientID, ReplyTo: clientID, Target: "haze-location",
 		Subject: fmt.Sprintf("eccc-clc-%s", result.ProviderVersion),
 		Data: map[string]any{
-			"reason": "operator_catalog_import", "source": result.Source,
+			"reason": reason, "source": result.Source,
 			"provider_version": result.ProviderVersion, "record_count": result.RecordCount,
+			"pack_id": "legacy-weather-geometry",
 		},
-	})
-	if err != nil {
-		return false, "The catalog is active on disk, but its reload event could not be published. Restart or reload haze-location before querying it."
+	}); err != nil {
+		return locationCatalogReloadResult{}, fmt.Errorf("publish location catalog reload request: %w", err)
 	}
-	return true, ""
+	scanner := bufio.NewScanner(connection)
+	scanner.Buffer(make([]byte, 16*1024), 1<<20)
+	for scanner.Scan() {
+		var envelope struct {
+			Type   string          `json:"type"`
+			Target string          `json:"target"`
+			Data   json.RawMessage `json:"data"`
+		}
+		if err := json.Unmarshal(scanner.Bytes(), &envelope); err != nil || envelope.Target != clientID {
+			continue
+		}
+		switch envelope.Type {
+		case "location.catalog.reloaded":
+			var reload locationCatalogReloadResult
+			if err := json.Unmarshal(envelope.Data, &reload); err != nil {
+				return locationCatalogReloadResult{}, fmt.Errorf("decode location catalog reload response: %w", err)
+			}
+			if strings.TrimSpace(reload.CatalogGeneration) == "" {
+				return locationCatalogReloadResult{}, errors.New("location service returned an empty catalog generation")
+			}
+			return reload, nil
+		case "location.catalog.reload_failed":
+			var failure struct {
+				Error string `json:"error"`
+				Code  string `json:"code"`
+			}
+			if err := json.Unmarshal(envelope.Data, &failure); err != nil {
+				return locationCatalogReloadResult{}, fmt.Errorf("decode location catalog reload failure: %w", err)
+			}
+			message := strings.TrimSpace(failure.Error)
+			if message == "" {
+				message = strings.TrimSpace(failure.Code)
+			}
+			if message == "" {
+				message = "location service rejected the catalog reload"
+			}
+			return locationCatalogReloadResult{}, errors.New(message)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		if reloadCtx.Err() != nil {
+			return locationCatalogReloadResult{}, fmt.Errorf("location catalog reload acknowledgement: %w", reloadCtx.Err())
+		}
+		return locationCatalogReloadResult{}, fmt.Errorf("read location catalog reload acknowledgement: %w", err)
+	}
+	return locationCatalogReloadResult{}, errors.New("location service bridge closed before acknowledging the catalog reload")
 }

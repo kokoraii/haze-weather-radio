@@ -49,11 +49,49 @@ jobs:
             --manifest scripts/util/location-catalog-sources.json \
             --pack "${{ matrix.pack }}" \
             --output "dist/location-catalogs/${{ matrix.pack }}.sqlite" \
+            --geometry-output "dist/location-catalogs/${{ matrix.pack }}.geometry.sqlite" \
+            --member-manifest-output "dist/location-catalogs/${{ matrix.pack }}.manifest.json" \
             --retrieved-at "$retrieved_at" \
             --allow-downloads
           cd dist/location-catalogs
           sha256sum -c "${{ matrix.pack }}.sqlite.sha256"
-          sqlite3 "${{ matrix.pack }}.sqlite" "PRAGMA integrity_check; SELECT rtreecheck('entity_rtree');"
+          sha256sum -c "${{ matrix.pack }}.geometry.sqlite.sha256"
+          test "$(sqlite3 "${{ matrix.pack }}.sqlite" "PRAGMA integrity_check;")" = "ok"
+          test "$(sqlite3 "${{ matrix.pack }}.sqlite" "SELECT rtreecheck('entity_rtree');")" = "ok"
+          test "$(sqlite3 "${{ matrix.pack }}.geometry.sqlite" "PRAGMA integrity_check;")" = "ok"
+          test "$(sqlite3 "${{ matrix.pack }}.geometry.sqlite" "SELECT rtreecheck('area_geometry_rtree');")" = "ok"
+          polygon_rows="$(sqlite3 "${{ matrix.pack }}.sqlite" "SELECT COUNT(*) FROM geometries WHERE geometry_type IN ('polygon', 'multipolygon');")"
+          test "$polygon_rows" -eq 0
+          invalid_geometry_rows="$(sqlite3 "${{ matrix.pack }}.geometry.sqlite" "SELECT COUNT(*) FROM area_geometries WHERE geometry_type NOT IN ('polygon', 'multipolygon') OR geometry_wkb IS NULL OR length(geometry_wkb) < 5;")"
+          test "$invalid_geometry_rows" -eq 0
+          geometry_rows="$(sqlite3 "${{ matrix.pack }}.geometry.sqlite" "SELECT COUNT(*) FROM area_geometries;")"
+          geometry_metadata_rows="$(sqlite3 "${{ matrix.pack }}.geometry.sqlite" "SELECT value FROM catalog_metadata WHERE key = 'count.geometries';")"
+          geometry_rtree_rows="$(sqlite3 "${{ matrix.pack }}.geometry.sqlite" "SELECT COUNT(*) FROM area_geometry_rtree;")"
+          test "$geometry_rows" -eq "$geometry_metadata_rows"
+          test "$geometry_rows" -eq "$geometry_rtree_rows"
+          core_sha256="$(sha256sum "${{ matrix.pack }}.sqlite" | cut -d ' ' -f 1)"
+          paired_core_sha256="$(sqlite3 "${{ matrix.pack }}.geometry.sqlite" "SELECT value FROM catalog_metadata WHERE key = 'core_sha256';")"
+          test "$paired_core_sha256" = "$core_sha256"
+          orphan_rows="$(sqlite3 "${{ matrix.pack }}.sqlite" "ATTACH DATABASE '${{ matrix.pack }}.geometry.sqlite' AS geometry_pack; SELECT COUNT(*) FROM geometry_pack.area_geometries AS geometry WHERE NOT EXISTS (SELECT 1 FROM entities WHERE canonical_id = geometry.canonical_id);")"
+          test "$orphan_rows" -eq 0
+          PACK_ID="${{ matrix.pack }}" python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          pack_id = os.environ["PACK_ID"]
+          fragment = json.loads(Path(f"{pack_id}.manifest.json").read_text(encoding="utf-8"))
+          assert fragment["schema_version"] == 1
+          assert fragment["pack_id"] == pack_id
+          for role, filename in {
+              "core": f"{pack_id}.sqlite",
+              "geometry": f"{pack_id}.geometry.sqlite",
+          }.items():
+              path = Path(filename)
+              assert fragment["members"][role]["file"] == filename
+              assert fragment["members"][role]["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+          PY
 
       - name: Upload checksummed pack
         uses: actions/upload-artifact@v4
@@ -62,5 +100,8 @@ jobs:
           path: |
             dist/location-catalogs/${{ matrix.pack }}.sqlite
             dist/location-catalogs/${{ matrix.pack }}.sqlite.sha256
+            dist/location-catalogs/${{ matrix.pack }}.geometry.sqlite
+            dist/location-catalogs/${{ matrix.pack }}.geometry.sqlite.sha256
+            dist/location-catalogs/${{ matrix.pack }}.manifest.json
           if-no-files-found: error
           retention-days: 30

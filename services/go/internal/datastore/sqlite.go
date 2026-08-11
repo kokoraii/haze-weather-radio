@@ -104,36 +104,53 @@ func (s *SQLiteStore) Migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, sqliteSchemaSQL); err != nil {
 		return fmt.Errorf("migrate sqlite datastore: %w", err)
 	}
-	hasCanonicalID := false
-	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info(locations_locations)")
+	hasCanonicalID, err := s.hasLocationCanonicalID(ctx)
 	if err != nil {
-		return fmt.Errorf("inspect sqlite location schema: %w", err)
-	}
-	for rows.Next() {
-		var cid int
-		var name, columnType string
-		var notNull, primaryKey int
-		var defaultValue any
-		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
-			rows.Close()
-			return err
-		}
-		if name == "canonical_id" {
-			hasCanonicalID = true
-		}
-	}
-	if err := rows.Close(); err != nil {
 		return err
 	}
 	if !hasCanonicalID {
-		if _, err := s.db.ExecContext(ctx, "ALTER TABLE locations_locations ADD COLUMN canonical_id TEXT"); err != nil {
-			return fmt.Errorf("add canonical location ID column: %w", err)
+		if _, alterErr := s.db.ExecContext(ctx, "ALTER TABLE locations_locations ADD COLUMN canonical_id TEXT"); alterErr != nil {
+			// Several Haze services can migrate the shared SQLite datastore at
+			// startup. Another process may add the column after our inspection
+			// but before this ALTER. Accept that race only when the desired
+			// schema is now observable.
+			hasCanonicalID, err = s.hasLocationCanonicalID(ctx)
+			if err != nil {
+				return fmt.Errorf("add canonical location ID column: %v; verify schema: %w", alterErr, err)
+			}
+			if !hasCanonicalID {
+				return fmt.Errorf("add canonical location ID column: %w", alterErr)
+			}
 		}
 	}
 	if _, err := s.db.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS idx_locations_canonical_id ON locations_locations(canonical_id) WHERE canonical_id IS NOT NULL AND canonical_id <> ''"); err != nil {
 		return fmt.Errorf("index canonical location IDs: %w", err)
 	}
 	return nil
+}
+
+func (s *SQLiteStore) hasLocationCanonicalID(ctx context.Context) (bool, error) {
+	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info(locations_locations)")
+	if err != nil {
+		return false, fmt.Errorf("inspect sqlite location schema: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull, primaryKey int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return false, err
+		}
+		if name == "canonical_id" {
+			return true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 func (s *SQLiteStore) UpsertLocation(ctx context.Context, record LocationRecord) error {

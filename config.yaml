@@ -23,7 +23,7 @@ services:
       executable: "bin/haze-location"
       config: "managed/configs/locations.xml"
       mode: "legacy" # legacy, shadow, or authoritative
-      workers: 4
+      workers: 16
       queue_size: 128
       scheduler:
         windows_priority: normal
@@ -150,10 +150,12 @@ services:
       prompts_file: "managed/configs/ivr.xml"
       extensions:
         - extension: "haze"
+          dids: [] # Optional VoIP.ms {DID} values, such as "+13065550123".
           name:
             text: "Canada"
             pronunciation: "Canada"
           name_position: "before"
+          caller_id_name: "Canada TeleWeather"
           province: "CA"
           enabled: true
         - extension: "100"
@@ -185,10 +187,12 @@ services:
           province: "MB"
           enabled: true
         - extension: "600"
+          dids: []
           name:
             text: "Saskatchewan"
             pronunciation: "Saskatchewan"
           name_position: "before"
+          caller_id_name: "Saskatchewan TeleWeather"
           province: "SK"
           enabled: true
         - extension: "700"
@@ -220,7 +224,7 @@ services:
         listen_ports:
           - port: 5060
           - port: 5080
-            domain: "teleweather.sip.rai.blue"
+            domain: "sip.teleweather.ca"
         public_host: "71.17.68.130"
         allowed_sources: []
         auth:
@@ -246,6 +250,7 @@ services:
       search:
         enabled: true
         voice_enabled: true
+        caller_hint_enabled: false
         spool_dir: "runtime/ivr/asr"
         multitap_window: "700ms"
         idle_submit: "2.5s"
@@ -466,7 +471,8 @@ webpanel:
     idle_timeout_seconds: 900
     persistent_session_ttl_seconds: 2592000
     login_rate_limit: 5
-    login_rate_window_seconds: 900
+    login_rate_window_seconds: 120
+    account_lock_duration_seconds: 120 # Administrator-role accounts are exempt from account locking.
     origination_rate_per_second: 2
     enforce_mfa: false # Optional by default. Enrolled accounts still require their current TOTP code.
     redis_required: true

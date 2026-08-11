@@ -683,7 +683,7 @@ func (s *accountStore) recordLoginFailure(ctx context.Context, accountID string,
 		return Account{}, fmt.Errorf("begin login failure update: %w", err)
 	}
 	defer tx.Rollback()
-	query := `SELECT failed_login_attempts, failed_login_window_started_at, account_locked, auth_version FROM users WHERE id=?`
+	query := `SELECT failed_login_attempts, failed_login_window_started_at, account_locked, auth_version, is_admin FROM users WHERE id=?`
 	if s.dialect == "postgres" {
 		query += ` FOR UPDATE`
 	}
@@ -691,7 +691,8 @@ func (s *accountStore) recordLoginFailure(ctx context.Context, accountID string,
 	var started sql.NullString
 	var locked bool
 	var currentVersion int64
-	if err := tx.QueryRowContext(ctx, s.bind(query), accountID).Scan(&attempts, &started, &locked, &currentVersion); err != nil {
+	var isAdmin bool
+	if err := tx.QueryRowContext(ctx, s.bind(query), accountID).Scan(&attempts, &started, &locked, &currentVersion, &isAdmin); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Account{}, errAccountNotFound
 		}
@@ -709,9 +710,10 @@ func (s *accountStore) recordLoginFailure(ctx context.Context, accountID string,
 		windowStarted = now
 	}
 	attempts++
-	newlyLocked := !locked && attempts >= lockAt
+	newlyLocked := !isAdmin && !locked && attempts >= lockAt
 	if newlyLocked {
 		locked = true
+		windowStarted = now
 	}
 	versionIncrement := 0
 	if newlyLocked {
@@ -773,6 +775,29 @@ func (s *accountStore) Unlock(ctx context.Context, accountID string) error {
 		return fmt.Errorf("unlock account: %w", err)
 	}
 	return requireAffected(result)
+}
+
+func (s *accountStore) UnlockLockedIfAuthVersion(ctx context.Context, accountID string, expectedVersion int64, now time.Time) (bool, error) {
+	if expectedVersion < 1 {
+		return false, fmt.Errorf("expected account authentication version is required")
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	result, err := s.db.ExecContext(ctx, s.bind(`
+UPDATE users SET account_locked=false, failed_login_attempts=0, failed_login_window_started_at=NULL,
+	auth_version=auth_version+1, updated_at=?
+WHERE id=? AND auth_version=? AND account_locked=true`), now.Format(time.RFC3339Nano), accountID, expectedVersion)
+	if err != nil {
+		return false, fmt.Errorf("automatically unlock account: %w", err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return count == 1, nil
 }
 
 func (s *accountStore) BumpAuthVersion(ctx context.Context, accountID string) error {
@@ -868,6 +893,9 @@ func validateAccount(account *Account) error {
 	account.Username = strings.TrimSpace(account.Username)
 	if !validUsername.MatchString(account.Username) {
 		return fmt.Errorf("username must be 1 to 50 letters, numbers, periods, underscores, or hyphens")
+	}
+	if account.IsAdmin {
+		account.AccountLocked = false
 	}
 	account.SenderID = strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(account.SenderID), "-", "/"))
 	if account.ForceSenderID && !validSenderID.MatchString(account.SenderID) {

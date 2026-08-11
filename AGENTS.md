@@ -65,12 +65,13 @@ Its structure is defined as an Event-Driven Architecture (EDA), a highly asynchr
 - For source changes that affect the primary live instance, rebuild the affected binaries, sync them into `/home/rai/haze-weather-radio/bin`, sync required config/assets, then restart with `systemctl --user restart haze-weather-radio.service`.
 - After restarting the primary live instance, check `systemctl --user status haze-weather-radio.service` and relevant `journalctl --user -u haze-weather-radio.service` logs.
 - The current CWRS/CWXR (Canadian Weather Radio Service) Haze instance is the Debian server at `172.16.1.39`. Its portable runtime is `/srv/haze-weather-radio`, its source checkout is `/home/rai/haze-weather-radio`, and it runs as the system service `haze-weather-radio.service`.
-- The legacy CWXR Windows VM is `172.16.1.38`, reachable through `\\DESKTOP-QOQ6ERC\Users\rai`. It no longer runs Haze. It hosts SpeakyAPI on port `5000` for the CWRS Debian server's remote SAPI voices.
+- The legacy CWXR Windows VM is `172.16.1.38`, reachable through `\\DESKTOP-QOQ6ERC\Users\rai`. It no longer runs Haze or SpeakyAPI.
+- The i2jr Windows host is `172.16.1.32`, reachable with `ssh i2jr`. It hosts SpeakyAPI on port `5000` for the CWRS Debian server's remote SAPI voices.
 - The RF receiver/transmitter Raspberry Pi runs at `172.16.1.37` and is reachable with `ssh pi`. It runs `haze-receiver.service`, which launches `/home/rai/hazeReceiver.py` and feeds PiFmAdv for local receiver testing.
 - Unless the user explicitly scopes a deployment to only one environment, changes that affect running Haze behavior should be deployed to both the primary live instance and the CWRS/CWXR instance.
 - For CWRS/CWXR, build on `172.16.1.39`, install the portable bundle under `/srv/haze-weather-radio`, and keep `bundle/managed/configs/cwxr-feeds.xml`, `cwxr-output.xml`, and `cwxr-readers.xml` synced as `runtime/managed/configs/feeds.xml`, `runtime/managed/configs/output.xml`, and `runtime/managed/configs/readers.xml`. Restart with `sudo systemctl restart haze-weather-radio.service`, then inspect the system service and journal.
 - For RF receiver changes, sync `hazeReceiver.py` to `/home/rai/hazeReceiver.py` on the Pi, preserve an on-device backup when practical, restart with `sudo systemctl restart haze-receiver.service`, then confirm `systemctl status haze-receiver.service` and that PiFmAdv starts with the intended frequency, deviation, and power arguments.
-- The legacy Windows VM's SpeakyAPI is started by the `SpeakyAPI` scheduled task. Haze deployments must not replace files on that VM unless the task specifically changes the remote voice server.
+- i2jr's production SpeakyAPI copy is started by the `SpeakyAPI` scheduled task from `C:\ProgramData\SpeakyAPI`. Its source checkout remains at `C:\SpeakyAPI`. Haze deployments must not replace either location unless the task specifically changes the remote voice server.
 - Never overwrite live `.env`, logs, runtime state, local data, managed operator files, or generated audio unless the user explicitly asks for that specific destructive action.
 
 ## Web panel

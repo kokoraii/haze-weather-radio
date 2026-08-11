@@ -4455,7 +4455,8 @@ a {
 }
 
 .public-map-toolbar {
-	min-height: 44px
+	justify-content: flex-end;
+	min-height: 36px
 }
 
 .public-map-toggles {

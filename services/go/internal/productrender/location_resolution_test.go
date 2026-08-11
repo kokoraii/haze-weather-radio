@@ -25,6 +25,20 @@ func TestCAPLocationReferencesPreserveQualifiedRawCodes(t *testing.T) {
 	}
 }
 
+func TestCAPLocationReferencesIgnoreECCCThreatAreaMapping(t *testing.T) {
+	alert := capmodel.Alert{Infos: []capmodel.AlertInfo{{Areas: []capmodel.AlertArea{
+		{Geocodes: []capmodel.NameValue{{Name: "layer:EC-MSC-SMC:1.0:CLC", Value: "065100"}}},
+		{ThreatStatus: "issued", Geocodes: []capmodel.NameValue{
+			{Name: capmodel.ECCCThreatAreaGeocodeName, Value: "issued"},
+			{Name: "profile:CAP-CP:Location:0.3", Value: "4711075"},
+		}},
+	}}}}
+	references, queries := capLocationReferences(alert)
+	if len(references) != 1 || len(queries) != 1 || references[0].RawIdentifiers[0].Value != "065100" {
+		t.Fatalf("references=%#v queries=%#v", references, queries)
+	}
+}
+
 func TestCanonicalSAMELocationsRejectsNonActionableCandidates(t *testing.T) {
 	locations := canonicalSAMELocations([]alertmodel.LocationReference{
 		{

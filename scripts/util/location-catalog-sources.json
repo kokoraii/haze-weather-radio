@@ -217,6 +217,24 @@
           "attribution": "Statistics Canada, 2021 Census Boundary Files"
         },
         {
+          "id": "statcan-csd-population-2021",
+          "title": "Statistics Canada 2021 census subdivision population and dwelling counts",
+          "adapter": "statcan_csd_population",
+          "location": "https://www150.statcan.gc.ca/n1/en/tbl/csv/98100002-eng.zip",
+          "archive_contains": "98100002.csv",
+          "encoding": "utf-8-sig",
+          "dguid_field": "DGUID",
+          "population_field": "Population and dwelling counts (13): Population, 2021 [1]",
+          "national_rank_field": "Population and dwelling counts (13): National population rank, 2021 [12]",
+          "province_rank_field": "Population and dwelling counts (13): Province/territory population rank, 2021 [13]",
+          "census_year": 2021,
+          "expected_min": 5000,
+          "valid_from": "2021-01-01",
+          "source_quality": 0.99,
+          "licence": "Statistics Canada Open Licence",
+          "attribution": "Statistics Canada, table 98-10-0002-01"
+        },
+        {
           "id": "eccc-swob-land",
           "title": "ECCC SWOB land stations",
           "adapter": "eccc_swob",

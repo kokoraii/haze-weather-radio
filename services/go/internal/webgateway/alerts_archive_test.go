@@ -737,6 +737,21 @@ storage:
 	}
 }
 
+func TestECCCAugust2026ThreatAreasDoNotAlterArchiveLocations(t *testing.T) {
+	info := capmodel.AlertInfo{Areas: []capmodel.AlertArea{
+		{Description: "City of Saskatoon", Geocodes: []capmodel.NameValue{{Name: "layer:EC-MSC-SMC:1.0:CLC", Value: "065100"}}},
+		{Description: "new active threat area", ThreatStatus: "issued", Geocodes: []capmodel.NameValue{{Name: "profile:CAP-CP:Location:0.3", Value: "4711066"}}},
+	}}
+	areas := archiveAreaNames(info)
+	if len(areas) != 1 || areas[0] != "City of Saskatoon" {
+		t.Fatalf("archive area names = %#v", areas)
+	}
+	locations := sameLocationsFromCAP(info)
+	if len(locations) != 1 || locations[0] != "065100" {
+		t.Fatalf("archive SAME locations = %#v", locations)
+	}
+}
+
 func parseArchiveTestAlert(t *testing.T, raw string) capmodel.Alert {
 	t.Helper()
 	alert, err := capmodel.ParseCAP([]byte(raw))

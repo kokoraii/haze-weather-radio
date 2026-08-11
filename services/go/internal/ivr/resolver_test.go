@@ -554,6 +554,27 @@ func TestResolverDerivesThreeDigitHelloWeatherProviderIDs(t *testing.T) {
 	}
 }
 
+func TestDeriveHelloWeatherRecordUsesSpecialProvinceFamilySuffix(t *testing.T) {
+	t.Parallel()
+	tests := map[string]string{
+		"01042": "ns-42",
+		"01119": "ns-19",
+		"01529": "nb-29",
+		"01723": "nb-23",
+		"01805": "pe-5",
+		"09104": "yt-4",
+		"09524": "nt-24",
+		"09802": "nu-2",
+		"04143": "on-143",
+	}
+	for code, want := range tests {
+		record, ok := deriveHelloWeatherRecord(code)
+		if !ok || record.Forecast != want {
+			t.Errorf("deriveHelloWeatherRecord(%q) = %#v, %t, want forecast %q", code, record, ok, want)
+		}
+	}
+}
+
 func TestResolverAcceptsProvinceAndLocationShorthand(t *testing.T) {
 	cfg := loadedConfig{
 		IVR:   Config{DefaultLanguage: "en-CA"},

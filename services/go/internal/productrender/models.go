@@ -46,25 +46,29 @@ type renderRequest struct {
 }
 
 type wxOnDemandRequest struct {
-	RequestID    string
-	CanonicalID  string
-	FeedID       string
-	Code         string
-	Source       string
-	Identity     string
-	LocationName string
-	Province     string
-	Country      string
-	ForecastID   string
-	StationID    string
-	Latitude     string
-	Longitude    string
-	Timezone     string
-	Language     string
-	ReaderID     string
-	Packages     []string
-	Force        bool
-	Telephone    bool
+	RequestID        string
+	CanonicalID      string
+	FeedID           string
+	Code             string
+	Source           string
+	Identity         string
+	LocationName     string
+	Province         string
+	Country          string
+	ForecastID       string
+	StationID        string
+	AirQualityID     string
+	ClimateID        string
+	HydrometricID    string
+	MarineForecastID string
+	Latitude         string
+	Longitude        string
+	Timezone         string
+	Language         string
+	ReaderID         string
+	Packages         []string
+	Force            bool
+	Telephone        bool
 }
 
 type observationSnapshot struct {

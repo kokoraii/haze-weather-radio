@@ -8,7 +8,7 @@ fn is_empty<T>(values: &[T]) -> bool {
     values.is_empty()
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct Alert {
     pub identifier: String,
     #[serde(default, skip_serializing_if = "is_blank")]
@@ -37,7 +37,7 @@ pub struct Alert {
     pub warnings: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct AlertInfo {
     #[serde(default, skip_serializing_if = "is_blank")]
     pub language: String,
@@ -79,6 +79,8 @@ pub struct AlertInfo {
     pub parameters: Vec<NameValue>,
     #[serde(default, skip_serializing_if = "is_empty")]
     pub resources: Vec<Resource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storm: Option<StormInfo>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -91,6 +93,38 @@ pub struct AlertArea {
     pub circles: Vec<String>,
     #[serde(default, skip_serializing_if = "is_empty")]
     pub geocodes: Vec<NameValue>,
+    #[serde(default, skip_serializing_if = "is_blank")]
+    pub threat_status: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct StormInfo {
+    #[serde(default, skip_serializing_if = "is_blank")]
+    pub speed: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed_value: Option<f64>,
+    #[serde(default, skip_serializing_if = "is_blank")]
+    pub speed_unit: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction_degrees: Option<f64>,
+    #[serde(default, skip_serializing_if = "is_blank")]
+    pub geometry_type: String,
+    #[serde(default, skip_serializing_if = "is_empty")]
+    pub points: Vec<GeoPoint>,
+    #[serde(default, skip_serializing_if = "is_blank")]
+    pub time: String,
+    #[serde(default, skip_serializing_if = "is_blank")]
+    pub motion_description: String,
+    #[serde(default, skip_serializing_if = "is_blank")]
+    pub position_description: String,
+    #[serde(default, skip_serializing_if = "is_blank")]
+    pub reference_location_points: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct GeoPoint {
+    pub latitude: f64,
+    pub longitude: f64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]

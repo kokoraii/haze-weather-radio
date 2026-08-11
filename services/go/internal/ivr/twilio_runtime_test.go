@@ -192,6 +192,110 @@ func TestTwilioConnectUsesCustomNonceWithoutWebSocketQuery(t *testing.T) {
 	}
 }
 
+func TestNormalizeNANPCaller(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "Twilio E164", input: "+13065550123", want: "+13065550123"},
+		{name: "formatted Canadian", input: "+1 (306) 555-0123", want: "+13065550123"},
+		{name: "national Canadian", input: "306-555-0123", want: "+13065550123"},
+		{name: "US NANP", input: "+12125550123", want: "+12125550123"},
+		{name: "blocked", input: "anonymous"},
+		{name: "restricted", input: "restricted"},
+		{name: "international", input: "+442071838750"},
+		{name: "missing country code after plus", input: "+3065550123"},
+		{name: "extension", input: "+13065550123 ext 4"},
+		{name: "invalid exchange", input: "+13061550123"},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := normalizeNANPCaller(test.input); got != test.want {
+				t.Fatalf("normalizeNANPCaller(%q) = %q, want %q", test.input, got, test.want)
+			}
+		})
+	}
+}
+
+func TestCallerProvinceHintIsConservative(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		caller string
+		want   string
+	}{
+		{name: "Saskatchewan", caller: "+13065550123", want: "SK"},
+		{name: "Ontario overlay", caller: "+19425550123", want: "ON"},
+		{name: "Nova Scotia and PEI shared", caller: "+19025550123"},
+		{name: "territories shared", caller: "+18675550123"},
+		{name: "US area code", caller: "+12125550123"},
+		{name: "blocked", caller: "anonymous"},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := callerProvinceHint(test.caller); got != test.want {
+				t.Fatalf("callerProvinceHint(%q) = %q, want %q", test.caller, got, test.want)
+			}
+		})
+	}
+}
+
+func TestTwilioValidatedCallerCreatesTransientProvinceHint(t *testing.T) {
+	t.Parallel()
+	enabled := true
+	runtime := testTwilioRuntime(t)
+	service := &Service{
+		cfg: loadedConfig{IVR: Config{
+			DefaultLanguage: "en-CA",
+			Search:          searchConfig{Enabled: &enabled, CallerHintEnabled: true},
+		}},
+		searchIndex: &locationSearchIndex{},
+		twilio:      runtime,
+	}
+	form := url.Values{
+		"AccountSid": {testTwilioAccountSID},
+		"CallSid":    {testTwilioCallSID},
+		"From":       {"+1 (306) 555-0123"},
+	}
+	rawQuery := "state=location_search"
+	publicURL := runtime.publicHTTPURL("/ivr/v1/twiml", rawQuery)
+	request := httptest.NewRequest(http.MethodPost, "http://internal/ivr/v1/twiml?"+rawQuery, strings.NewReader(form.Encode()))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("X-Twilio-Signature", signTwilioRequest(publicURL, parseSingleValues(t, form.Encode()), testTwilioAuthToken))
+	response := httptest.NewRecorder()
+	service.requireTwilioCallback(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		service.writeTwilioSearchConnect(writer, request, "en-CA", "CA")
+	})).ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("validated caller callback status = %d, body = %q", response.Code, response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "306555") || strings.Contains(response.Body.String(), "%2B1306") {
+		t.Fatalf("TwiML exposed caller identity: %q", response.Body.String())
+	}
+	runtime.mu.Lock()
+	token := runtime.byCallID[testTwilioCallSID]
+	pending := runtime.pending[token]
+	if pending == nil {
+		runtime.mu.Unlock()
+		t.Fatal("validated callback did not create a pending search session")
+	}
+	storedProvince := pending.callerProvince
+	runtime.mu.Unlock()
+	if storedProvince != "SK" {
+		t.Fatalf("caller hint was not normalized conservatively: province=%q", storedProvince)
+	}
+	consumed, ok := runtime.consumePending(token, testTwilioAccountSID, testTwilioCallSID)
+	if !ok || consumed.callerProvince != "SK" {
+		t.Fatalf("consumed caller hint lost province: %#v", consumed)
+	}
+}
+
 func TestTwilioResultAndMediaTokensAreOpaqueAndLocationBound(t *testing.T) {
 	t.Parallel()
 	runtime := testTwilioRuntime(t)

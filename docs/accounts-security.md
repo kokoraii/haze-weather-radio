@@ -63,7 +63,8 @@ The default policies are:
 - 12-hour maximum regular session
 - 15-minute idle timeout for browser-close sessions
 - optional 30-day persistent session only when the account permits it
-- five sign-in attempts per username and IP in 15 minutes, with account lock after five failed password or MFA checks
+- five sign-in attempts per username and IP in two minutes, with a two-minute account lock after five failed password or MFA checks
+- administrator-role accounts remain subject to username/IP and IP-wide rate limits, but are never placed in the persistent account-locked state
 - two alert generation or origination requests per second per account
 - 90-day password expiry for newly created accounts
 - optional TOTP enrollment when `enforce_mfa` is disabled, with password-only sign-in allowed for accounts that have not completed enrollment
@@ -76,9 +77,9 @@ timedatectl status
 sudo timedatectl set-ntp true
 ```
 
-## Sole-administrator recovery
+## Administrator recovery
 
-If the only administrator is locked, stop the service and run the local recovery command with the same private environment and configuration used by the service. The command unlocks the account, resets its failure window, advances its authentication version, revokes every session, and writes requested and completed audit events.
+Current Haze versions automatically clear legacy administrator lock state at startup, and administrator-role accounts no longer enter the account-locked state. They remain protected by the two-minute sign-in rate limit. The local recovery command remains available for repairing an account database created by an older binary or manually edited outside Haze. Run it with the same private environment and configuration used by the service. The command unlocks the account, resets its failure window, advances its authentication version, revokes every session, and writes requested and completed audit events.
 
 ```bash
 cd /srv/haze-weather-radio

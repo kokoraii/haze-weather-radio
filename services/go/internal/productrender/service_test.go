@@ -31,17 +31,20 @@ func TestWxOnDemandRequestUsesWeatherSourceFromData(t *testing.T) {
 		"source":  "haze-ivr",
 		"subject": "wx-1",
 		"data": map[string]any{
-			"request_id":        "wx-1",
-			"canonical_id":      "urn:haze:location:fixture",
-			"feed_id":           "sk-0001",
-			"code":              "06032",
-			"source":            "hello_weather",
-			"location_identity": "hello_weather:06032",
-			"country":           "CA",
-			"forecast_id":       "sk-32",
-			"latitude":          "51.347",
-			"longitude":         "-105.434",
-			"packages":          []any{"forecast"},
+			"request_id":         "wx-1",
+			"canonical_id":       "urn:haze:location:fixture",
+			"feed_id":            "sk-0001",
+			"code":               "06032",
+			"source":             "hello_weather",
+			"location_identity":  "hello_weather:06032",
+			"country":            "CA",
+			"forecast_id":        "sk-32",
+			"air_quality_id":     "AQTEST",
+			"hydrometric_id":     "05HG001",
+			"marine_forecast_id": "088800",
+			"latitude":           "51.347",
+			"longitude":          "-105.434",
+			"packages":           []any{"forecast"},
 		},
 	})
 
@@ -56,6 +59,9 @@ func TestWxOnDemandRequestUsesWeatherSourceFromData(t *testing.T) {
 	}
 	if request.RequestID != "wx-1" || request.FeedID != "sk-0001" || request.ForecastID != "sk-32" {
 		t.Fatalf("parsed request = %#v", request)
+	}
+	if request.AirQualityID != "AQTEST" || request.HydrometricID != "05HG001" || request.MarineForecastID != "088800" {
+		t.Fatalf("capability identifiers = %#v", request)
 	}
 	if request.Latitude != "51.347" || request.Longitude != "-105.434" {
 		t.Fatalf("coordinates = %q,%q", request.Latitude, request.Longitude)

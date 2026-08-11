@@ -22,22 +22,26 @@ import (
 
 // ResolvedLocation is the canonical IVR lookup result for caller-entered digits.
 type ResolvedLocation struct {
-	CanonicalID string `json:"canonical_id,omitempty"`
-	Input       string `json:"input"`
-	Code        string `json:"code"`
-	Source      string `json:"source"`
-	Name        string `json:"name"`
-	Province    string `json:"province,omitempty"`
-	Country     string `json:"country,omitempty"`
-	Kind        string `json:"kind,omitempty"`
-	FeedID      string `json:"feed_id"`
-	Covered     bool   `json:"covered_by_feed"`
-	Language    string `json:"language"`
-	Timezone    string `json:"timezone,omitempty"`
-	Forecast    string `json:"forecast_id,omitempty"`
-	StationID   string `json:"station_id,omitempty"`
-	Latitude    string `json:"latitude,omitempty"`
-	Longitude   string `json:"longitude,omitempty"`
+	CanonicalID      string `json:"canonical_id,omitempty"`
+	Input            string `json:"input"`
+	Code             string `json:"code"`
+	Source           string `json:"source"`
+	Name             string `json:"name"`
+	Province         string `json:"province,omitempty"`
+	Country          string `json:"country,omitempty"`
+	Kind             string `json:"kind,omitempty"`
+	FeedID           string `json:"feed_id"`
+	Covered          bool   `json:"covered_by_feed"`
+	Language         string `json:"language"`
+	Timezone         string `json:"timezone,omitempty"`
+	Forecast         string `json:"forecast_id,omitempty"`
+	StationID        string `json:"station_id,omitempty"`
+	AirQualityID     string `json:"air_quality_id,omitempty"`
+	ClimateID        string `json:"climate_id,omitempty"`
+	HydrometricID    string `json:"hydrometric_id,omitempty"`
+	MarineForecastID string `json:"marine_forecast_id,omitempty"`
+	Latitude         string `json:"latitude,omitempty"`
+	Longitude        string `json:"longitude,omitempty"`
 }
 
 // ResolvePlace resolves one source-qualified location database record without
@@ -195,6 +199,8 @@ type Resolver struct {
 	helloWeatherCodes  map[string]locationRecord
 	helloWeatherLoaded bool
 	lookupHelloWeather helloWeatherLookup
+	telephoneCodesOnce sync.Once
+	telephoneCodes     []telephoneLocationCode
 	geocodeIndexOnce   sync.Once
 	geocodeNameIndex   map[string]locationRecord
 	feedIndexOnce      sync.Once
@@ -1130,12 +1136,17 @@ func deriveHelloWeatherRecord(code string) (locationRecord, bool) {
 	if !ok {
 		return locationRecord{}, false
 	}
-	for _, digit := range code[2:] {
+	cityDigits := code[2:]
+	switch code[:3] {
+	case "010", "011", "015", "017", "018", "091", "095", "098":
+		cityDigits = code[3:]
+	}
+	for _, digit := range cityDigits {
 		if digit < '0' || digit > '9' {
 			return locationRecord{}, false
 		}
 	}
-	city := strings.TrimLeft(code[2:], "0")
+	city := strings.TrimLeft(cityDigits, "0")
 	if city == "" {
 		return locationRecord{}, false
 	}

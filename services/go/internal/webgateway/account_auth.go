@@ -91,6 +91,7 @@ type accountAuth struct {
 	idleTimeout         time.Duration
 	loginLimit          int
 	loginWindow         time.Duration
+	accountLockDuration time.Duration
 	originationRate     int
 	trustedProxyCIDRs   []*net.IPNet
 	loginCIDRAllowlist  []*net.IPNet
@@ -201,7 +202,8 @@ func newAccountAuth(config Config, configPath string) *accountAuth {
 		persistentTTL:       durationSeconds(authConfig.PersistentSessionTTLSeconds, 30*24*time.Hour),
 		idleTimeout:         durationSeconds(authConfig.IdleTimeoutSeconds, 15*time.Minute),
 		loginLimit:          positiveOr(authConfig.LoginRateLimit, 5),
-		loginWindow:         durationSeconds(authConfig.LoginRateWindowSeconds, 15*time.Minute),
+		loginWindow:         durationSeconds(authConfig.LoginRateWindowSeconds, 2*time.Minute),
+		accountLockDuration: durationSeconds(authConfig.AccountLockDurationSeconds, 2*time.Minute),
 		originationRate:     positiveOr(authConfig.OriginationRatePerSecond, 2),
 		loginLimiter:        newAttemptLimiter(),
 		loginIPLimiter:      newAttemptLimiter(),
@@ -288,6 +290,12 @@ func newAccountAuth(config Config, configPath string) *accountAuth {
 		h.store.Close()
 		return h
 	}
+	if err := h.repairAccountLocks(ctx, time.Now().UTC()); err != nil {
+		h.initializationError = err
+		_ = h.sessions.Close()
+		h.store.Close()
+		return h
+	}
 	dummy, err := h.hashPassword("haze-unknown-account-dummy-password")
 	if err != nil {
 		h.initializationError = err
@@ -352,6 +360,72 @@ func (h *accountAuth) bootstrapFirstAdmin(ctx context.Context, usernameEnv strin
 	return nil
 }
 
+func temporaryAccountLockError() *AuthError {
+	return &AuthError{
+		Code:       "account_locked",
+		Detail:     "This account is temporarily locked. Try again after the lock period.",
+		HTTPStatus: http.StatusLocked,
+	}
+}
+
+func (h *accountAuth) repairAccountLocks(ctx context.Context, now time.Time) error {
+	accounts, err := h.store.List(ctx)
+	if err != nil {
+		return fmt.Errorf("load account locks: %w", err)
+	}
+	for _, account := range accounts {
+		if !account.AccountLocked {
+			continue
+		}
+		if _, err := h.applyAccountLockPolicy(ctx, account, now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (h *accountAuth) applyAccountLockPolicy(ctx context.Context, account Account, now time.Time) (Account, error) {
+	if !account.AccountLocked {
+		return account, nil
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	reason := ""
+	if account.IsAdmin {
+		reason = "administrator_exempt"
+	} else {
+		lockedAt := account.failedLoginWindowStartedAt
+		if lockedAt.IsZero() {
+			lockedAt = account.UpdatedAt
+		}
+		if lockedAt.IsZero() || now.Before(lockedAt) || now.Sub(lockedAt) >= h.accountLockDuration {
+			reason = "duration_elapsed"
+		}
+	}
+	if reason == "" {
+		return account, nil
+	}
+	unlocked, err := h.store.UnlockLockedIfAuthVersion(ctx, account.ID, account.authVersion, now)
+	if err != nil {
+		return Account{}, fmt.Errorf("apply account lock policy: %w", err)
+	}
+	if !unlocked {
+		return h.store.ByID(ctx, account.ID)
+	}
+	h.ResetLoginLimits(ctx, account.Username, "")
+	h.purgeUserSessionLeases(ctx, account.ID, account)
+	if err := h.audit.Append("access", AuditEvent{
+		Timestamp: now, Event: "ACCOUNT_LOCK_AUTO_CLEARED", ActorID: account.ID, ActorUsername: account.Username,
+		Severity: "warning", Details: map[string]any{"reason": reason},
+	}); err != nil {
+		return Account{}, fmt.Errorf("audit automatic account unlock: %w", err)
+	}
+	return h.store.ByID(ctx, account.ID)
+}
+
 func (h *accountAuth) Login(ctx context.Context, input LoginInput) (LoginResult, error) {
 	if h == nil || !h.configured {
 		return LoginResult{}, h.unavailableError()
@@ -380,8 +454,14 @@ func (h *accountAuth) Login(ctx context.Context, input LoginInput) (LoginResult,
 	if !pairAllowed || !ipRateAllowed {
 		h.auditPreauthenticationFailure("LOGIN_RATE_LIMITED", username, ip, userAgent, "critical")
 		if !pairAllowed {
-			if account, err := h.store.ByUsername(ctx, username); err == nil && account.AccountLocked {
-				return LoginResult{}, &AuthError{Code: "account_locked", Detail: "This account is locked. Contact an administrator.", HTTPStatus: http.StatusLocked}
+			if account, lookupErr := h.store.ByUsername(ctx, username); lookupErr == nil {
+				account, policyErr := h.applyAccountLockPolicy(ctx, account, now)
+				if policyErr != nil {
+					return LoginResult{}, &AuthError{Code: "auth_unavailable", Detail: "Sign in is temporarily unavailable.", HTTPStatus: http.StatusServiceUnavailable}
+				}
+				if account.AccountLocked {
+					return LoginResult{}, temporaryAccountLockError()
+				}
 			}
 		}
 		return LoginResult{}, &AuthError{Code: "login_rate_limited", Detail: "Too many sign-in attempts. Try again later.", HTTPStatus: http.StatusTooManyRequests}
@@ -394,8 +474,12 @@ func (h *accountAuth) Login(ctx context.Context, input LoginInput) (LoginResult,
 	if err != nil {
 		return LoginResult{}, &AuthError{Code: "auth_unavailable", Detail: "Sign in is temporarily unavailable.", HTTPStatus: http.StatusServiceUnavailable}
 	}
+	account, err = h.applyAccountLockPolicy(ctx, account, now)
+	if err != nil {
+		return LoginResult{}, &AuthError{Code: "auth_unavailable", Detail: "Sign in is temporarily unavailable.", HTTPStatus: http.StatusServiceUnavailable}
+	}
 	if account.AccountLocked {
-		return LoginResult{}, &AuthError{Code: "account_locked", Detail: "This account is locked. Contact an administrator.", HTTPStatus: http.StatusLocked}
+		return LoginResult{}, temporaryAccountLockError()
 	}
 	accountCIDRs, err := parseCIDRList(account.CIDRWhitelist)
 	if err != nil {
@@ -434,7 +518,7 @@ func (h *accountAuth) Login(ctx context.Context, input LoginInput) (LoginResult,
 		})
 		if updated.AccountLocked {
 			_ = h.sessions.DeleteUser(ctx, account.ID)
-			return LoginResult{}, &AuthError{Code: "account_locked", Detail: "This account is locked. Contact an administrator.", HTTPStatus: http.StatusLocked}
+			return LoginResult{}, temporaryAccountLockError()
 		}
 		return LoginResult{}, invalidCredentials()
 	}
@@ -474,7 +558,7 @@ func (h *accountAuth) Login(ctx context.Context, input LoginInput) (LoginResult,
 			})
 			if updated.AccountLocked {
 				_ = h.sessions.DeleteUser(ctx, account.ID)
-				return LoginResult{}, &AuthError{Code: "account_locked", Detail: "This account is locked. Contact an administrator.", HTTPStatus: http.StatusLocked}
+				return LoginResult{}, temporaryAccountLockError()
 			}
 			return LoginResult{}, &AuthError{Code: "invalid_mfa", Detail: "The authentication code is invalid or was already used.", HTTPStatus: http.StatusUnauthorized}
 		}
@@ -584,8 +668,12 @@ func (h *accountAuth) refreshLoginAccount(ctx context.Context, previous Account)
 	if err != nil {
 		return Account{}, &AuthError{Code: "auth_unavailable", Detail: "Sign in is temporarily unavailable.", HTTPStatus: http.StatusServiceUnavailable}
 	}
+	account, err = h.applyAccountLockPolicy(ctx, account, time.Now().UTC())
+	if err != nil {
+		return Account{}, &AuthError{Code: "auth_unavailable", Detail: "Sign in is temporarily unavailable.", HTTPStatus: http.StatusServiceUnavailable}
+	}
 	if account.AccountLocked {
-		return Account{}, &AuthError{Code: "account_locked", Detail: "This account is locked. Contact an administrator.", HTTPStatus: http.StatusLocked}
+		return Account{}, temporaryAccountLockError()
 	}
 	if account.authVersion != previous.authVersion {
 		return Account{}, &AuthError{Code: "login_state_changed", Detail: "The account changed while sign in was in progress. Try again.", HTTPStatus: http.StatusConflict}
@@ -793,7 +881,21 @@ func (h *accountAuth) Logout(request *http.Request) error {
 }
 
 func (h *accountAuth) ListAccounts(ctx context.Context) ([]Account, error) {
-	return h.store.List(ctx)
+	accounts, err := h.store.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	for index, account := range accounts {
+		if !account.AccountLocked {
+			continue
+		}
+		accounts[index], err = h.applyAccountLockPolicy(ctx, account, now)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return accounts, nil
 }
 
 func (h *accountAuth) ListSessions(ctx context.Context, userID string) ([]ActiveSession, error) {

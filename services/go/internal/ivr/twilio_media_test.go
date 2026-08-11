@@ -217,11 +217,110 @@ func TestTwilioKeypadSearchUsesSharedSessionAndBargesPrompt(t *testing.T) {
 	}
 	select {
 	case location := <-selected:
-		if location.Code != "06040" || location.Source != "hello_weather" {
+		if location.Code != "SK-40" || location.Source != "eccc_forecast" {
 			t.Fatalf("unexpected selected location: %#v", location)
 		}
 	case <-ctx.Done():
 		t.Fatal("Twilio keypad search did not select Saskatoon")
+	}
+}
+
+func TestTwilioLocationSearchContextAppliesCallerHintSoftly(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name          string
+		selector      string
+		caller        string
+		callerEnabled bool
+		wantRegion    string
+		wantExplicit  bool
+	}{
+		{
+			name: "nationwide caller hint", selector: "CA", caller: "SK", callerEnabled: true,
+			wantRegion: "SK", wantExplicit: false,
+		},
+		{
+			name: "regional line wins", selector: "ON", caller: "SK", callerEnabled: true,
+			wantRegion: "ON", wantExplicit: true,
+		},
+		{
+			name: "hint disabled", selector: "CA", caller: "SK", callerEnabled: false,
+			wantRegion: "", wantExplicit: false,
+		},
+		{
+			name: "ambiguous caller", selector: "CA", caller: "", callerEnabled: true,
+			wantRegion: "", wantExplicit: false,
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			hint := twilioLocationSearchContext("en-CA", test.selector, test.caller, test.callerEnabled)
+			if hint.Region != test.wantRegion || hint.ExplicitRegion != test.wantExplicit {
+				t.Fatalf("context = %#v, want region=%q explicit=%t", hint, test.wantRegion, test.wantExplicit)
+			}
+		})
+	}
+}
+
+func TestTwilioAmbiguityMenuPlaysOneMatchAtATime(t *testing.T) {
+	t.Parallel()
+	type result struct {
+		location ResolvedLocation
+		prompts  []string
+		ok       bool
+	}
+	results := make(chan result, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		ws, err := websocket.Accept(writer, request, &websocket.AcceptOptions{InsecureSkipVerify: true})
+		if err != nil {
+			results <- result{}
+			return
+		}
+		defer ws.Close(websocket.StatusNormalClosure, "done")
+		prompts := make([]string, 0, 2)
+		media := &twilioMediaConnection{
+			service: &Service{}, ws: ws, streamSID: testTwilioStreamSID,
+			digits: make(chan string, 4), marks: make(chan string, 4),
+			textPCMU: func(_ context.Context, _ string, text string, _ string) ([]byte, error) {
+				prompts = append(prompts, text)
+				return make([]byte, 160), nil
+			},
+		}
+		media.digits <- "3"
+		media.digits <- "2"
+		decision := locationSearchDecision{Kind: locationSearchChoices, Matches: []locationSearchMatch{
+			{DisplayName: "Springfield", Target: locationSearchTarget{Location: ResolvedLocation{Source: "test", Code: "first", Province: "ON"}}},
+			{DisplayName: "Saskatoon", Target: locationSearchTarget{Location: ResolvedLocation{Source: "test", Code: "second", Province: "SK"}}},
+		}}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		location, ok := media.confirmDecision(ctx, "en-CA", decision)
+		results <- result{location: location, prompts: prompts, ok: ok}
+	}))
+	defer server.Close()
+	client, _, err := websocket.Dial(context.Background(), "ws"+strings.TrimPrefix(server.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close(websocket.StatusNormalClosure, "done")
+	select {
+	case got := <-results:
+		if !got.ok || got.location.Code != "second" {
+			t.Fatalf("sequential ambiguity selected %#v, ok=%t", got.location, got.ok)
+		}
+		if len(got.prompts) != 2 {
+			t.Fatalf("prompt count = %d, want 2: %#v", len(got.prompts), got.prompts)
+		}
+		if !strings.Contains(got.prompts[0], "Springfield") || strings.Contains(got.prompts[0], "Saskatoon") {
+			t.Fatalf("first prompt did not contain exactly the current match: %q", got.prompts[0])
+		}
+		if !strings.Contains(got.prompts[1], "Saskatoon") || !strings.Contains(got.prompts[1], "Press 2") || !strings.Contains(got.prompts[1], "3 for the next") || !strings.Contains(got.prompts[1], "1 to go back") {
+			t.Fatalf("second prompt did not contain localized navigation: %q", got.prompts[1])
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Twilio ambiguity menu did not complete")
 	}
 }
 
@@ -307,7 +406,7 @@ func TestTwilioVoiceSearchUsesVADBrokeredASRAndSharedMatcher(t *testing.T) {
 	}
 	select {
 	case location := <-selected:
-		if location.Code != "06040" || location.Source != "hello_weather" {
+		if location.Code != "SK-40" || location.Source != "eccc_forecast" {
 			t.Fatalf("unexpected selected location: %#v", location)
 		}
 	case <-ctx.Done():

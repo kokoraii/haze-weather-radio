@@ -35,9 +35,12 @@ type locationSearchName struct {
 }
 
 type locationSearchTarget struct {
-	Key      string
-	Location ResolvedLocation
-	Names    []locationSearchName
+	Key        string
+	Location   ResolvedLocation
+	Names      []locationSearchName
+	Population int64
+	CensusYear int
+	CityPage   bool
 }
 
 type locationSearchMatch struct {
@@ -181,16 +184,16 @@ func decideLocationSearch(matches []locationSearchMatch, context locationSearchC
 	if len(closeMatches) == 1 {
 		return locationSearchDecision{Kind: locationSearchConfirm, Matches: closeMatches}
 	}
-	if len(closeMatches) <= 3 {
-		return locationSearchDecision{Kind: locationSearchChoices, Matches: closeMatches}
-	}
-	return locationSearchDecision{Kind: locationSearchRefine, Matches: closeMatches[:minInt(4, len(closeMatches))]}
+	return locationSearchDecision{Kind: locationSearchChoices, Matches: closeMatches}
 }
 
 func loadLocationSearchIndex(cfg loadedConfig, resolver *Resolver) (*locationSearchIndex, error) {
 	snapshot, ok := locationdb.Load(cfg.BaseDir)
 	if !ok {
 		return nil, fmt.Errorf("managed location database is unavailable")
+	}
+	if enriched, loaded := locationdb.EnrichPopulationFromCorePack(cfg.BaseDir, snapshot); loaded {
+		snapshot = enriched
 	}
 	return newLocationSearchIndex(snapshot, resolver)
 }
@@ -213,6 +216,10 @@ func newLocationSearchIndex(snapshot locationdb.Snapshot, resolver *Resolver) (*
 		} else if preferSearchLocation(location, target.Location) {
 			target.Location = location
 		}
+		if strings.EqualFold(place.Source, "forecast") {
+			target.CityPage = true
+		}
+		updateSearchTargetPopulation(target, place)
 		addSearchName(target, place.Name, "en", place.Code)
 		addSearchName(target, place.NameFR, "fr", place.Code)
 		for _, alias := range place.Aliases() {
@@ -240,6 +247,7 @@ func newLocationSearchIndex(snapshot locationdb.Snapshot, resolver *Resolver) (*
 			target = &locationSearchTarget{Key: key, Location: location}
 			grouped[key] = target
 		}
+		updateSearchTargetPopulation(target, place)
 		addSearchName(target, stationLink.StationName, "", stationLink.StationID)
 	}
 	if len(grouped) == 0 {
@@ -254,6 +262,17 @@ func newLocationSearchIndex(snapshot locationdb.Snapshot, resolver *Resolver) (*
 	}
 	sort.Slice(index.targets, func(i, j int) bool { return index.targets[i].Key < index.targets[j].Key })
 	return index, nil
+}
+
+func updateSearchTargetPopulation(target *locationSearchTarget, place locationdb.Place) {
+	if target == nil {
+		return
+	}
+	population, censusYear := place.CensusPopulation()
+	if population > target.Population || population == target.Population && censusYear > target.CensusYear {
+		target.Population = population
+		target.CensusYear = censusYear
+	}
 }
 
 func canonicalSearchTargetKey(location ResolvedLocation) string {
@@ -284,9 +303,9 @@ func preferSearchLocation(candidate ResolvedLocation, current ResolvedLocation) 
 
 func searchSourcePriority(source string) int {
 	switch strings.ToLower(strings.TrimSpace(source)) {
-	case "hello_weather":
-		return 0
 	case "eccc_forecast", "nws_zone", "nws_marine_zone":
+		return 0
+	case "hello_weather":
 		return 1
 	case "station":
 		return 2
@@ -450,6 +469,9 @@ func (index *locationSearchIndex) searchText(query string, context locationSearc
 	}
 	matches := make([]locationSearchMatch, 0, 16)
 	for _, target := range index.targets {
+		if !locationAllowedBySearchContext(target.Location, context) {
+			continue
+		}
 		bestScore := 0.0
 		exact := false
 		languageMatch := false
@@ -488,6 +510,9 @@ func (index *locationSearchIndex) searchT9(digits string, context locationSearch
 	}
 	matches := make([]locationSearchMatch, 0, 16)
 	for _, target := range index.targets {
+		if !locationAllowedBySearchContext(target.Location, context) {
+			continue
+		}
 		bestScore := 0.0
 		exact := false
 		for _, name := range target.Names {
@@ -666,19 +691,57 @@ func applyLocationContext(score float64, location ResolvedLocation, context loca
 	return math.Max(0, math.Min(1, score))
 }
 
+func locationAllowedBySearchContext(location ResolvedLocation, context locationSearchContext) bool {
+	if !context.ExplicitRegion || strings.TrimSpace(context.Region) == "" {
+		return true
+	}
+	region := normalizeProvinceCode(context.Region)
+	return sameProvince(location.Province, region)
+}
+
+const locationSearchPopulationMaxBoost = 0.03
+
+func locationSearchPopulationBoost(population int64) float64 {
+	if population <= 0 {
+		return 0
+	}
+	const populationCeiling = int64(10_000_000)
+	bounded := minInt64(population, populationCeiling)
+	return locationSearchPopulationMaxBoost * math.Log1p(float64(bounded)) / math.Log1p(float64(populationCeiling))
+}
+
+func locationSearchRankingScore(match locationSearchMatch) float64 {
+	return match.Score + locationSearchPopulationBoost(match.Target.Population)
+}
+
 func sortLocationSearchMatches(matches []locationSearchMatch) {
 	sort.SliceStable(matches, func(i, j int) bool {
-		if matches[i].Score != matches[j].Score {
-			return matches[i].Score > matches[j].Score
-		}
 		if matches[i].Exact != matches[j].Exact {
 			return matches[i].Exact
+		}
+		if matches[i].Target.CityPage != matches[j].Target.CityPage {
+			return matches[i].Target.CityPage
+		}
+		leftRank := locationSearchRankingScore(matches[i])
+		rightRank := locationSearchRankingScore(matches[j])
+		if leftRank != rightRank {
+			return leftRank > rightRank
+		}
+		if matches[i].Score != matches[j].Score {
+			return matches[i].Score > matches[j].Score
 		}
 		if left, right := searchSourcePriority(matches[i].Target.Location.Source), searchSourcePriority(matches[j].Target.Location.Source); left != right {
 			return left < right
 		}
 		return matches[i].Target.Key < matches[j].Target.Key
 	})
+}
+
+func minInt64(left int64, right int64) int64 {
+	if left < right {
+		return left
+	}
+	return right
 }
 
 func trimLocationSearchMatches(matches []locationSearchMatch, limit int) []locationSearchMatch {

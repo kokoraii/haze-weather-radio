@@ -5,6 +5,7 @@ on:
   pull_request:
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -165,15 +166,69 @@ jobs:
       - name: Test CGEN GPU and MSDF path
         run: cargo test -p haze-cgen --features gpu-wgpu --locked ${{ runner.os == 'Windows' && '--target x86_64-pc-windows-gnullvm' || '' }}
 
+  catalog_artifacts:
+    name: Resolve validated location catalogs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run_id: ${{ steps.catalog_run.outputs.run_id }}
+
+    steps:
+      - name: Find latest successful catalog run
+        id: catalog_run
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_id="$(
+            gh api --method GET \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/location-catalogs.yml/runs" \
+              -f branch="$DEFAULT_BRANCH" \
+              -f status=success \
+              -F per_page=1 \
+              --jq '.workflow_runs[0].id // empty'
+          )"
+          if [[ -z "$run_id" ]]; then
+            echo "::error::No successful Location Catalogs run was found on ${DEFAULT_BRANCH}. Run location-catalogs.yml before packaging a portable bundle."
+            exit 1
+          fi
+          artifacts="$(
+            gh api --method GET \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/artifacts" \
+              -F per_page=100
+          )"
+          for pack in global-core ca-weather us-weather; do
+            artifact_name="haze-location-${pack}-${run_id}"
+            if ! jq -e --arg name "$artifact_name" \
+              '.artifacts[] | select(.name == $name and (.expired | not))' \
+              <<< "$artifacts" >/dev/null; then
+              echo "::error::Validated catalog artifact ${artifact_name} is missing or expired. Run location-catalogs.yml before packaging a portable bundle."
+              exit 1
+            fi
+          done
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "Using validated location catalogs from workflow run $run_id."
+
   windows-bundle:
     name: Build Windows Bundle
     runs-on: windows-latest
-    needs: test
+    needs: [test, catalog_artifacts]
     timeout-minutes: 60
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install validated location catalogs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: haze-location-*-${{ needs.catalog_artifacts.outputs.run_id }}
+          path: bundle/managed/locations
+          merge-multiple: true
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.catalog_artifacts.outputs.run_id }}
 
       - name: Install MSYS2 CLANG64 dependencies
         uses: msys2/setup-msys2@v2
@@ -220,13 +275,22 @@ jobs:
         shell: pwsh
         run: ./scripts/build-haze.ps1 -Profile release -OutputDir dist/Haze_UAP-Windows-x86_64-Portable
 
-      - name: Verify synced bundle directories
+      - name: Verify synced bundle directories and location catalogs
         shell: pwsh
         run: |
           $bundle = "dist/Haze_UAP-Windows-x86_64-Portable"
           foreach ($dir in @("audio", "managed", "webroot")) {
             if (-not (Test-Path -LiteralPath (Join-Path $bundle $dir) -PathType Container)) {
               throw "Missing synced bundle directory: $dir"
+            }
+          }
+          $locations = Join-Path $bundle "managed\locations"
+          foreach ($pack in @("global-core", "ca-weather", "us-weather")) {
+            foreach ($suffix in @(".sqlite", ".sqlite.sha256", ".geometry.sqlite", ".geometry.sqlite.sha256", ".manifest.json")) {
+              $path = Join-Path $locations "$pack$suffix"
+              if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or (Get-Item -LiteralPath $path).Length -eq 0) {
+                throw "Missing bundled location catalog artifact: $path"
+              }
             }
           }
 
@@ -256,12 +320,21 @@ jobs:
   linux-bundle:
     name: Build Linux Bundle
     runs-on: ubuntu-latest
-    needs: test
+    needs: [test, catalog_artifacts]
     timeout-minutes: 60
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install validated location catalogs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: haze-location-*-${{ needs.catalog_artifacts.outputs.run_id }}
+          path: bundle/managed/locations
+          merge-multiple: true
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.catalog_artifacts.outputs.run_id }}
 
       - name: Install Linux build dependencies
         run: |
@@ -297,11 +370,19 @@ jobs:
       - name: Build Haze bundle
         run: bash scripts/build-haze.sh --profile release --output-dir dist/Haze_UAP-Linux-x86_64-Portable
 
-      - name: Verify synced bundle directories
+      - name: Verify synced bundle directories and location catalogs
         run: |
           bundle="dist/Haze_UAP-Linux-x86_64-Portable"
           for dir in audio managed webroot; do
             test -d "$bundle/$dir" || { echo "Missing synced bundle directory: $dir" >&2; exit 1; }
+          done
+          for pack in global-core ca-weather us-weather; do
+            for suffix in .sqlite .sqlite.sha256 .geometry.sqlite .geometry.sqlite.sha256 .manifest.json; do
+              test -s "$bundle/managed/locations/${pack}${suffix}" || {
+                echo "Missing bundled location catalog artifact: ${pack}${suffix}" >&2
+                exit 1
+              }
+            done
           done
 
       - name: Create portable tar.xz
@@ -318,12 +399,21 @@ jobs:
   freebsd-bundle:
     name: Build FreeBSD Bundle
     runs-on: ubuntu-latest
-    needs: test
+    needs: [test, catalog_artifacts]
     timeout-minutes: 75
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install validated location catalogs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: haze-location-*-${{ needs.catalog_artifacts.outputs.run_id }}
+          path: bundle/managed/locations
+          merge-multiple: true
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.catalog_artifacts.outputs.run_id }}
 
       - name: Build and test in FreeBSD
         uses: vmactions/freebsd-vm@v1
@@ -358,6 +448,23 @@ jobs:
             cargo test --workspace
             cargo test -p haze-cgen --features gpu-wgpu
             bash scripts/build-haze.sh --profile release
+
+      - name: Verify synced bundle directories and location catalogs
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle="dist/Haze_UAP-FreeBSD-x86_64-Portable"
+          for dir in audio managed webroot; do
+            test -d "$bundle/$dir" || { echo "Missing synced bundle directory: $dir" >&2; exit 1; }
+          done
+          for pack in global-core ca-weather us-weather; do
+            for suffix in .sqlite .sqlite.sha256 .geometry.sqlite .geometry.sqlite.sha256 .manifest.json; do
+              test -s "$bundle/managed/locations/${pack}${suffix}" || {
+                echo "Missing bundled location catalog artifact: ${pack}${suffix}" >&2
+                exit 1
+              }
+            done
+          done
 
       - name: Upload FreeBSD Haze bundle
         uses: actions/upload-artifact@v4

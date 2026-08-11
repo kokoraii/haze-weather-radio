@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -61,6 +63,80 @@ func TestSQLiteDSNAppliesStartupPragmas(t *testing.T) {
 	withExistingQuery := sqliteDSN("runtime/state/haze.db?cache=shared", time.Second)
 	if !strings.Contains(withExistingQuery, "?cache=shared&") {
 		t.Fatalf("existing query was not preserved: %q", withExistingQuery)
+	}
+}
+
+func TestSQLiteMigrateConcurrentCanonicalIDUpgrade(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "haze.db")
+	db, err := sql.Open("sqlite", sqliteDSN(path, 5*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`CREATE TABLE locations_locations (
+		source TEXT NOT NULL,
+		location_id TEXT NOT NULL,
+		kind TEXT NOT NULL DEFAULT 'unknown',
+		name_en TEXT,
+		name_fr TEXT,
+		station_id TEXT,
+		citypage_id TEXT,
+		clc TEXT,
+		latitude REAL,
+		longitude REAL,
+		metadata TEXT NOT NULL DEFAULT '{}',
+		first_seen TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+		last_seen TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+		PRIMARY KEY (source, location_id)
+	)`)
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	const workers = 8
+	start := make(chan struct{})
+	errors := make(chan error, workers)
+	var group sync.WaitGroup
+	group.Add(workers)
+	for range workers {
+		go func() {
+			defer group.Done()
+			<-start
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			store, err := OpenSQLite(ctx, SQLiteConfig{
+				Path:        path,
+				BusyTimeout: "5s",
+			}, ".")
+			if err == nil {
+				store.Close()
+			}
+			errors <- err
+		}()
+	}
+	close(start)
+	group.Wait()
+	close(errors)
+	for err := range errors {
+		if err != nil {
+			t.Fatalf("concurrent migration: %v", err)
+		}
+	}
+
+	store, err := OpenSQLite(context.Background(), SQLiteConfig{Path: path}, ".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	hasCanonicalID, err := store.hasLocationCanonicalID(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasCanonicalID {
+		t.Fatal("canonical_id column is missing after concurrent migration")
 	}
 }
 

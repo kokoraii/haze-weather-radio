@@ -3221,6 +3221,10 @@ function readableMapProperty(key) {
         nws_zone_codes: 'NWS zone', onset: 'Onset', provider_version: 'Dataset', same_code: 'SAME',
         same_codes: 'SAME codes', sender: 'Sender', sender_name: 'Sender name', severity: 'Severity', sgc_codes: 'SGC',
         source: 'Source', status: 'Status', urgency: 'Urgency', class: 'Class', disputed: 'Disputed', maritime: 'Maritime',
+        motion_description: 'Storm motion', reference_location_points: 'Reference locations',
+        storm_direction_degrees: 'Storm direction', storm_geometry_type: 'Storm geometry', storm_points: 'Storm points',
+        storm_position_description: 'Storm position', storm_speed: 'Storm speed', storm_time: 'Storm time',
+        threat_area: 'True threat area', threat_status: 'Threat status',
     };
     return labels[key] || key.replaceAll('_', ' ').replace(/^./, (letter) => letter.toUpperCase());
 }
@@ -3648,11 +3652,8 @@ function renderListen(feeds) {
                     </table>
                 </div>
             </section>
-            <section class="feed-card public-map-card">
+            <section class="feed-card public-map-card" aria-label="Map">
                 <div class="public-feed-map-heading public-map-toolbar">
-                    <div>
-                        <h3>Coverage Map</h3>
-                    </div>
                     <div class="public-map-toggles">
                         <label class="public-map-toggle">
                             <input type="checkbox" data-feed-border-toggle>

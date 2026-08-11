@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/meowraii/haze-weather-radio/services/go/internal/capmodel"
@@ -19,8 +20,15 @@ import (
 const (
 	publicFeedMapMaxAreas         = 5000
 	publicFeedMapMaxAlertFeatures = 2000
-	publicFeedMapBatchSize        = 100
-	publicFeedMapTimeout          = 20 * time.Second
+	// Request a small number of equally exact candidates so an installed
+	// lower-priority geometry pack can supply a polygon when the preferred core
+	// catalog's geometry sidecar is unavailable.
+	publicFeedMapCandidateLimit = 8
+	// Area responses can contain large exact WKB-derived polygons. Keep each
+	// broker response comfortably below the location client's bounded scanner.
+	publicFeedMapBatchSize          = 1
+	publicFeedMapResolveConcurrency = 16
+	publicFeedMapTimeout            = 20 * time.Second
 )
 
 type feedAreaKey struct {
@@ -48,6 +56,12 @@ type publicMapLocation struct {
 	NWSZoneCodes   []string `json:"nws_zone_codes,omitempty"`
 	Latitude       *float64 `json:"latitude"`
 	Longitude      *float64 `json:"longitude"`
+}
+
+type feedAreaResolveResult struct {
+	batchIndex int
+	response   locationclient.Response
+	err        error
 }
 
 func (s *Server) publicFeedMap(writer http.ResponseWriter, request *http.Request) {
@@ -244,34 +258,107 @@ func (s *Server) resolveFeedAreaFeatures(ctx context.Context, keys []feedAreaKey
 	if bridgeAddr == "" {
 		return nil, nil, "", nil, fmt.Errorf("location bridge is unavailable")
 	}
-	client := locationclient.New(bridgeAddr, "haze-web-public-feed-map")
-	client.Timeout = publicFeedMapTimeout
+	if len(keys) == 0 {
+		return []publicMapLocation{}, []map[string]any{}, "", []string{}, nil
+	}
+
+	batchCount := (len(keys) + publicFeedMapBatchSize - 1) / publicFeedMapBatchSize
+	workerCount := min(batchCount, publicFeedMapResolveConcurrency)
+	resolveContext, cancel := context.WithCancel(ctx)
+	defer cancel()
+	jobs := make(chan int)
+	results := make(chan feedAreaResolveResult, workerCount)
+	var workers sync.WaitGroup
+	for workerIndex := 0; workerIndex < workerCount; workerIndex++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for {
+				select {
+				case <-resolveContext.Done():
+					return
+				case batchIndex, ok := <-jobs:
+					if !ok {
+						return
+					}
+					start := batchIndex * publicFeedMapBatchSize
+					end := min(start+publicFeedMapBatchSize, len(keys))
+					release, err := s.acquireFeedMapResolveSlot(resolveContext)
+					response := locationclient.Response{}
+					if err == nil {
+						client := locationclient.New(bridgeAddr, "haze-web-public-feed-map")
+						client.Timeout = publicFeedMapTimeout
+						response, err = client.Query(resolveContext, feedAreaLocationRequest(keys[start:end]))
+						release()
+					}
+					select {
+					case results <- feedAreaResolveResult{batchIndex: batchIndex, response: response, err: err}:
+						if err != nil {
+							cancel()
+							return
+						}
+					case <-resolveContext.Done():
+						return
+					}
+				}
+			}
+		}()
+	}
+	go func() {
+		defer close(jobs)
+		for batchIndex := 0; batchIndex < batchCount; batchIndex++ {
+			select {
+			case jobs <- batchIndex:
+			case <-resolveContext.Done():
+				return
+			}
+		}
+	}()
+	go func() {
+		workers.Wait()
+		close(results)
+	}()
+
+	responses := make([]locationclient.Response, batchCount)
+	completed := make([]bool, batchCount)
+	var resolveErr error
+	for result := range results {
+		if result.err != nil {
+			if resolveErr == nil {
+				resolveErr = fmt.Errorf("resolve feed map location batch %d: %w", result.batchIndex, result.err)
+				cancel()
+			}
+			continue
+		}
+		responses[result.batchIndex] = result.response
+		completed[result.batchIndex] = true
+	}
+	if resolveErr != nil {
+		return nil, nil, "", nil, resolveErr
+	}
+	if err := resolveContext.Err(); err != nil {
+		return nil, nil, "", nil, err
+	}
+
 	locations := make([]publicMapLocation, 0, len(keys))
 	features := make([]map[string]any, 0, len(keys))
 	generation := ""
 	packs := []string{}
-	for start := 0; start < len(keys); start += publicFeedMapBatchSize {
-		end := start + publicFeedMapBatchSize
-		if end > len(keys) {
-			end = len(keys)
+	catalogIdentitySet := false
+	for batchIndex, response := range responses {
+		if !completed[batchIndex] {
+			return nil, nil, "", nil, fmt.Errorf("location map batch %d did not complete", batchIndex)
 		}
+		start := batchIndex * publicFeedMapBatchSize
+		end := min(start+publicFeedMapBatchSize, len(keys))
 		batchKeys := keys[start:end]
-		inputs := make([]locationclient.Input, 0, len(batchKeys))
-		for _, key := range batchKeys {
-			scheme, authority := "clc", "eccc"
-			if key.Source == "nws_same" {
-				scheme, authority = "same", "nws"
-			}
-			inputs = append(inputs, locationclient.Input{Kind: "identifier", Scheme: scheme, Authority: authority, Value: key.Code})
+		if !catalogIdentitySet {
+			generation = response.CatalogGeneration
+			packs = append([]string(nil), response.CatalogPacks...)
+			catalogIdentitySet = true
+		} else if generation != response.CatalogGeneration || !sameCatalogPacks(packs, response.CatalogPacks) {
+			return nil, nil, "", nil, fmt.Errorf("location catalog changed while the feed map was being resolved")
 		}
-		response, err := client.Query(ctx, locationclient.Request{
-			APIVersion: locationclient.APIVersion, Operation: "batch_resolve", Inputs: inputs,
-			Filters: locationclient.Filters{}, Options: locationclient.Options{Limit: 10, MinimumConfidence: "exact", IncludeInactive: true},
-		})
-		if err != nil {
-			return nil, nil, "", nil, err
-		}
-		generation, packs = response.CatalogGeneration, response.CatalogPacks
 		for _, batch := range response.Batches {
 			if batch.InputIndex < 0 || batch.InputIndex >= len(batchKeys) || len(batch.Results) == 0 {
 				continue
@@ -327,6 +414,54 @@ func (s *Server) resolveFeedAreaFeatures(ctx context.Context, keys []feedAreaKey
 		return locations[i].Name < locations[j].Name
 	})
 	return locations, features, generation, packs, nil
+}
+
+func (s *Server) acquireFeedMapResolveSlot(ctx context.Context) (func(), error) {
+	if s == nil || s.feedMapResolveSlots == nil {
+		return func() {}, nil
+	}
+	select {
+	case s.feedMapResolveSlots <- struct{}{}:
+		return func() { <-s.feedMapResolveSlots }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func feedAreaLocationRequest(keys []feedAreaKey) locationclient.Request {
+	inputs := make([]locationclient.Input, 0, len(keys))
+	for _, key := range keys {
+		scheme, authority := "clc", "eccc"
+		if key.Source == "nws_same" {
+			scheme, authority = "same", "nws"
+		}
+		inputs = append(inputs, locationclient.Input{Kind: "identifier", Scheme: scheme, Authority: authority, Value: key.Code})
+	}
+	return locationclient.Request{
+		APIVersion: locationclient.APIVersion, Operation: "batch_resolve", Inputs: inputs,
+		Filters: locationclient.Filters{}, Options: locationclient.Options{
+			Limit: publicFeedMapCandidateLimit, MinimumConfidence: "exact", IncludeInactive: true, IncludeAreaGeometry: true,
+		},
+	}
+}
+
+func sameCatalogPacks(left []string, right []string) bool {
+	normalize := func(values []string) []string {
+		seen := map[string]struct{}{}
+		for _, value := range values {
+			value = strings.TrimSpace(value)
+			if value != "" {
+				seen[value] = struct{}{}
+			}
+		}
+		out := make([]string, 0, len(seen))
+		for value := range seen {
+			out = append(out, value)
+		}
+		sort.Strings(out)
+		return out
+	}
+	return reflect.DeepEqual(normalize(left), normalize(right))
 }
 
 func publicMapLocationCodes(entity locationclient.Entity, fallbackSame string) (string, []string, []string, []string, []string, []string) {
@@ -406,6 +541,9 @@ func (s *Server) activeMapAlertFeatures(ctx context.Context, bounds publicMapBou
 		}
 		for _, info := range record.Alert.Infos {
 			for _, area := range info.Areas {
+				if capmodel.IsECCCThreatArea(area) {
+					continue
+				}
 				if alertAreaHasExplicitGeometry(area) {
 					continue
 				}
@@ -466,7 +604,21 @@ recordsLoop:
 			continue
 		}
 		for infoIndex, info := range record.Alert.Infos {
+			hasThreatAreas := false
+			for _, area := range info.Areas {
+				if capmodel.IsECCCThreatArea(area) {
+					hasThreatAreas = true
+					break
+				}
+			}
 			for areaIndex, area := range info.Areas {
+				threatArea := capmodel.IsECCCThreatArea(area)
+				if hasThreatAreas && !threatArea {
+					continue
+				}
+				if threatArea && !capmodel.IsECCCActiveThreatArea(area) {
+					continue
+				}
 				base := map[string]any{
 					"alert_id": record.ID, "event": info.Event, "headline": info.Headline,
 					"severity": strings.ToLower(info.Severity), "urgency": info.Urgency, "certainty": info.Certainty,
@@ -474,6 +626,11 @@ recordsLoop:
 					"sender_name": info.SenderName, "effective": info.Effective, "onset": info.Onset, "expires": info.Expires,
 					"area_description": area.Description, "category": strings.Join(info.Category, ", "), "response": strings.Join(info.Response, ", "),
 				}
+				if threatArea {
+					base["threat_area"] = true
+					base["threat_status"] = capmodel.ECCCThreatAreaStatus(area)
+				}
+				appendStormMapProperties(base, info.Storm)
 				explicit := false
 				for polygonIndex, raw := range area.Polygons {
 					geometry, ok := capPolygonGeometry(raw)
@@ -488,6 +645,9 @@ recordsLoop:
 					seen[id] = struct{}{}
 					properties := cloneAnyMap(base)
 					properties["geometry_method"] = "cap_polygon"
+					if threatArea {
+						properties["geometry_method"] = "cap_threat_polygon"
+					}
 					if geoJSONGeometryIntersectsBounds(geometry, bounds) && !appendFeature(map[string]any{"type": "Feature", "id": id, "geometry": geometry, "properties": properties}) {
 						break recordsLoop
 					}
@@ -505,11 +665,17 @@ recordsLoop:
 					seen[id] = struct{}{}
 					properties := cloneAnyMap(base)
 					properties["geometry_method"] = "cap_circle"
+					if threatArea {
+						properties["geometry_method"] = "cap_threat_circle"
+					}
 					if geoJSONGeometryIntersectsBounds(geometry, bounds) && !appendFeature(map[string]any{"type": "Feature", "id": id, "geometry": geometry, "properties": properties}) {
 						break recordsLoop
 					}
 				}
 				if explicit {
+					continue
+				}
+				if hasThreatAreas {
 					continue
 				}
 				for _, key := range alertAreaKeys(area, clcNames, nwsNames) {
@@ -656,6 +822,40 @@ func cloneAnyMap(input map[string]any) map[string]any {
 		out[key] = value
 	}
 	return out
+}
+
+func appendStormMapProperties(properties map[string]any, storm *capmodel.StormInfo) {
+	if properties == nil || storm == nil {
+		return
+	}
+	if value := strings.TrimSpace(storm.Speed); value != "" {
+		properties["storm_speed"] = value
+	}
+	if storm.DirectionDegrees != nil {
+		properties["storm_direction_degrees"] = *storm.DirectionDegrees
+	}
+	if value := strings.TrimSpace(storm.GeometryType); value != "" {
+		properties["storm_geometry_type"] = value
+	}
+	if len(storm.Points) > 0 {
+		points := make([]string, 0, len(storm.Points))
+		for _, point := range storm.Points {
+			points = append(points, strconv.FormatFloat(point.Latitude, 'f', -1, 64)+","+strconv.FormatFloat(point.Longitude, 'f', -1, 64))
+		}
+		properties["storm_points"] = strings.Join(points, " ")
+	}
+	if value := strings.TrimSpace(storm.Time); value != "" {
+		properties["storm_time"] = value
+	}
+	if value := strings.TrimSpace(storm.MotionDescription); value != "" {
+		properties["motion_description"] = value
+	}
+	if value := strings.TrimSpace(storm.PositionDescription); value != "" {
+		properties["storm_position_description"] = value
+	}
+	if value := strings.TrimSpace(storm.ReferenceLocationPoints); value != "" {
+		properties["reference_location_points"] = value
+	}
 }
 
 func capPolygonGeometry(raw string) (map[string]any, bool) {

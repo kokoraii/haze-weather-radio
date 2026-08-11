@@ -20,6 +20,7 @@ type Packet struct {
 	Content      Content        `json:"content,omitempty"`
 	Timing       Timing         `json:"timing,omitempty"`
 	Areas        Areas          `json:"areas,omitempty"`
+	Storm        *StormInfo     `json:"storm,omitempty"`
 	SAME         *SAME          `json:"same,omitempty"`
 	Audio        *Audio         `json:"audio,omitempty"`
 	Options      Options        `json:"options,omitempty"`
@@ -53,9 +54,40 @@ type Timing struct {
 
 // Areas contains resolved names and raw location codes targeted by the alert.
 type Areas struct {
-	Names     []string            `json:"names,omitempty"`
-	Codes     []string            `json:"codes,omitempty"`
-	Locations []LocationReference `json:"locations,omitempty"`
+	Names       []string            `json:"names,omitempty"`
+	Codes       []string            `json:"codes,omitempty"`
+	Locations   []LocationReference `json:"locations,omitempty"`
+	ThreatAreas []ThreatArea        `json:"threat_areas,omitempty"`
+}
+
+// ThreatArea is an additive free-form hazard geometry. Zone identifiers remain
+// authoritative for relay and SAME decisions.
+type ThreatArea struct {
+	Status         string   `json:"status"`
+	Description    string   `json:"description,omitempty"`
+	Polygons       []string `json:"polygons,omitempty"`
+	CAPCPLocations []string `json:"cap_cp_locations,omitempty"`
+}
+
+// StormInfo carries ECCC storm-specific facts without replacing the original
+// CAP parameters retained in the archived XML.
+type StormInfo struct {
+	Speed                   string     `json:"speed,omitempty"`
+	SpeedValue              *float64   `json:"speed_value,omitempty"`
+	SpeedUnit               string     `json:"speed_unit,omitempty"`
+	DirectionDegrees        *float64   `json:"direction_degrees,omitempty"`
+	GeometryType            string     `json:"geometry_type,omitempty"`
+	Points                  []GeoPoint `json:"points,omitempty"`
+	Time                    string     `json:"time,omitempty"`
+	MotionDescription       string     `json:"motion_description,omitempty"`
+	PositionDescription     string     `json:"position_description,omitempty"`
+	ReferenceLocationPoints string     `json:"reference_location_points,omitempty"`
+}
+
+// GeoPoint is a CAP latitude/longitude coordinate.
+type GeoPoint struct {
+	Latitude  float64 `json:"latitude"`
+	Longitude float64 `json:"longitude"`
 }
 
 // LocationReference keeps an alert's raw targeting identifier beside the
@@ -151,6 +183,16 @@ func (p Packet) Normalize() Packet {
 	p.Areas.Names = uniqueClean(p.Areas.Names)
 	p.Areas.Codes = uniqueClean(p.Areas.Codes)
 	p.Areas.Locations = normalizeLocationReferences(p.Areas.Locations)
+	p.Areas.ThreatAreas = normalizeThreatAreas(p.Areas.ThreatAreas)
+	if p.Storm != nil {
+		p.Storm.Speed = clean(p.Storm.Speed)
+		p.Storm.SpeedUnit = strings.ToLower(clean(p.Storm.SpeedUnit))
+		p.Storm.GeometryType = strings.ToLower(clean(p.Storm.GeometryType))
+		p.Storm.Time = clean(p.Storm.Time)
+		p.Storm.MotionDescription = clean(p.Storm.MotionDescription)
+		p.Storm.PositionDescription = clean(p.Storm.PositionDescription)
+		p.Storm.ReferenceLocationPoints = clean(p.Storm.ReferenceLocationPoints)
+	}
 	if p.SAME != nil {
 		p.SAME.Locations = uniqueClean(p.SAME.Locations)
 	}
@@ -222,6 +264,8 @@ func LegacyFromMap(data map[string]any) Packet {
 		packet.Areas.Codes = codes
 	}
 	packet.Areas.Locations = locationReferences(firstValue(data, "canonical_locations"))
+	packet.Areas.ThreatAreas = threatAreas(firstValue(data, "threat_areas"))
+	packet.Storm = stormInfo(firstValue(data, "storm", "storm_characteristics"))
 	if hasSAMEFields(data) {
 		packet.SAME = &SAME{
 			Include:          boolValueDefault(firstValue(data, "include_same"), true),
@@ -301,6 +345,12 @@ func LegacyFields(packet Packet) map[string]any {
 	}
 	if len(packet.Areas.Locations) > 0 {
 		out["canonical_locations"] = packet.Areas.Locations
+	}
+	if len(packet.Areas.ThreatAreas) > 0 {
+		out["threat_areas"] = packet.Areas.ThreatAreas
+	}
+	if packet.Storm != nil {
+		out["storm"] = packet.Storm
 	}
 	if packet.Presentation.SpeechText != "" {
 		out["alert_text"] = packet.Presentation.SpeechText
@@ -504,6 +554,66 @@ func locationReferences(value any) []LocationReference {
 		return nil
 	}
 	return normalizeLocationReferences(references)
+}
+
+func threatAreas(value any) []ThreatArea {
+	if value == nil {
+		return nil
+	}
+	if typed, ok := value.([]ThreatArea); ok {
+		return normalizeThreatAreas(typed)
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return nil
+	}
+	var areas []ThreatArea
+	if err := json.Unmarshal(raw, &areas); err != nil {
+		return nil
+	}
+	return normalizeThreatAreas(areas)
+}
+
+func normalizeThreatAreas(values []ThreatArea) []ThreatArea {
+	out := make([]ThreatArea, 0, len(values))
+	seen := map[string]struct{}{}
+	for _, area := range values {
+		area.Status = strings.ToLower(clean(area.Status))
+		area.Description = clean(area.Description)
+		area.Polygons = uniqueClean(area.Polygons)
+		area.CAPCPLocations = uniqueClean(area.CAPCPLocations)
+		if area.Status == "" || len(area.Polygons) == 0 {
+			continue
+		}
+		key := area.Status + "\x00" + strings.Join(area.Polygons, "\x00")
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, area)
+	}
+	return out
+}
+
+func stormInfo(value any) *StormInfo {
+	if value == nil {
+		return nil
+	}
+	if typed, ok := value.(*StormInfo); ok {
+		return typed
+	}
+	if typed, ok := value.(StormInfo); ok {
+		return &typed
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return nil
+	}
+	var storm StormInfo
+	if err := json.Unmarshal(raw, &storm); err != nil {
+		return nil
+	}
+	return &storm
 }
 
 func normalizeLocationReferences(values []LocationReference) []LocationReference {

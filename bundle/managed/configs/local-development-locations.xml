@@ -5,6 +5,10 @@
     <pack id="ca-weather" path="managed/locations/ca-weather.sqlite" priority="250" enabled="true" required="false" />
     <pack id="us-weather" path="managed/locations/us-weather.sqlite" priority="250" enabled="true" required="false" />
     <legacy id="legacy-alert-locations" path="managed/alert_location_map.sqlite" priority="10" enabled="true" required="false" format="legacy" />
+    <geometry id="global-core-geometry" path="managed/locations/global-core.geometry.sqlite" core="global-core" priority="300" enabled="true" required="false" />
+    <geometry id="ca-weather-geometry" path="managed/locations/ca-weather.geometry.sqlite" core="ca-weather" priority="250" enabled="true" required="false" />
+    <geometry id="us-weather-geometry" path="managed/locations/us-weather.geometry.sqlite" core="us-weather" priority="250" enabled="true" required="false" />
+    <geometry id="legacy-weather-geometry" path="managed/locations/legacy-weather-geometry.sqlite" core="legacy-alert-locations" priority="10" enabled="true" required="false" format="legacy" />
   </catalogs>
   <overlay path="runtime/state/location-overlay.sqlite">
     <source id="haze-data-ingest" />

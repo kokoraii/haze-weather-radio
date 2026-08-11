@@ -371,7 +371,10 @@ function renderGlobalSecurity() {
 	setValue('accountsGlobalSessionTTL', durationLabel(globalSecurity.session_ttl_seconds));
 	setValue('accountsGlobalPersistentTTL', durationLabel(globalSecurity.persistent_session_ttl_seconds));
 	setValue('accountsGlobalIdleTTL', durationLabel(globalSecurity.idle_timeout_seconds));
-	setValue('accountsGlobalLoginLimit', `${globalSecurity.login_rate_limit || 5} in ${durationLabel(globalSecurity.login_rate_window_seconds || 900)}`);
+	const loginWindow = durationLabel(globalSecurity.login_rate_window_seconds || 120);
+	const lockDuration = durationLabel(globalSecurity.account_lock_duration_seconds || 120);
+	const adminPolicy = globalSecurity.administrator_lock_exempt ? '; administrators exempt' : '';
+	setValue('accountsGlobalLoginLimit', `${globalSecurity.login_rate_limit || 5} in ${loginWindow}; ${lockDuration} lock${adminPolicy}`);
 	setValue('accountsGlobalOriginationRate', `${globalSecurity.origination_rate_per_second || 2} requests per second`);
 	setValue('accountsGlobalCIDRs', (globalSecurity.login_cidr_allowlist || []).join('\n') || 'Any source, then apply each account allowlist');
 }

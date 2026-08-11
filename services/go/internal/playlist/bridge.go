@@ -61,6 +61,7 @@ type renderedSegment struct {
 
 type synthJob struct {
 	ID               string
+	VoiceRouteKey    string
 	Text             string
 	ReaderID         string
 	Language         string
@@ -175,8 +176,13 @@ func (c *bridgeClient) Synthesize(ctx context.Context, job synthJob) (string, er
 		}
 	}
 	priority := normalizeSynthesisPriority(job.Priority)
+	voiceRouteKey := strings.TrimSpace(job.VoiceRouteKey)
+	if voiceRouteKey == "" {
+		voiceRouteKey = job.ID
+	}
 	data := map[string]any{
 		"job_id":             job.ID,
+		"voice_route_key":    voiceRouteKey,
 		"text":               job.Text,
 		"reader_id":          job.ReaderID,
 		"language":           job.Language,

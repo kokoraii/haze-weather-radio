@@ -2,6 +2,7 @@
 
 use std::f64::consts::PI;
 
+use serde_json::{json, Value};
 use thiserror::Error;
 
 const EARTH_RADIUS_M: f64 = 6_371_008.8;
@@ -14,6 +15,16 @@ pub enum GeometryError {
     Unsupported(u32),
     #[error("invalid WKB byte order")]
     ByteOrder,
+    #[error("WKB geometry has trailing bytes")]
+    Trailing,
+    #[error("WKB geometry contains a non-finite coordinate")]
+    NonFinite,
+    #[error("WKB coordinate is outside WGS84 bounds")]
+    CoordinateBounds,
+    #[error("WKB polygon ring is invalid")]
+    InvalidRing,
+    #[error("WKB multipolygon contains a non-polygon member")]
+    InvalidMultiPolygonMember,
 }
 
 #[must_use]
@@ -53,6 +64,102 @@ pub fn bounding_box(latitude: f64, longitude: f64, radius_km: f64) -> [f64; 4] {
 pub fn contains_wkb(bytes: &[u8], longitude: f64, latitude: f64) -> Result<bool, GeometryError> {
     let mut cursor = Cursor::new(bytes);
     contains_geometry(&mut cursor, longitude, latitude)
+}
+
+pub fn wkb_to_geojson(bytes: &[u8]) -> Result<Value, GeometryError> {
+    let mut cursor = Cursor::new(bytes);
+    let geometry = decode_geometry(&mut cursor)?;
+    if cursor.remaining() != 0 {
+        return Err(GeometryError::Trailing);
+    }
+    Ok(geometry)
+}
+
+fn decode_geometry(cursor: &mut Cursor<'_>) -> Result<Value, GeometryError> {
+    let little_endian = match cursor.read_u8()? {
+        0 => false,
+        1 => true,
+        _ => return Err(GeometryError::ByteOrder),
+    };
+    let raw_type = cursor.read_u32(little_endian)?;
+    match raw_type & 0x0000_00ff {
+        1 => {
+            let coordinate = read_coordinate(cursor, little_endian)?;
+            Ok(json!({"type": "Point", "coordinates": coordinate}))
+        }
+        3 => {
+            let coordinates = decode_polygon(cursor, little_endian)?;
+            Ok(json!({"type": "Polygon", "coordinates": coordinates}))
+        }
+        6 => {
+            let count = cursor.read_u32(little_endian)? as usize;
+            if count > cursor.remaining() / 9 {
+                return Err(GeometryError::Truncated);
+            }
+            let mut coordinates = Vec::with_capacity(count);
+            for _ in 0..count {
+                let member = decode_geometry(cursor)?;
+                if member.get("type").and_then(Value::as_str) != Some("Polygon") {
+                    return Err(GeometryError::InvalidMultiPolygonMember);
+                }
+                coordinates.push(
+                    member
+                        .get("coordinates")
+                        .cloned()
+                        .ok_or(GeometryError::InvalidMultiPolygonMember)?,
+                );
+            }
+            Ok(json!({"type": "MultiPolygon", "coordinates": coordinates}))
+        }
+        other => Err(GeometryError::Unsupported(other)),
+    }
+}
+
+fn decode_polygon(
+    cursor: &mut Cursor<'_>,
+    little_endian: bool,
+) -> Result<Vec<Vec<[f64; 2]>>, GeometryError> {
+    let ring_count = cursor.read_u32(little_endian)? as usize;
+    if ring_count > cursor.remaining() / 4 {
+        return Err(GeometryError::Truncated);
+    }
+    let mut rings = Vec::with_capacity(ring_count);
+    for _ in 0..ring_count {
+        let point_count = cursor.read_u32(little_endian)? as usize;
+        if point_count < 4 {
+            return Err(GeometryError::InvalidRing);
+        }
+        if point_count > cursor.remaining() / 16 {
+            return Err(GeometryError::Truncated);
+        }
+        let mut points = Vec::with_capacity(point_count);
+        for _ in 0..point_count {
+            points.push(read_coordinate(cursor, little_endian)?);
+        }
+        if points.first() != points.last() {
+            return Err(GeometryError::InvalidRing);
+        }
+        rings.push(points);
+    }
+    if rings.is_empty() {
+        return Err(GeometryError::InvalidRing);
+    }
+    Ok(rings)
+}
+
+fn read_coordinate(
+    cursor: &mut Cursor<'_>,
+    little_endian: bool,
+) -> Result<[f64; 2], GeometryError> {
+    let longitude = cursor.read_f64(little_endian)?;
+    let latitude = cursor.read_f64(little_endian)?;
+    if !longitude.is_finite() || !latitude.is_finite() {
+        return Err(GeometryError::NonFinite);
+    }
+    if !(-180.0..=180.0).contains(&longitude) || !(-90.0..=90.0).contains(&latitude) {
+        return Err(GeometryError::CoordinateBounds);
+    }
+    Ok([longitude, latitude])
 }
 
 fn contains_geometry(
@@ -181,10 +288,16 @@ impl<'a> Cursor<'a> {
         self.position = end;
         bytes.try_into().map_err(|_| GeometryError::Truncated)
     }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.position)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
 
     #[test]
@@ -195,5 +308,91 @@ mod tests {
     #[test]
     fn distance_is_zero_for_identical_points() {
         assert_eq!(haversine_m(52.1, -106.6, 52.1, -106.6), 0.0);
+    }
+
+    #[test]
+    fn decodes_polygon_and_multipolygon_wkb() {
+        let polygon = polygon_wkb(true);
+        let decoded = wkb_to_geojson(&polygon).expect("polygon");
+        assert_eq!(decoded["type"], "Polygon");
+        assert_eq!(decoded["coordinates"][0][1], json!([-106.0, 52.0]));
+
+        let mut multipolygon = Vec::new();
+        multipolygon.push(1);
+        multipolygon.extend_from_slice(&6_u32.to_le_bytes());
+        multipolygon.extend_from_slice(&1_u32.to_le_bytes());
+        multipolygon.extend_from_slice(&polygon);
+        let decoded = wkb_to_geojson(&multipolygon).expect("multipolygon");
+        assert_eq!(decoded["type"], "MultiPolygon");
+        assert_eq!(decoded["coordinates"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn decodes_big_endian_point_wkb() {
+        let mut bytes = vec![0];
+        bytes.extend_from_slice(&1_u32.to_be_bytes());
+        bytes.extend_from_slice(&(-106.67_f64).to_be_bytes());
+        bytes.extend_from_slice(&(52.13_f64).to_be_bytes());
+        let decoded = wkb_to_geojson(&bytes).expect("point");
+        assert_eq!(
+            decoded,
+            json!({"type": "Point", "coordinates": [-106.67, 52.13]})
+        );
+    }
+
+    #[test]
+    fn rejects_trailing_truncated_and_invalid_wkb() {
+        let mut trailing = polygon_wkb(true);
+        trailing.push(0);
+        assert!(matches!(
+            wkb_to_geojson(&trailing),
+            Err(GeometryError::Trailing)
+        ));
+        assert!(matches!(
+            wkb_to_geojson(&polygon_wkb(true)[..8]),
+            Err(GeometryError::Truncated)
+        ));
+
+        let mut point = vec![1];
+        point.extend_from_slice(&1_u32.to_le_bytes());
+        point.extend_from_slice(&f64::NAN.to_le_bytes());
+        point.extend_from_slice(&0_f64.to_le_bytes());
+        assert!(matches!(
+            wkb_to_geojson(&point),
+            Err(GeometryError::NonFinite)
+        ));
+    }
+
+    fn polygon_wkb(little_endian: bool) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.push(u8::from(little_endian));
+        if little_endian {
+            bytes.extend_from_slice(&3_u32.to_le_bytes());
+            bytes.extend_from_slice(&1_u32.to_le_bytes());
+            bytes.extend_from_slice(&4_u32.to_le_bytes());
+        } else {
+            bytes.extend_from_slice(&3_u32.to_be_bytes());
+            bytes.extend_from_slice(&1_u32.to_be_bytes());
+            bytes.extend_from_slice(&4_u32.to_be_bytes());
+        }
+        for (longitude, latitude) in [
+            (-107.0_f64, 52.0_f64),
+            (-106.0, 52.0),
+            (-106.0, 53.0),
+            (-107.0, 52.0),
+        ] {
+            if little_endian {
+                bytes
+                    .write_all(&longitude.to_le_bytes())
+                    .expect("longitude");
+                bytes.write_all(&latitude.to_le_bytes()).expect("latitude");
+            } else {
+                bytes
+                    .write_all(&longitude.to_be_bytes())
+                    .expect("longitude");
+                bytes.write_all(&latitude.to_be_bytes()).expect("latitude");
+            }
+        }
+        bytes
     }
 }

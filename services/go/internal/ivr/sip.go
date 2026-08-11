@@ -18,19 +18,22 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/pion/rtp"
 )
 
 const (
-	sipPayloadPCMU         = 0
-	sipPayloadG722         = 9
-	sipDefaultDTMFPayload  = 101
-	sipTelephoneEventClock = 8000
-	sipPCMUSampleRate      = 8000
-	sipG722SampleRate      = 16000
-	sipPacketSamples       = 160
-	sipG722FrameSamples    = sipG722SampleRate / 50
+	sipPayloadPCMU                = 0
+	sipPayloadG722                = 9
+	sipDefaultDTMFPayload         = 101
+	sipTelephoneEventClock        = 8000
+	sipPCMUSampleRate             = 8000
+	sipG722SampleRate             = 16000
+	sipPacketSamples              = 160
+	sipG722FrameSamples           = sipG722SampleRate / 50
+	sipTrustedSourceLookupTimeout = 3 * time.Second
+	sipTrustedSourceRefreshEvery  = 5 * time.Minute
 )
 
 type sipAudioCodec int
@@ -70,10 +73,14 @@ type sipRegistrar struct {
 }
 
 type sipServerState struct {
-	calls        map[string]*sipCall
-	challenges   map[string]time.Time
-	callsMu      sync.Mutex
-	challengesMu sync.Mutex
+	calls                     map[string]*sipCall
+	inviteReplies             map[string]string
+	challenges                map[string]time.Time
+	trustedSources            atomic.Value // map[string]struct{}, refreshed from the registration server DNS name.
+	trustedSourceLookup       func(context.Context, string) ([]net.IPAddr, error)
+	trustedSourceRefreshEvery time.Duration
+	callsMu                   sync.Mutex
+	challengesMu              sync.Mutex
 }
 
 type sipMediaOffer struct {
@@ -89,33 +96,34 @@ type sipMediaOffer struct {
 }
 
 type sipCall struct {
-	service       *Service
-	line          extensionConfig
-	directFeedID  string
-	ctx           context.Context
-	cancel        context.CancelFunc
-	callID        string
-	localTag      string
-	sipConn       *net.UDPConn
-	sipRemote     *net.UDPAddr
-	sipHeaders    map[string]string
-	sipRequestURI string
-	rtpConn       *net.UDPConn
-	remoteRTP     *net.UDPAddr
-	audioCodec    sipAudioCodec
-	audioPayload  int
-	dtmfPayload   int
-	digits        chan string
-	audioFrames   chan pcmFrame
-	captureActive atomic.Bool
-	done          chan struct{}
-	sendMu        sync.Mutex
-	byeOnce       sync.Once
-	seq           uint16
-	timestamp     uint32
-	ssrc          uint32
-	sentRTPLog    bool
-	recvRTPLog    bool
+	service        *Service
+	line           extensionConfig
+	directFeedID   string
+	callerProvince string
+	ctx            context.Context
+	cancel         context.CancelFunc
+	callID         string
+	localTag       string
+	sipConn        *net.UDPConn
+	sipRemote      *net.UDPAddr
+	sipHeaders     map[string]string
+	sipRequestURI  string
+	rtpConn        *net.UDPConn
+	remoteRTP      *net.UDPAddr
+	audioCodec     sipAudioCodec
+	audioPayload   int
+	dtmfPayload    int
+	digits         chan string
+	audioFrames    chan pcmFrame
+	captureActive  atomic.Bool
+	done           chan struct{}
+	sendMu         sync.Mutex
+	byeOnce        sync.Once
+	seq            uint16
+	timestamp      uint32
+	ssrc           uint32
+	sentRTPLog     bool
+	recvRTPLog     bool
 }
 
 type sipDirectFeedTarget struct {
@@ -124,12 +132,23 @@ type sipDirectFeedTarget struct {
 	Enabled bool
 }
 
+type sipLineSelection struct {
+	Line          extensionConfig
+	Matched       bool
+	CalledAddress string
+}
+
 func (s *Service) runSIP(ctx context.Context) error {
 	bindings := s.cfg.IVR.SIP.listenBindings()
 	if len(bindings) == 0 {
 		return fmt.Errorf("no SIP listen bindings configured")
 	}
-	state := &sipServerState{calls: map[string]*sipCall{}, challenges: map[string]time.Time{}}
+	state := &sipServerState{calls: map[string]*sipCall{}, inviteReplies: map[string]string{}, challenges: map[string]time.Time{}}
+	state.trustedSources.Store(map[string]struct{}{})
+	if s.cfg.IVR.SIP.Registration.Enabled && s.cfg.IVR.SIP.Registration.RestrictSourcesToServer {
+		s.refreshSIPTrustedSources(ctx, state)
+		go s.runSIPTrustedSourceRefresh(ctx, state)
+	}
 	errCh := make(chan error, len(bindings))
 	conns := make([]*net.UDPConn, 0, len(bindings))
 	for index, binding := range bindings {
@@ -184,6 +203,83 @@ func (s *Service) runSIP(ctx context.Context) error {
 	}
 }
 
+// refreshSIPTrustedSources resolves the configured registration server and
+// atomically replaces the dynamic source set only after a complete, nonempty
+// result. A failed lookup intentionally retains the previous set, and an
+// initially empty set remains fail-closed when source restriction is enabled.
+func (s *Service) refreshSIPTrustedSources(parent context.Context, state *sipServerState) {
+	if s == nil || state == nil {
+		return
+	}
+	host := strings.Trim(strings.TrimSpace(sipHostOnly(s.cfg.IVR.SIP.Registration.Server)), "[]")
+	if host == "" {
+		log.Printf("IVR SIP trusted source refresh skipped: registration server is not configured")
+		return
+	}
+
+	trusted := make(map[string]struct{})
+	if ip := net.ParseIP(host); ip != nil {
+		if key := sipTrustedSourceKey(ip); key != "" {
+			trusted[key] = struct{}{}
+		}
+	} else {
+		if parent == nil {
+			parent = context.Background()
+		}
+		lookupContext, cancel := context.WithTimeout(parent, sipTrustedSourceLookupTimeout)
+		defer cancel()
+		lookup := state.trustedSourceLookup
+		if lookup == nil {
+			lookup = net.DefaultResolver.LookupIPAddr
+		}
+		addresses, err := lookup(lookupContext, host)
+		if err != nil {
+			log.Printf("IVR SIP trusted source refresh failed for registration server %q: %v", host, err)
+			return
+		}
+		for _, address := range addresses {
+			if key := sipTrustedSourceKey(address.IP); key != "" {
+				trusted[key] = struct{}{}
+			}
+		}
+	}
+	if len(trusted) == 0 {
+		log.Printf("IVR SIP trusted source refresh returned no usable addresses for registration server %q", host)
+		return
+	}
+	state.trustedSources.Store(trusted)
+	s.sipDebugf("trusted SIP source refresh server=%s addresses=%d", host, len(trusted))
+}
+
+// runSIPTrustedSourceRefresh keeps the registration-server source set current
+// without blocking SIP listeners. The caller's context owns its lifetime.
+func (s *Service) runSIPTrustedSourceRefresh(ctx context.Context, state *sipServerState) {
+	if s == nil || state == nil || ctx == nil {
+		return
+	}
+	interval := state.trustedSourceRefreshEvery
+	if interval <= 0 {
+		interval = sipTrustedSourceRefreshEvery
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.refreshSIPTrustedSources(ctx, state)
+		}
+	}
+}
+
+func sipTrustedSourceKey(ip net.IP) string {
+	if ip == nil || ip.IsUnspecified() {
+		return ""
+	}
+	return ip.String()
+}
+
 func (s *Service) runSIPListener(ctx context.Context, binding sipListenBinding, conn *net.UDPConn, state *sipServerState, registrar *sipRegistrar) error {
 	defer conn.Close()
 	buffer := make([]byte, 16384)
@@ -207,7 +303,7 @@ func (s *Service) runSIPListener(ctx context.Context, binding sipListenBinding, 
 			continue
 		}
 		callID := sipHeader(request.Headers, "call-id")
-		if !s.sipSourceAllowed(remote) {
+		if !s.sipSourceAllowedWithTrustedSources(remote, state) {
 			_, _ = conn.WriteToUDP([]byte(sipReply("403 Forbidden", request.Headers, "Warning: 399 haze \"SIP source is not allowed\"\r\n")), remote)
 			continue
 		}
@@ -230,11 +326,18 @@ func (s *Service) runSIPListener(ctx context.Context, binding sipListenBinding, 
 				_, _ = conn.WriteToUDP([]byte(sipReply(status, request.Headers, extra)), remote)
 				continue
 			}
-			state.callsMu.Lock()
-			activeCalls := len(state.calls)
-			if state.calls[callID] != nil {
-				activeCalls--
+			if _, err := conn.WriteToUDP([]byte(sipReply("100 Trying", request.Headers, "")), remote); err != nil {
+				log.Printf("IVR SIP failed to acknowledge INVITE %s from %s: %v", callID, remote, err)
 			}
+			state.callsMu.Lock()
+			if reply := state.inviteReplies[callID]; reply != "" {
+				state.callsMu.Unlock()
+				if _, err := conn.WriteToUDP([]byte(reply), remote); err != nil {
+					log.Printf("IVR SIP failed to resend INVITE response for %s to %s: %v", callID, remote, err)
+				}
+				continue
+			}
+			activeCalls := len(state.calls)
 			if !s.sipCanAcceptCall(activeCalls) {
 				state.callsMu.Unlock()
 				_, _ = conn.WriteToUDP([]byte(sipReply("486 Busy Here", request.Headers, "Warning: 399 haze \"too many active IVR calls\"\r\n")), remote)
@@ -242,29 +345,32 @@ func (s *Service) runSIPListener(ctx context.Context, binding sipListenBinding, 
 			}
 			state.callsMu.Unlock()
 			call, response := s.acceptSIPInvite(ctx, request, remote, conn, conn.LocalAddr())
-			_, _ = conn.WriteToUDP([]byte(response), remote)
+			if _, err := conn.WriteToUDP([]byte(response), remote); err != nil {
+				log.Printf("IVR SIP failed to respond to INVITE %s from %s: %v", callID, remote, err)
+			}
 			if call == nil {
 				continue
 			}
 			state.callsMu.Lock()
-			if existing := state.calls[callID]; existing != nil {
-				existing.close()
-			}
 			state.calls[callID] = call
+			state.inviteReplies[callID] = response
 			state.callsMu.Unlock()
 			go func(id string, c *sipCall) {
 				c.run()
 				state.callsMu.Lock()
 				if state.calls[id] == c {
 					delete(state.calls, id)
+					delete(state.inviteReplies, id)
 				}
 				state.callsMu.Unlock()
 			}(callID, call)
 		case "ACK":
+			s.sipDebugf("received ACK call=%s from=%s", callID, remote)
 		case "BYE", "CANCEL":
 			state.callsMu.Lock()
 			call := state.calls[callID]
 			delete(state.calls, callID)
+			delete(state.inviteReplies, callID)
 			state.callsMu.Unlock()
 			if call != nil {
 				call.close()
@@ -287,7 +393,8 @@ func (s *Service) runSIPListener(ctx context.Context, binding sipListenBinding, 
 }
 
 func (s *Service) acceptSIPInvite(ctx context.Context, request sipRequest, remote *net.UDPAddr, conn *net.UDPConn, local net.Addr) (*sipCall, string) {
-	line, matched := s.sipRequestLine(request)
+	selection := s.sipRequestLineSelection(request)
+	line, matched := selection.Line, selection.Matched
 	directFeed := s.sipRequestDirectFeed(request)
 	if _, extensionMatched := s.cfg.IVR.extensionLine(sipURIUser(request.URI)); extensionMatched {
 		directFeed = sipDirectFeedTarget{}
@@ -326,28 +433,29 @@ func (s *Service) acceptSIPInvite(ctx context.Context, request sipRequest, remot
 	}
 	audioCodec, audioPayload := s.selectSIPAudioCodec(offer)
 	call := &sipCall{
-		service:       s,
-		line:          line,
-		directFeedID:  directFeed.ID,
-		ctx:           callCtx,
-		cancel:        cancel,
-		callID:        sipHeader(request.Headers, "call-id"),
-		localTag:      randomHex(6),
-		sipConn:       conn,
-		sipRemote:     cloneUDPAddr(remote),
-		sipHeaders:    cloneSIPHeaders(request.Headers),
-		sipRequestURI: firstNonBlank(sipContactURI(sipHeader(request.Headers, "contact")), request.URI),
-		rtpConn:       rtpConn,
-		remoteRTP:     &net.UDPAddr{IP: net.ParseIP(offer.Host), Port: offer.Port},
-		audioCodec:    audioCodec,
-		audioPayload:  audioPayload,
-		dtmfPayload:   offer.DTMFPayload,
-		digits:        make(chan string, 16),
-		audioFrames:   make(chan pcmFrame, 64),
-		done:          make(chan struct{}),
-		seq:           uint16(time.Now().UnixNano()),
-		timestamp:     uint32(time.Now().UnixNano()),
-		ssrc:          randomUint32(),
+		service:        s,
+		line:           line,
+		directFeedID:   directFeed.ID,
+		callerProvince: s.sipCallerProvinceHint(request),
+		ctx:            callCtx,
+		cancel:         cancel,
+		callID:         sipHeader(request.Headers, "call-id"),
+		localTag:       randomHex(6),
+		sipConn:        conn,
+		sipRemote:      cloneUDPAddr(remote),
+		sipHeaders:     cloneSIPHeaders(request.Headers),
+		sipRequestURI:  firstNonBlank(sipContactURI(sipHeader(request.Headers, "contact")), request.URI),
+		rtpConn:        rtpConn,
+		remoteRTP:      &net.UDPAddr{IP: net.ParseIP(offer.Host), Port: offer.Port},
+		audioCodec:     audioCodec,
+		audioPayload:   audioPayload,
+		dtmfPayload:    offer.DTMFPayload,
+		digits:         make(chan string, 16),
+		audioFrames:    make(chan pcmFrame, 64),
+		done:           make(chan struct{}),
+		seq:            uint16(time.Now().UnixNano()),
+		timestamp:      uint32(time.Now().UnixNano()),
+		ssrc:           randomUint32(),
 	}
 	if call.dtmfPayload <= 0 {
 		call.dtmfPayload = sipDefaultDTMFPayload
@@ -360,7 +468,33 @@ func (s *Service) acceptSIPInvite(ctx context.Context, request sipRequest, remot
 		call.callID, remote, offer.Host, offer.Port, localHost, rtpPort, offer.HasPCMU, offer.PCMUPayload, offer.HasG722, offer.G722Payload, call.audioCodec.name(), call.audioPayload, call.dtmfPayload)
 	s.sipDebugf("accepted call=%s from=%s remote_rtp=%s:%d bind_rtp=%s advertised_rtp=%s:%d selected=%s/%d offered_pcmu=%v/%d offered_g722=%v/%d dtmf=%d sdp=%q",
 		call.callID, remote, offer.Host, offer.Port, rtpConn.LocalAddr(), localHost, rtpPort, call.audioCodec.name(), call.audioPayload, offer.HasPCMU, offer.PCMUPayload, offer.HasG722, offer.G722Payload, call.dtmfPayload, sdp)
-	return call, sipReplyWithBody("200 OK", request.Headers, call.localTag, "application/sdp", sdp, localHost)
+	connectedIdentity := ""
+	if !directFeed.Matched {
+		connectedIdentity = sipConnectedLineHeaders(s.extensionCallerIDName(line), selection.CalledAddress)
+	}
+	return call, sipReplyWithBodyTo("200 OK", request.Headers, call.localTag, "application/sdp", sdp, localHost, sipAddrPort(local), s.sipContactUser(), connectedIdentity, remote)
+}
+
+func (s *Service) sipContactUser() string {
+	if s == nil {
+		return "haze"
+	}
+	registration := s.cfg.IVR.SIP.Registration
+	return firstNonBlank(registration.ContactUser, registration.FromUser, registration.Username, "haze")
+}
+
+func (s *Service) sipCallerProvinceHint(request sipRequest) string {
+	if s == nil || !s.cfg.IVR.Search.CallerHintEnabled {
+		return ""
+	}
+	for _, header := range []string{"p-asserted-identity", "remote-party-id", "from"} {
+		caller := normalizeNANPCaller(sipURIUser(sipHeader(request.Headers, header)))
+		if caller == "" {
+			continue
+		}
+		return callerProvinceHint(caller)
+	}
+	return ""
 }
 
 func newSIPRegistrar(service *Service, conn *net.UDPConn, localAddr net.Addr) *sipRegistrar {
@@ -836,7 +970,7 @@ func (c *sipCall) menuLoop() {
 			if option.Language != "" {
 				location.Language = option.Language
 			}
-			c.playProduct(location, splitCSV(option.Packages))
+			c.playMappedProduct(location, splitCSV(option.Packages), true)
 		case "broadcast":
 			location, err := c.service.defaultFeedLocation()
 			if err != nil || !c.service.broadcastAvailable(location.FeedID) {
@@ -846,7 +980,8 @@ func (c *sipCall) menuLoop() {
 			location.Language = language
 			c.playPrompt("broadcast_menu", "main", nil)
 			if !c.playLiveBroadcast(location.FeedID) {
-				c.playProduct(location, c.service.broadcastPackages(option))
+				packages := c.service.broadcastPackages(option)
+				c.playProduct(c.service.mapProductLocation(location, packages, nil), packages)
 			}
 		case "operator":
 			c.playPrompt("operator", "main", nil)
@@ -977,7 +1112,7 @@ func (c *sipCall) locationMenu(location ResolvedLocation) {
 		}
 		switch option.Action {
 		case "product":
-			_ = c.playProduct(location, splitCSV(option.Packages))
+			c.playMappedProduct(location, splitCSV(option.Packages), true)
 		case "menu":
 			c.configuredMenu(location, option.Next)
 		case "broadcast":
@@ -987,7 +1122,8 @@ func (c *sipCall) locationMenu(location ResolvedLocation) {
 			}
 			c.playPrompt("broadcast_menu", "main", nil)
 			if !c.playLiveBroadcast(location.FeedID) {
-				_ = c.playProduct(location, c.service.broadcastPackages(option))
+				packages := c.service.broadcastPackages(option)
+				_ = c.playProduct(c.service.mapProductLocation(location, packages, nil), packages)
 			}
 		case "operator":
 			c.playPrompt("operator", "main", nil)
@@ -1052,7 +1188,7 @@ func (c *sipCall) configuredMenu(location ResolvedLocation, menuID string) {
 		}
 		switch option.Action {
 		case "product":
-			_ = c.playProduct(location, splitCSV(option.Packages))
+			c.playMappedProduct(location, splitCSV(option.Packages), true)
 		case "menu":
 			c.configuredMenu(location, option.Next)
 		case "broadcast":
@@ -1062,7 +1198,8 @@ func (c *sipCall) configuredMenu(location ResolvedLocation, menuID string) {
 			}
 			c.playPrompt("broadcast_menu", "main", nil)
 			if !c.playLiveBroadcast(location.FeedID) {
-				_ = c.playProduct(location, c.service.broadcastPackages(option))
+				packages := c.service.broadcastPackages(option)
+				_ = c.playProduct(c.service.mapProductLocation(location, packages, nil), packages)
 			}
 		case "operator":
 			c.playPrompt("operator", "main", nil)
@@ -1855,6 +1992,11 @@ func sipContactURI(value string) string {
 }
 
 func (s *Service) sipRequestLine(request sipRequest) (extensionConfig, bool) {
+	selection := s.sipRequestLineSelection(request)
+	return selection.Line, selection.Matched
+}
+
+func (s *Service) sipRequestLineSelection(request sipRequest) sipLineSelection {
 	candidates := []string{
 		request.URI,
 		sipHeader(request.Headers, "to"),
@@ -1864,27 +2006,50 @@ func (s *Service) sipRequestLine(request sipRequest) (extensionConfig, bool) {
 	}
 	var canadaLine extensionConfig
 	canadaMatched := false
+	canadaAddress := ""
+	calledNumberAddress := ""
 	for _, candidate := range candidates {
-		extension := sipURIUser(candidate)
-		if extension == "" {
+		user := sipURIUser(candidate)
+		if user == "" {
 			continue
 		}
-		line, matched := s.cfg.IVR.extensionLine(extension)
-		if !matched {
-			continue
+		if calledNumberAddress == "" && normalizeCalledNumber(user) != "" {
+			calledNumberAddress = candidate
 		}
-		if line.directProvince() != "" {
-			return line, true
+		if line, matched := s.cfg.IVR.extensionLineByDID(user); matched {
+			return sipLineSelection{Line: line, Matched: true, CalledAddress: candidate}
 		}
-		if !canadaMatched {
-			canadaLine = line
-			canadaMatched = true
+		if line, matched := s.cfg.IVR.extensionLineByExtension(user); matched {
+			if line.directProvince() != "" {
+				return sipLineSelection{Line: line, Matched: true, CalledAddress: candidate}
+			}
+			if !canadaMatched {
+				canadaLine = line
+				canadaMatched = true
+				canadaAddress = candidate
+			}
+		}
+	}
+	for _, candidate := range candidates {
+		user := sipURIUser(candidate)
+		if province := callerProvinceHint(normalizeCalledNumber(user)); province != "" {
+			if line, matched := s.cfg.IVR.provinceLine(province); matched {
+				return sipLineSelection{Line: line, Matched: true, CalledAddress: candidate}
+			}
 		}
 	}
 	if canadaMatched {
-		return canadaLine, true
+		if calledNumberAddress != "" {
+			canadaAddress = calledNumberAddress
+		}
+		return sipLineSelection{Line: canadaLine, Matched: true, CalledAddress: canadaAddress}
 	}
-	return s.cfg.IVR.extensionLine("")
+	line, matched := s.cfg.IVR.extensionLine("")
+	calledAddress := calledNumberAddress
+	if calledAddress == "" {
+		calledAddress = request.URI
+	}
+	return sipLineSelection{Line: line, Matched: matched, CalledAddress: calledAddress}
 }
 
 func (s *Service) sipRequestDirectFeed(request sipRequest) sipDirectFeedTarget {
@@ -2190,6 +2355,38 @@ func (s *Service) sipSourceAllowed(remote *net.UDPAddr) bool {
 	return false
 }
 
+// sipSourceAllowedWithTrustedSources preserves explicit configured source
+// entries and, when registration-source restriction is enabled, adds currently
+// resolved registration-server addresses. With no explicit configured entry,
+// an unavailable or empty dynamic set is fail-closed for that opt-in
+// restriction.
+func (s *Service) sipSourceAllowedWithTrustedSources(remote *net.UDPAddr, state *sipServerState) bool {
+	if s == nil {
+		return false
+	}
+	registration := s.cfg.IVR.SIP.Registration
+	if !registration.Enabled || !registration.RestrictSourcesToServer {
+		return s.sipSourceAllowed(remote)
+	}
+	if remote == nil {
+		return false
+	}
+	if len(s.cfg.IVR.SIP.AllowedSources) > 0 && s.sipSourceAllowed(remote) {
+		return true
+	}
+	key := sipTrustedSourceKey(remote.IP)
+	if key == "" || state == nil {
+		return false
+	}
+	loaded := state.trustedSources.Load()
+	trusted, ok := loaded.(map[string]struct{})
+	if !ok || len(trusted) == 0 {
+		return false
+	}
+	_, allowed := trusted[key]
+	return allowed
+}
+
 func (s *Service) sipDomainAllowed(request sipRequest, domain string) bool {
 	domain = normalizeSIPDomain(domain)
 	if domain == "" {
@@ -2397,7 +2594,13 @@ func sipHeaders(lines []string) map[string]string {
 		if !ok {
 			continue
 		}
-		headers[strings.ToLower(strings.TrimSpace(key))] = strings.TrimSpace(value)
+		key = strings.ToLower(strings.TrimSpace(key))
+		value = strings.TrimSpace(value)
+		if key == "via" && headers[key] != "" {
+			headers[key] += "\n" + value
+			continue
+		}
+		headers[key] = value
 	}
 	return headers
 }
@@ -2407,14 +2610,79 @@ func sipHeader(headers map[string]string, key string) string {
 }
 
 func sipReply(status string, headers map[string]string, extra string) string {
-	return sipBuildReply(status, headers, "", "", "", "", extra)
+	return sipBuildReply(status, headers, "", "", "", "", 0, "", extra)
 }
 
-func sipReplyWithBody(status string, headers map[string]string, toTag string, contentType string, body string, contactHost string) string {
-	return sipBuildReply(status, headers, toTag, contentType, body, contactHost, "")
+func sipReplyWithBody(status string, headers map[string]string, toTag string, contentType string, body string, contactHost string, contactPort int, contactUser string, extra string) string {
+	return sipBuildReply(status, headers, toTag, contentType, body, contactHost, contactPort, contactUser, extra)
 }
 
-func sipBuildReply(status string, headers map[string]string, toTag string, contentType string, body string, contactHost string, extra string) string {
+// sipReplyWithBodyTo applies the RFC 3581 response parameters requested by the
+// topmost SIP proxy before constructing a final response. This keeps replies
+// routable when the provider reached us through a UDP source port that differs
+// from the Via sent-by address.
+func sipReplyWithBodyTo(status string, headers map[string]string, toTag string, contentType string, body string, contactHost string, contactPort int, contactUser string, extra string, remote *net.UDPAddr) string {
+	return sipBuildReply(status, sipResponseHeaders(headers, remote), toTag, contentType, body, contactHost, contactPort, contactUser, extra)
+}
+
+func sipResponseHeaders(headers map[string]string, remote *net.UDPAddr) map[string]string {
+	result := cloneSIPHeaders(headers)
+	if remote == nil || remote.IP == nil || remote.Port <= 0 {
+		return result
+	}
+	vias := strings.Split(sipHeader(result, "via"), "\n")
+	if len(vias) == 0 || strings.TrimSpace(vias[0]) == "" {
+		return result
+	}
+	vias[0] = sipResponseVia(vias[0], remote)
+	result["via"] = strings.Join(vias, "\n")
+	return result
+}
+
+func sipResponseVia(via string, remote *net.UDPAddr) string {
+	via = strings.TrimSpace(via)
+	if via == "" || remote == nil || remote.IP == nil || remote.Port <= 0 {
+		return via
+	}
+	remoteIP := remote.IP.String()
+	if !sipViaHasParameter(via, "received") {
+		via += ";received=" + remoteIP
+	}
+	if start, end, found := sipViaParameterBounds(via, "rport"); found {
+		valueStart := start + len(";rport")
+		if valueStart == end {
+			via = via[:valueStart] + "=" + strconv.Itoa(remote.Port) + via[end:]
+		}
+	}
+	return via
+}
+
+func sipViaHasParameter(via string, parameter string) bool {
+	_, _, found := sipViaParameterBounds(via, parameter)
+	return found
+}
+
+func sipViaParameterBounds(via string, parameter string) (int, int, bool) {
+	lower := strings.ToLower(via)
+	needle := ";" + strings.ToLower(strings.TrimSpace(parameter))
+	for offset := 0; ; {
+		index := strings.Index(lower[offset:], needle)
+		if index < 0 {
+			return 0, 0, false
+		}
+		start := offset + index
+		end := start + len(needle)
+		if end == len(via) || via[end] == '=' || via[end] == ';' {
+			for end < len(via) && via[end] != ';' {
+				end++
+			}
+			return start, end, true
+		}
+		offset = end
+	}
+}
+
+func sipBuildReply(status string, headers map[string]string, toTag string, contentType string, body string, contactHost string, contactPort int, contactUser string, extra string) string {
 	var builder strings.Builder
 	builder.WriteString("SIP/2.0 " + status + "\r\n")
 	for _, key := range []string{"via", "from", "to", "call-id", "cseq"} {
@@ -2423,6 +2691,14 @@ func sipBuildReply(status string, headers map[string]string, toTag string, conte
 			if name == "" {
 				name = strings.ToUpper(key[:1]) + key[1:]
 			}
+			if key == "via" {
+				for _, via := range strings.Split(value, "\n") {
+					if via = strings.TrimSpace(via); via != "" {
+						builder.WriteString("Via: " + via + "\r\n")
+					}
+				}
+				continue
+			}
 			if key == "to" && toTag != "" && !strings.Contains(strings.ToLower(value), "tag=") {
 				value += ";tag=" + toTag
 			}
@@ -2430,7 +2706,12 @@ func sipBuildReply(status string, headers map[string]string, toTag string, conte
 		}
 	}
 	if contactHost != "" {
-		builder.WriteString("Contact: <sip:haze@" + contactHost + ">\r\n")
+		contactUser = firstNonBlank(contactUser, "haze")
+		if contactPort > 0 {
+			builder.WriteString(fmt.Sprintf("Contact: <sip:%s@%s:%d>\r\n", contactUser, contactHost, contactPort))
+		} else {
+			builder.WriteString(fmt.Sprintf("Contact: <sip:%s@%s>\r\n", contactUser, contactHost))
+		}
 	}
 	builder.WriteString("Allow: INVITE, ACK, BYE, CANCEL, OPTIONS, INFO\r\n")
 	builder.WriteString(extra)
@@ -2503,4 +2784,93 @@ func randomUint32() uint32 {
 func escapeSIPWarning(value string) string {
 	value = strings.ReplaceAll(value, `"`, `'`)
 	return strings.ReplaceAll(value, "\r\n", " ")
+}
+
+func sipConnectedLineHeaders(name string, address string) string {
+	name = sanitizeSIPDisplayName(name)
+	uri := canonicalSIPIdentityURI(address)
+	if name == "" || uri == "" {
+		return ""
+	}
+	identity := `"` + escapeSIPQuotedString(name) + `" <` + uri + `>`
+	return "P-Asserted-Identity: " + identity + "\r\n" +
+		"Remote-Party-ID: " + identity + ";party=called;screen=yes;privacy=off\r\n"
+}
+
+func sanitizeSIPDisplayName(value string) string {
+	var builder strings.Builder
+	spacePending := false
+	runes := 0
+	for _, character := range strings.TrimSpace(value) {
+		if unicode.IsControl(character) || unicode.IsSpace(character) {
+			spacePending = builder.Len() > 0
+			continue
+		}
+		if runes >= 80 {
+			break
+		}
+		if spacePending {
+			builder.WriteByte(' ')
+			spacePending = false
+		}
+		builder.WriteRune(character)
+		runes++
+	}
+	return builder.String()
+}
+
+func escapeSIPQuotedString(value string) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	return strings.ReplaceAll(value, `"`, `\"`)
+}
+
+func canonicalSIPIdentityURI(address string) string {
+	contact := sipContactURI(address)
+	user := sipURIUser(contact)
+	host := normalizeSIPDomain(sipHostNameOnly(contact))
+	if !validSIPIdentityUser(user) || !validSIPIdentityHost(host) {
+		return ""
+	}
+	if ip := net.ParseIP(host); ip != nil && strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	return "sip:" + user + "@" + host
+}
+
+func validSIPIdentityUser(value string) bool {
+	if value == "" || len(value) > 128 {
+		return false
+	}
+	for _, character := range value {
+		if character >= 'a' && character <= 'z' ||
+			character >= 'A' && character <= 'Z' ||
+			character >= '0' && character <= '9' ||
+			character == '+' || character == '-' || character == '_' || character == '.' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func validSIPIdentityHost(value string) bool {
+	if value == "" || len(value) > 253 {
+		return false
+	}
+	if net.ParseIP(value) != nil {
+		return true
+	}
+	for _, label := range strings.Split(value, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, character := range label {
+			if character >= 'a' && character <= 'z' ||
+				character >= '0' && character <= '9' || character == '-' {
+				continue
+			}
+			return false
+		}
+	}
+	return true
 }

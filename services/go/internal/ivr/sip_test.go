@@ -29,7 +29,7 @@ services:
         listen_ports:
           - port: 5060
           - port: 5080
-            domain: teleweather.sip.rai.blue
+            domain: sip.teleweather.ca
 `), &root)
 	if err != nil {
 		t.Fatal(err)
@@ -44,7 +44,7 @@ services:
 	if bindings[0].Addr != "0.0.0.0:5060" || bindings[0].Domain != "" {
 		t.Fatalf("first binding = %#v", bindings[0])
 	}
-	if bindings[1].Addr != "0.0.0.0:5080" || bindings[1].Domain != "teleweather.sip.rai.blue" {
+	if bindings[1].Addr != "0.0.0.0:5080" || bindings[1].Domain != "sip.teleweather.ca" {
 		t.Fatalf("second binding = %#v", bindings[1])
 	}
 }
@@ -54,7 +54,7 @@ func TestEquivalentSIPListenOverridePreservesAdditionalPorts(t *testing.T) {
 		Listen: "0.0.0.0:5060",
 		ListenPorts: sipListenPorts{
 			{Port: 5060},
-			{Port: 5080, Domain: "teleweather.sip.rai.blue"},
+			{Port: 5080, Domain: "sip.teleweather.ca"},
 		},
 	}
 	applySIPListenOverride(&cfg, "0.0.0.0:5060")
@@ -72,9 +72,9 @@ func TestEquivalentSIPListenOverridePreservesAdditionalPorts(t *testing.T) {
 func TestSIPDomainAllowedMatchesRequestURI(t *testing.T) {
 	service := &Service{}
 	request := sampleSIPInviteRequest()
-	request.URI = "sip:ivr@teleweather.sip.rai.blue:5080"
+	request.URI = "sip:ivr@sip.teleweather.ca:5080"
 
-	if !service.sipDomainAllowed(request, "teleweather.sip.rai.blue") {
+	if !service.sipDomainAllowed(request, "sip.teleweather.ca") {
 		t.Fatal("expected matching SIP domain to be allowed")
 	}
 	if service.sipDomainAllowed(request, "other.sip.rai.blue") {
@@ -138,7 +138,7 @@ func TestSIPInviteSelectsConfiguredProvinceLine(t *testing.T) {
 		RTP:        rtpConfig{PortMin: 0, PortMax: 0},
 	}, Prompts: defaultPromptConfig()}}
 	request := sampleSIPInviteRequest()
-	request.URI = "sip:600@teleweather.sip.rai.blue"
+	request.URI = "sip:600@sip.teleweather.ca"
 
 	call, response := acceptTestSIPInvite(service, context.Background(), request, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5062}, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5060})
 	if call == nil {
@@ -150,18 +150,198 @@ func TestSIPInviteSelectsConfiguredProvinceLine(t *testing.T) {
 	}
 }
 
+func TestSIPInviteAnswerUsesRegisteredContactIdentity(t *testing.T) {
+	service := &Service{cfg: loadedConfig{IVR: Config{
+		Extensions: []extensionConfig{{Extension: "haze", Province: "CA"}},
+		RTP:        rtpConfig{PortMin: 0, PortMax: 0},
+		SIP: sipConfig{Registration: sipRegistrationConfig{
+			Username:    "tollfreef",
+			ContactUser: "tollfreef",
+		}},
+	}, Prompts: defaultPromptConfig()}}
+	request := sampleSIPInviteRequest()
+	local := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5060}
+	call, response := acceptTestSIPInvite(service, context.Background(), request, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5062}, local)
+	if call == nil {
+		t.Fatalf("expected accepted call, response: %s", response)
+	}
+	defer call.close()
+	if !strings.Contains(response, "Contact: <sip:tollfreef@127.0.0.1:5060>") {
+		t.Fatalf("SIP answer did not preserve the registered contact: %s", response)
+	}
+}
+
+func TestSIPReplyPreservesAllViaHeaders(t *testing.T) {
+	headers := sipHeaders([]string{
+		"Via: SIP/2.0/UDP edge-1.example;branch=z9hG4bK-first",
+		"Via: SIP/2.0/UDP edge-2.example;branch=z9hG4bK-second",
+		"From: <sip:caller@example>;tag=caller",
+		"To: <sip:haze@example>",
+		"Call-ID: test-call",
+		"CSeq: 1 INVITE",
+	})
+	response := sipReply("100 Trying", headers, "")
+	first := strings.Index(response, "Via: SIP/2.0/UDP edge-1.example;branch=z9hG4bK-first\r\n")
+	second := strings.Index(response, "Via: SIP/2.0/UDP edge-2.example;branch=z9hG4bK-second\r\n")
+	if first < 0 || second < 0 || first >= second {
+		t.Fatalf("SIP response did not preserve Via order: %s", response)
+	}
+}
+
+func TestSIPReplyToAddsRequestedResponseRoutingParameters(t *testing.T) {
+	headers := sipHeaders([]string{
+		"Via: SIP/2.0/UDP provider.example:5060;rport;branch=z9hG4bK-one",
+		"From: <sip:caller@example.net>;tag=origin",
+		"To: <sip:tollfreef@example.net>",
+		"Call-ID: call-routing",
+		"CSeq: 1 INVITE",
+	})
+	reply := sipReplyWithBodyTo("200 OK", headers, "haze", "application/sdp", "v=0\r\n", "71.17.68.130", 5060, "tollfreef", "", &net.UDPAddr{IP: net.ParseIP("159.65.244.171"), Port: 5060})
+	if !strings.Contains(reply, "Via: SIP/2.0/UDP provider.example:5060;rport=5060;branch=z9hG4bK-one;received=159.65.244.171\r\n") {
+		t.Fatalf("response did not set RFC 3581 parameters: %q", reply)
+	}
+}
+
 func TestSIPProvinceLineSurvivesProxyRequestURIRewrite(t *testing.T) {
 	service := &Service{cfg: loadedConfig{IVR: Config{Extensions: []extensionConfig{
 		{Extension: "haze", Province: "CA"},
 		{Extension: "600", Province: "SK"},
 	}}}}
 	request := sampleSIPInviteRequest()
-	request.URI = "sip:haze@teleweather.sip.rai.blue"
-	request.Headers["to"] = "<sip:600@teleweather.sip.rai.blue>"
+	request.URI = "sip:haze@sip.teleweather.ca"
+	request.Headers["to"] = "<sip:600@sip.teleweather.ca>"
 
 	line, matched := service.sipRequestLine(request)
 	if !matched || line.Extension != "600" || line.directProvince() != "SK" {
 		t.Fatalf("selected line = %#v, matched=%v", line, matched)
+	}
+}
+
+func TestSIPCalledDIDSelectsLineWithoutReplacingCallerIdentity(t *testing.T) {
+	service := &Service{cfg: loadedConfig{IVR: Config{Extensions: []extensionConfig{
+		{Extension: "haze", Name: "Canada", Province: "CA"},
+		{Extension: "600", Name: "Saskatchewan", Province: "SK"},
+		{Extension: "900", DIDs: []string{"+18675550123"}, Name: "Yukon", Province: "YT"},
+		{Extension: "national", DIDs: []string{"3065550199"}, Name: "Canada", Province: "CA"},
+	}}}}
+	tests := []struct {
+		name          string
+		requestURI    string
+		to            string
+		from          string
+		wantExtension string
+		wantAddress   string
+	}{
+		{name: "Saskatchewan area code", requestURI: "sip:+13065551234@sip.teleweather.ca", wantExtension: "600", wantAddress: "sip:+13065551234@sip.teleweather.ca"},
+		{name: "DID survives proxy rewrite", requestURI: "sip:haze@sip.teleweather.ca", to: "<sip:13065551234@sip.teleweather.ca>", wantExtension: "600", wantAddress: "<sip:13065551234@sip.teleweather.ca>"},
+		{name: "toll free defaults Canada", requestURI: "sip:+18005550123@sip.teleweather.ca", wantExtension: "haze", wantAddress: "sip:+18005550123@sip.teleweather.ca"},
+		{name: "explicit DID handles shared area code", requestURI: "sip:+18675550123@sip.teleweather.ca", wantExtension: "900", wantAddress: "sip:+18675550123@sip.teleweather.ca"},
+		{name: "explicit DID overrides area inference", requestURI: "sip:+13065550199@sip.teleweather.ca", wantExtension: "national", wantAddress: "sip:+13065550199@sip.teleweather.ca"},
+		{name: "calling party is not used as called line", requestURI: "sip:haze@sip.teleweather.ca", from: `"Saskatchewan caller" <sip:+13065551234@carrier.example>;tag=test`, wantExtension: "haze", wantAddress: "sip:haze@sip.teleweather.ca"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := sampleSIPInviteRequest()
+			request.URI = test.requestURI
+			if test.to != "" {
+				request.Headers["to"] = test.to
+			}
+			if test.from != "" {
+				request.Headers["from"] = test.from
+			}
+			selection := service.sipRequestLineSelection(request)
+			if selection.Line.Extension != test.wantExtension || selection.CalledAddress != test.wantAddress {
+				t.Fatalf("selection = %#v, want extension %q and address %q", selection, test.wantExtension, test.wantAddress)
+			}
+		})
+	}
+}
+
+func TestSIPAcceptedCallAdvertisesConnectedLineName(t *testing.T) {
+	service := &Service{cfg: loadedConfig{IVR: Config{
+		Extensions: []extensionConfig{
+			{Extension: "haze", Name: map[string]any{"text": "Canada", "pronunciation": "can ah dah"}, Province: "CA"},
+			{Extension: "600", Name: map[string]any{"text": "Saskatchewan", "pronunciation": "sask at chew on"}, Province: "SK"},
+		},
+		RTP: rtpConfig{PortMin: 0, PortMax: 0},
+	}, Prompts: defaultPromptConfig()}}
+	service.cfg.Root.Operator.TelephoneName = map[string]any{"text": "TeleWeather", "pronunciation": "tele weather"}
+	request := sampleSIPInviteRequest()
+	request.URI = "sip:+13065551234@sip.teleweather.ca"
+	request.Headers["to"] = "<sip:+13065551234@sip.teleweather.ca>"
+
+	call, response := acceptTestSIPInvite(service, context.Background(), request, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5062}, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5060})
+	if call == nil {
+		t.Fatalf("expected accepted call, response: %s", response)
+	}
+	defer call.close()
+	identity := `"Saskatchewan TeleWeather" <sip:+13065551234@sip.teleweather.ca>`
+	if !strings.Contains(response, "P-Asserted-Identity: "+identity+"\r\n") ||
+		!strings.Contains(response, "Remote-Party-ID: "+identity+";party=called;screen=yes;privacy=off\r\n") {
+		t.Fatalf("connected line identity missing from response: %s", response)
+	}
+	if !strings.Contains(response, "From: <sip:caller@127.0.0.1>;tag=abc\r\n") {
+		t.Fatalf("response replaced the inbound caller identity: %s", response)
+	}
+}
+
+func TestSIPConnectedLineHeadersRejectInjection(t *testing.T) {
+	tests := []struct {
+		name    string
+		line    string
+		address string
+		want    string
+	}{
+		{name: "safe", line: "Saskatchewan TeleWeather", address: "sip:600@sip.teleweather.ca", want: `P-Asserted-Identity: "Saskatchewan TeleWeather" <sip:600@sip.teleweather.ca>`},
+		{name: "escaped", line: `Canada "Weather"`, address: "sip:haze@sip.teleweather.ca", want: `P-Asserted-Identity: "Canada \"Weather\"" <sip:haze@sip.teleweather.ca>`},
+		{name: "invalid URI", line: "Canada TeleWeather", address: "sip:haze@bad host", want: ""},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			headers := sipConnectedLineHeaders(test.line, test.address)
+			if test.want == "" {
+				if headers != "" {
+					t.Fatalf("headers = %q, want empty", headers)
+				}
+				return
+			}
+			if !strings.Contains(headers, test.want) {
+				t.Fatalf("headers = %q, missing %q", headers, test.want)
+			}
+			if strings.Contains(headers, "\r\nX-Injected:") {
+				t.Fatalf("headers contain an injected field: %q", headers)
+			}
+		})
+	}
+	if headers := sipConnectedLineHeaders("Canada\r\nX-Injected: yes", "sip:haze@sip.teleweather.ca"); strings.Contains(headers, "\r\nX-Injected:") {
+		t.Fatalf("control characters injected a SIP header: %q", headers)
+	}
+}
+
+func TestIVRExtensionDIDAndCallerIDValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		lines   []extensionConfig
+		wantErr string
+	}{
+		{name: "valid", lines: []extensionConfig{{Extension: "haze", Province: "CA", NamePosition: "before", DIDs: []string{"3065550123"}, CallerIDName: "Canada TeleWeather"}}},
+		{name: "duplicate formatted DID", lines: []extensionConfig{
+			{Extension: "haze", Province: "CA", NamePosition: "before", DIDs: []string{"306-555-0123"}},
+			{Extension: "600", Province: "SK", NamePosition: "before", DIDs: []string{"+13065550123"}},
+		}, wantErr: "configured for extensions"},
+		{name: "invalid DID", lines: []extensionConfig{{Extension: "haze", Province: "CA", NamePosition: "before", DIDs: []string{"not-a-number"}}}, wantErr: "invalid DID"},
+		{name: "header injection", lines: []extensionConfig{{Extension: "haze", Province: "CA", NamePosition: "before", CallerIDName: "Canada\r\nX-Injected: yes"}}, wantErr: "invalid caller_id_name"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateIVRExtensions(test.lines)
+			if test.wantErr == "" && err != nil {
+				t.Fatalf("validateIVRExtensions() error = %v", err)
+			}
+			if test.wantErr != "" && (err == nil || !strings.Contains(err.Error(), test.wantErr)) {
+				t.Fatalf("validateIVRExtensions() error = %v, want %q", err, test.wantErr)
+			}
+		})
 	}
 }
 
@@ -320,7 +500,7 @@ func TestSIPInviteRejectsDisabledProvinceLine(t *testing.T) {
 		RTP: rtpConfig{PortMin: 0, PortMax: 0},
 	}, Prompts: defaultPromptConfig()}}
 	request := sampleSIPInviteRequest()
-	request.URI = "sip:800@teleweather.sip.rai.blue"
+	request.URI = "sip:800@sip.teleweather.ca"
 
 	call, response := acceptTestSIPInvite(service, context.Background(), request, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5062}, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 5060})
 	if call != nil {
@@ -588,6 +768,139 @@ func TestSIPSourceAllowedSupportsIPAndCIDR(t *testing.T) {
 	}
 }
 
+func TestSIPTrustedSourceRefreshUsesRegistrationServerAndRetainsLastGoodSet(t *testing.T) {
+	service := &Service{cfg: loadedConfig{IVR: Config{SIP: sipConfig{Registration: sipRegistrationConfig{
+		Server: "sip:registrar.example.test:5060;transport=udp",
+	}}}}}
+	state := &sipServerState{
+		trustedSourceLookup: func(_ context.Context, host string) ([]net.IPAddr, error) {
+			if host != "registrar.example.test" {
+				t.Fatalf("lookup host = %q, want registrar.example.test", host)
+			}
+			return []net.IPAddr{
+				{IP: net.ParseIP("192.0.2.44")},
+				{IP: net.ParseIP("2001:db8::44")},
+				{},
+			}, nil
+		},
+	}
+	state.trustedSources.Store(map[string]struct{}{"192.0.2.1": {}})
+
+	service.refreshSIPTrustedSources(context.Background(), state)
+	trusted, ok := state.trustedSources.Load().(map[string]struct{})
+	if !ok || len(trusted) != 2 {
+		t.Fatalf("trusted sources = %#v", state.trustedSources.Load())
+	}
+	for _, source := range []string{"192.0.2.44", "2001:db8::44"} {
+		if _, exists := trusted[source]; !exists {
+			t.Fatalf("trusted sources missing %q: %#v", source, trusted)
+		}
+	}
+
+	state.trustedSourceLookup = func(context.Context, string) ([]net.IPAddr, error) {
+		return nil, fmt.Errorf("temporary DNS failure")
+	}
+	service.refreshSIPTrustedSources(context.Background(), state)
+	trusted, ok = state.trustedSources.Load().(map[string]struct{})
+	if !ok || len(trusted) != 2 {
+		t.Fatalf("failed refresh replaced the last good source set: %#v", state.trustedSources.Load())
+	}
+}
+
+func TestSIPTrustedSourceRefreshAcceptsLiteralServerWithoutDNS(t *testing.T) {
+	service := &Service{cfg: loadedConfig{IVR: Config{SIP: sipConfig{Registration: sipRegistrationConfig{
+		Server: "[2001:db8::55]:5060",
+	}}}}}
+	state := &sipServerState{
+		trustedSourceLookup: func(context.Context, string) ([]net.IPAddr, error) {
+			t.Fatal("literal registration server should not use DNS")
+			return nil, nil
+		},
+	}
+	state.trustedSources.Store(map[string]struct{}{})
+
+	service.refreshSIPTrustedSources(context.Background(), state)
+	trusted, ok := state.trustedSources.Load().(map[string]struct{})
+	if !ok || len(trusted) != 1 {
+		t.Fatalf("trusted sources = %#v", state.trustedSources.Load())
+	}
+	if _, exists := trusted["2001:db8::55"]; !exists {
+		t.Fatalf("literal IPv6 source was not retained: %#v", trusted)
+	}
+}
+
+func TestSIPSourceAllowedWithTrustedSources(t *testing.T) {
+	service := &Service{cfg: loadedConfig{IVR: Config{SIP: sipConfig{Registration: sipRegistrationConfig{
+		Enabled: true, RestrictSourcesToServer: true,
+	}}}}}
+	state := &sipServerState{}
+	state.trustedSources.Store(map[string]struct{}{"192.0.2.44": {}})
+	trustedRemote := &net.UDPAddr{IP: net.ParseIP("192.0.2.44"), Port: 5060}
+	configuredRemote := &net.UDPAddr{IP: net.ParseIP("198.51.100.21"), Port: 5060}
+	otherRemote := &net.UDPAddr{IP: net.ParseIP("203.0.113.25"), Port: 5060}
+
+	if !service.sipSourceAllowedWithTrustedSources(trustedRemote, state) {
+		t.Fatal("resolved registration-server source was rejected")
+	}
+	if service.sipSourceAllowedWithTrustedSources(otherRemote, state) {
+		t.Fatal("source outside the trusted registration-server set was allowed")
+	}
+
+	service.cfg.IVR.SIP.AllowedSources = []string{"198.51.100.21"}
+	if !service.sipSourceAllowedWithTrustedSources(configuredRemote, state) {
+		t.Fatal("explicit configured source was not preserved")
+	}
+	if !service.sipSourceAllowedWithTrustedSources(trustedRemote, state) {
+		t.Fatal("trusted registration-server source was not additive to configured sources")
+	}
+
+	state.trustedSources.Store(map[string]struct{}{})
+	service.cfg.IVR.SIP.AllowedSources = nil
+	if service.sipSourceAllowedWithTrustedSources(otherRemote, state) {
+		t.Fatal("empty trusted source set did not fail closed")
+	}
+	service.cfg.IVR.SIP.Registration.RestrictSourcesToServer = false
+	if !service.sipSourceAllowedWithTrustedSources(otherRemote, state) {
+		t.Fatal("default source behavior changed when restriction is disabled")
+	}
+}
+
+func TestRunSIPTrustedSourceRefreshStopsWithContext(t *testing.T) {
+	service := &Service{cfg: loadedConfig{IVR: Config{SIP: sipConfig{Registration: sipRegistrationConfig{
+		Server: "registrar.example.test",
+	}}}}}
+	refreshed := make(chan struct{}, 1)
+	state := &sipServerState{
+		trustedSourceRefreshEvery: 5 * time.Millisecond,
+		trustedSourceLookup: func(context.Context, string) ([]net.IPAddr, error) {
+			select {
+			case refreshed <- struct{}{}:
+			default:
+			}
+			return []net.IPAddr{{IP: net.ParseIP("192.0.2.55")}}, nil
+		},
+	}
+	state.trustedSources.Store(map[string]struct{}{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		service.runSIPTrustedSourceRefresh(ctx, state)
+		close(done)
+	}()
+	select {
+	case <-refreshed:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("trusted source refresh did not run")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("trusted source refresher did not stop after cancellation")
+	}
+}
+
 func TestSIPCanAcceptCallHonorsConfiguredLimit(t *testing.T) {
 	service := &Service{cfg: loadedConfig{IVR: Config{MaxConcurrentCalls: 2}}}
 	if !service.sipCanAcceptCall(1) {
@@ -823,6 +1136,37 @@ func TestAlertAudioCanBeInterruptedWithPound(t *testing.T) {
 	call.digits <- "#"
 	if digit, interrupted := call.playAudioFile(path, digitInterruptPound); !interrupted || digit != "#" {
 		t.Fatalf("pound interrupt returned digit=%q interrupted=%v", digit, interrupted)
+	}
+}
+
+func TestSIPCallerProvinceHint(t *testing.T) {
+	tests := []struct {
+		name    string
+		headers map[string]string
+		enabled bool
+		want    string
+	}{
+		{
+			name: "asserted identity preferred",
+			headers: map[string]string{
+				"p-asserted-identity": "<sip:+13065551234@carrier.example>",
+				"from":                "<sip:+14165551234@carrier.example>",
+			},
+			enabled: true,
+			want:    "SK",
+		},
+		{name: "from fallback", headers: map[string]string{"from": "<tel:+14165551234>"}, enabled: true, want: "ON"},
+		{name: "shared maritime code omitted", headers: map[string]string{"from": "<sip:+19025551234@carrier.example>"}, enabled: true},
+		{name: "anonymous omitted", headers: map[string]string{"from": "<sip:anonymous@carrier.example>"}, enabled: true},
+		{name: "feature disabled", headers: map[string]string{"from": "<sip:+13065551234@carrier.example>"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service := &Service{cfg: loadedConfig{IVR: Config{Search: searchConfig{CallerHintEnabled: test.enabled}}}}
+			if got := service.sipCallerProvinceHint(sipRequest{Headers: test.headers}); got != test.want {
+				t.Fatalf("sipCallerProvinceHint() = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 

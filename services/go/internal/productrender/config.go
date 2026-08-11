@@ -58,6 +58,7 @@ type feedsXML struct {
 }
 
 type feedXML struct {
+	OnDemand   bool   `xml:"-"`
 	ID         string `xml:"id,attr"`
 	EnabledRaw string `xml:"enabled,attr"`
 	Timezone   string `xml:"timezone,attr"`

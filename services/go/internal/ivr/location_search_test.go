@@ -32,6 +32,55 @@ func testLocationSearchIndex(t *testing.T) *locationSearchIndex {
 	return index
 }
 
+func testPopulationLocationSearchIndex(t *testing.T) *locationSearchIndex {
+	t.Helper()
+	snapshot := locationdb.Snapshot{
+		Places: []locationdb.Place{
+			{Source: "forecast", Code: "SK-HAR", Name: "Harmony", Region: "SK", Country: "CA", Kind: "forecast", Attrs: map[string]any{"census_population": 125_000, "census_year": 2021}},
+			{Source: "forecast", Code: "ON-HAR", Name: "Harmony", Region: "ON", Country: "CA", Kind: "forecast", Attrs: map[string]any{"population": 1_250, "census_year": 2021}},
+			{Source: "forecast", Code: "SK-GRP", Name: "Grouped Place", Region: "SK", Country: "CA", Kind: "forecast", Attrs: map[string]any{"population": 500}},
+			{Source: "clc", Code: "009999", Name: "Grouped Place Census Division", Region: "SK", Country: "CA", Kind: "zone", Attrs: map[string]any{"population_centre_population": 250_000, "census_year": 2021}},
+		},
+		Links: []locationdb.Link{{FromSource: "forecast", FromCode: "SK-GRP", ToSource: "clc", ToCode: "009999", Score: 1}},
+	}
+	cfg := loadedConfig{IVR: Config{DefaultLanguage: "en-CA"}, Feeds: []feedXML{{ID: "test", EnabledRaw: "true", Timezone: "UTC"}}}
+	index, err := newLocationSearchIndex(snapshot, NewResolver(cfg))
+	if err != nil {
+		t.Fatalf("newLocationSearchIndex: %v", err)
+	}
+	return index
+}
+
+func testT9Input(text string) *locationSearchKeypad {
+	input := newLocationSearchKeypad(700 * time.Millisecond)
+	at := time.Unix(0, 0)
+	for _, digit := range t9(text) {
+		input.Feed(string(digit), at)
+		at = at.Add(time.Second)
+	}
+	return input
+}
+
+func testMultitapInput(text string) *locationSearchKeypad {
+	input := newLocationSearchKeypad(700 * time.Millisecond)
+	at := time.Unix(0, 0)
+	for _, letter := range strings.ToLower(text) {
+		for key, letters := range multitapLetters {
+			presses := strings.IndexRune(letters, letter) + 1
+			if presses <= 0 {
+				continue
+			}
+			for press := 0; press < presses; press++ {
+				input.Feed(string(key), at)
+				at = at.Add(100 * time.Millisecond)
+			}
+			at = at.Add(800 * time.Millisecond)
+			break
+		}
+	}
+	return input
+}
+
 func TestLocationSearchVoiceNormalizesNamesAndRegions(t *testing.T) {
 	index := testLocationSearchIndex(t)
 	tests := []struct {
@@ -40,13 +89,13 @@ func TestLocationSearchVoiceNormalizesNamesAndRegions(t *testing.T) {
 		region string
 		code   string
 	}{
-		{name: "municipal prefix", query: "weather for Saskatoon Saskatchewan", code: "06040"},
+		{name: "municipal prefix", query: "weather for Saskatoon Saskatchewan", code: "SK-40"},
 		{name: "accent insensitive", query: "Quebec", code: "QC-1"},
 		{name: "explicit state", query: "Springfield Missouri", region: "MO", code: "MOZ001"},
-		{name: "alias", query: "YXE", code: "06040"},
-		{name: "station link name", query: "Saskatoon Diefenbaker", code: "06040"},
+		{name: "alias", query: "YXE", code: "SK-40"},
+		{name: "station link name", query: "Saskatoon Diefenbaker", code: "SK-40"},
 		{name: "name article preserved", query: "The Pas", code: "MB-1"},
-		{name: "fuzzy typo", query: "Saskaton", code: "06040"},
+		{name: "fuzzy typo", query: "Saskaton", code: "SK-40"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -84,6 +133,109 @@ func TestLocationSearchDoesNotAutoAcceptHomonym(t *testing.T) {
 	}
 }
 
+func TestLocationSearchExplicitRegionHardFiltersEveryMethod(t *testing.T) {
+	index := testPopulationLocationSearchIndex(t)
+	context := locationSearchContext{Region: "Ontario", ExplicitRegion: true, Language: "en-CA"}
+	tests := []struct {
+		name   string
+		search func() []locationSearchMatch
+	}{
+		{name: "voice", search: func() []locationSearchMatch { return index.SearchVoice("Harmony", context) }},
+		{name: "T9", search: func() []locationSearchMatch { return index.SearchKeypad(testT9Input("Harmony"), context) }},
+		{name: "multitap", search: func() []locationSearchMatch { return index.SearchKeypad(testMultitapInput("Harmony"), context) }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			matches := test.search()
+			if len(matches) != 1 {
+				t.Fatalf("matches = %#v, want exactly one in-province result", matches)
+			}
+			if matches[0].Target.Location.Province != "ON" || matches[0].Target.Location.Code != "ON-HAR" {
+				t.Fatalf("match = %#v, want Ontario Harmony", matches[0])
+			}
+		})
+	}
+}
+
+func TestLocationSearchCaliforniaRegionIsNotTreatedAsCanada(t *testing.T) {
+	location := ResolvedLocation{Source: "nws_zone", Code: "CAZ001", Name: "Springfield", Province: "CA", Country: "US"}
+	if !locationAllowedBySearchContext(location, locationSearchContext{Region: "CA", ExplicitRegion: true}) {
+		t.Fatal("California location was rejected as though CA meant country Canada")
+	}
+	canadian := ResolvedLocation{Source: "forecast", Code: "AB-1", Name: "Springfield", Province: "AB", Country: "CA"}
+	if locationAllowedBySearchContext(canadian, locationSearchContext{Region: "CA", ExplicitRegion: true}) {
+		t.Fatal("Canadian location outside California passed the explicit state filter")
+	}
+}
+
+func TestLocationSearchPopulationPriorRanksButDoesNotResolveHomonym(t *testing.T) {
+	index := testPopulationLocationSearchIndex(t)
+	matches := index.SearchVoice("Harmony", locationSearchContext{Language: "en-CA"})
+	if len(matches) != 2 {
+		t.Fatalf("matches = %#v, want both nationwide homonyms", matches)
+	}
+	if matches[0].Target.Location.Province != "SK" || matches[0].Target.Population != 125_000 {
+		t.Fatalf("top population-ranked match = %#v", matches[0])
+	}
+	if shouldAutoAcceptLocation(matches, locationSearchContext{}) {
+		t.Fatal("population prior bypassed homonym auto-accept protection")
+	}
+	decision := decideLocationSearch(matches, locationSearchContext{})
+	if decision.Kind != locationSearchChoices || len(decision.Matches) != 2 {
+		t.Fatalf("decision = %#v, want an ambiguity menu", decision)
+	}
+}
+
+func TestLocationSearchGroupedTargetKeepsBestPopulation(t *testing.T) {
+	index := testPopulationLocationSearchIndex(t)
+	matches := index.SearchVoice("Grouped Place", locationSearchContext{Region: "SK", ExplicitRegion: true})
+	if len(matches) == 0 {
+		t.Fatal("grouped target was not searchable")
+	}
+	if matches[0].Target.Population != 250_000 || matches[0].Target.CensusYear != 2021 {
+		t.Fatalf("grouped population = (%d, %d), want (250000, 2021)", matches[0].Target.Population, matches[0].Target.CensusYear)
+	}
+}
+
+func TestLocationSearchPrefersCityPageThenFallsBackToCensusMunicipality(t *testing.T) {
+	t.Parallel()
+	snapshot := locationdb.Snapshot{Places: []locationdb.Place{
+		{Source: "forecast", Code: "SK-77", Name: "City of Maple Creek", Region: "SK", Country: "CA", Kind: "forecast"},
+		{Source: "sgc", Code: "4701001", Name: "Maple Creek", Region: "SK", Country: "CA", Kind: "municipality", Attrs: map[string]any{"population": 1_000_000}},
+		{Source: "sgc", Code: "4701002", Name: "Rural Municipality of Lone Tree", Region: "SK", Country: "CA", Kind: "municipality"},
+	}}
+	cfg := loadedConfig{IVR: Config{DefaultLanguage: "en-CA"}, Feeds: []feedXML{{ID: "test", EnabledRaw: "true", Timezone: "UTC"}}}
+	index, err := newLocationSearchIndex(snapshot, NewResolver(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cityMatches := index.SearchVoice("Maple Creek", locationSearchContext{Language: "en-CA", Region: "SK"})
+	if len(cityMatches) < 2 || cityMatches[0].Target.Location.Code != "SK-77" || !cityMatches[0].Target.CityPage {
+		t.Fatalf("city-page priority = %#v", cityMatches)
+	}
+	municipalityMatches := index.SearchVoice("Lone Tree", locationSearchContext{Language: "en-CA", Region: "SK"})
+	if len(municipalityMatches) == 0 || municipalityMatches[0].Target.Location.Code != "4701002" || municipalityMatches[0].Target.CityPage {
+		t.Fatalf("municipality fallback = %#v", municipalityMatches)
+	}
+}
+
+func TestLocationSearchSourceQualifiedOverlappingCodesStayDistinct(t *testing.T) {
+	snapshot := locationdb.Snapshot{Places: []locationdb.Place{
+		{Source: "forecast", Code: "ZZ001", Name: "Twin Falls", Region: "SK", Country: "CA", Kind: "forecast"},
+		{Source: "nws_zone", Code: "ZZ001", Name: "Twin Falls", Region: "ID", Country: "US", Kind: "zone"},
+	}}
+	cfg := loadedConfig{IVR: Config{DefaultLanguage: "en-US"}, Feeds: []feedXML{{ID: "test", EnabledRaw: "true", Timezone: "UTC"}}}
+	index, err := newLocationSearchIndex(snapshot, NewResolver(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	matches := index.SearchVoice("Twin Falls", locationSearchContext{})
+	if len(matches) != 2 || matches[0].Target.Key == matches[1].Target.Key {
+		t.Fatalf("source-qualified overlapping identifiers collapsed: %#v", matches)
+	}
+}
+
 func TestLocationSearchOpaqueLabelsAreExactOnly(t *testing.T) {
 	index := testLocationSearchIndex(t)
 	if matches := index.SearchVoice("MN000003", locationSearchContext{}); len(matches) != 0 {
@@ -102,7 +254,7 @@ func TestLocationSearchKeypadInfersT9AndMultitap(t *testing.T) {
 		t9Input.Feed(string(digit), base.Add(time.Duration(offset)*100*time.Millisecond))
 	}
 	t9Matches := index.SearchKeypad(t9Input, locationSearchContext{Region: "SK"})
-	if len(t9Matches) == 0 || t9Matches[0].Target.Location.Code != "06040" || t9Matches[0].Method != locationSearchT9 {
+	if len(t9Matches) == 0 || t9Matches[0].Target.Location.Code != "SK-40" || t9Matches[0].Method != locationSearchT9 {
 		t.Fatalf("T9 matches = %#v", t9Matches)
 	}
 
@@ -152,7 +304,7 @@ func TestLocationSearchMultitapSpellsCompleteLocation(t *testing.T) {
 		t.Fatalf("multitap = %q", got)
 	}
 	matches := index.SearchKeypad(input, locationSearchContext{Region: "SK"})
-	if len(matches) == 0 || matches[0].Target.Location.Code != "06040" || matches[0].Method != locationSearchMultitap {
+	if len(matches) == 0 || matches[0].Target.Location.Code != "SK-40" || matches[0].Method != locationSearchMultitap {
 		t.Fatalf("multitap location matches = %#v", matches)
 	}
 }
@@ -189,7 +341,7 @@ func TestLocationSearchSessionLocksFirstSubstantiveModality(t *testing.T) {
 	}
 }
 
-func TestDecideLocationSearchNeverGuessesLargeAmbiguity(t *testing.T) {
+func TestDecideLocationSearchPresentsLargeAmbiguity(t *testing.T) {
 	matches := []locationSearchMatch{
 		{Target: locationSearchTarget{Key: "1"}, Score: 0.90},
 		{Target: locationSearchTarget{Key: "2"}, Score: 0.89},
@@ -197,8 +349,8 @@ func TestDecideLocationSearchNeverGuessesLargeAmbiguity(t *testing.T) {
 		{Target: locationSearchTarget{Key: "4"}, Score: 0.87},
 	}
 	decision := decideLocationSearch(matches, locationSearchContext{})
-	if decision.Kind != locationSearchRefine {
-		t.Fatalf("large collision set produced %q", decision.Kind)
+	if decision.Kind != locationSearchChoices || len(decision.Matches) != len(matches) {
+		t.Fatalf("large collision set produced %#v", decision)
 	}
 }
 

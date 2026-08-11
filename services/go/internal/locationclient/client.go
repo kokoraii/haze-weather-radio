@@ -75,6 +75,7 @@ type Options struct {
 	InputMode              string          `json:"input_mode,omitempty"`
 	MaxDepth               int             `json:"max_depth,omitempty"`
 	MaxVisited             int             `json:"max_visited,omitempty"`
+	IncludeAreaGeometry    bool            `json:"include_area_geometry,omitempty"`
 }
 
 type GeographicBias struct {
@@ -286,6 +287,10 @@ func (client *Client) Query(ctx context.Context, request Request) (Response, err
 		deadline = contextDeadline
 	}
 	_ = connection.SetDeadline(deadline)
+	stopCancellation := context.AfterFunc(ctx, func() {
+		_ = connection.SetDeadline(time.Now())
+	})
+	defer stopCancellation()
 	encoder := json.NewEncoder(connection)
 	if err := encoder.Encode(map[string]any{
 		"type": "bridge.client",
@@ -334,10 +339,16 @@ func (client *Client) Query(ctx context.Context, request Request) (Response, err
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		if errors.Is(err, os.ErrDeadlineExceeded) || ctx.Err() != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return Response{}, contextErr
+		}
+		if errors.Is(err, os.ErrDeadlineExceeded) {
 			return Response{}, context.DeadlineExceeded
 		}
 		return Response{}, err
+	}
+	if contextErr := ctx.Err(); contextErr != nil {
+		return Response{}, contextErr
 	}
 	return Response{}, fmt.Errorf("location bridge closed before replying")
 }
