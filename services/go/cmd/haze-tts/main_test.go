@@ -384,6 +384,54 @@ func TestHandleSynthesisJobRoutesUnavailableSpeakyAPIToFallbackBeforeSynthesis(t
 	}
 }
 
+func TestHandleSynthesisJobFallsBackWhenHealthySpeakyAPIFailsDuringSynthesis(t *testing.T) {
+	primary := &fakeProvider{id: "speakyapi", err: tts.ErrProviderUnavailable}
+	backup := &fakeProvider{id: "piper", audio: tts.Audio{Format: tts.FormatWAV, Data: []byte("fallback")}}
+	state := &serviceState{
+		ctx:       context.Background(),
+		cfg:       serviceConfig{Timeout: time.Second},
+		providers: map[string]tts.Provider{"speakyapi": primary, "piper": backup},
+		readers: []tts.Reader{{
+			ID:       "00",
+			Provider: "speakyapi",
+			VoiceID:  "Vocalizer Tom - Claro",
+			Backup:   &tts.ReaderBackup{Provider: "piper", VoiceID: "en_US-hfc_male-medium"},
+		}},
+		dictionaries:   map[string]dictionaryResult{},
+		synthesisCache: map[[32]byte]synthesisCacheEntry{},
+	}
+	conn, peer := net.Pipe()
+	defer conn.Close()
+	defer peer.Close()
+	outputPath := filepath.Join(t.TempDir(), "fallback.wav")
+
+	go handleSynthesisJob(context.Background(), conn, state, map[string]any{
+		"type": "tts.synthesize",
+		"data": map[string]any{
+			"job_id":          "healthy-probe-fallback-job",
+			"voice_route_key": "current-conditions",
+			"reader_id":       "00",
+			"text":            "weather",
+			"output_path":     outputPath,
+		},
+	})
+
+	var event map[string]any
+	if err := json.NewDecoder(peer).Decode(&event); err != nil {
+		t.Fatal(err)
+	}
+	if event["type"] != "tts.synthesized" {
+		t.Fatalf("event type = %v", event["type"])
+	}
+	data := event["data"].(map[string]any)
+	if data["provider"] != "piper" || data["backup_used"] != true {
+		t.Fatalf("fallback metadata = %#v", data)
+	}
+	if primary.requestCount() != 1 || backup.requestCount() != 1 {
+		t.Fatalf("primary requests=%d fallback requests=%d", primary.requestCount(), backup.requestCount())
+	}
+}
+
 func TestResolveVoiceRouteSharesProviderHealthProbe(t *testing.T) {
 	release := make(chan struct{})
 	started := make(chan struct{}, 1)

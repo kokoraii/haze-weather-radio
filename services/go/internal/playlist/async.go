@@ -452,13 +452,13 @@ func (s *Service) invalidateRoutinePreparation(planner *feedPlanner) {
 	}
 }
 
-func (s *Service) enqueuePriorityPreparation(ctx context.Context, planner *feedPlanner, data map[string]any) {
+func (s *Service) enqueuePriorityPreparation(ctx context.Context, planner *feedPlanner, data map[string]any) error {
 	data, alertID := normalizePriorityAlertRequest(data)
 	if priorityAlertRequestStale(data, time.Now().UTC()) {
 		cleanupSupersededAlertQueueParts(planner.cfg.BaseDir, planner.feed.ID, alertID, "")
 		planner.lastError = ""
 		planner.writeState()
-		return
+		return fmt.Errorf("priority alert request is stale")
 	}
 	s.invalidateRoutinePreparation(planner)
 	state := s.preparationState(planner.feed.ID)
@@ -477,7 +477,7 @@ func (s *Service) enqueuePriorityPreparation(ctx context.Context, planner *feedP
 	if len(filtered) >= limit {
 		planner.lastError = fmt.Sprintf("priority preparation backlog is full (%d)", limit)
 		planner.writeState()
-		return
+		return fmt.Errorf("enqueue priority alert: %s", planner.lastError)
 	}
 	s.priorityPending = filtered
 	state.priorityVersions[alertID]++
@@ -494,6 +494,7 @@ func (s *Service) enqueuePriorityPreparation(ctx context.Context, planner *feedP
 		data:    data,
 	})
 	s.startPendingPriorityPreparations(ctx)
+	return nil
 }
 
 func (s *Service) startPendingPriorityPreparations(ctx context.Context) {
@@ -711,6 +712,7 @@ func (s *Service) handlePriorityPreparationResult(ctx context.Context, result pr
 		planner.discardPriorityAlertPreparation(result.prepared)
 		if current && priorityAlertRequestStale(result.job.data, time.Now().UTC()) {
 			cleanupSupersededAlertQueueParts(planner.cfg.BaseDir, planner.feed.ID, result.job.alertID, "")
+			planner.publishAutomationDispatchStatus(result.job.data, "failed", "priority alert request became stale during preparation")
 		}
 		s.startPendingPriorityPreparations(ctx)
 		return
@@ -719,12 +721,14 @@ func (s *Service) handlePriorityPreparationResult(ctx context.Context, result pr
 		planner.discardPriorityAlertPreparation(result.prepared)
 		planner.lastError = result.err.Error()
 		planner.writeState()
+		planner.publishAutomationDispatchStatus(result.job.data, "failed", planner.lastError)
 		s.startPendingPriorityPreparations(ctx)
 		return
 	}
 	if err := planner.commitPriorityAlert(result.prepared); err != nil {
 		planner.discardPriorityAlertPreparation(result.prepared)
 		planner.lastError = err.Error()
+		planner.publishAutomationDispatchStatus(result.job.data, "failed", planner.lastError)
 	} else {
 		planner.lastError = ""
 	}

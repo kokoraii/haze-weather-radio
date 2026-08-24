@@ -95,7 +95,12 @@ func (s *Service) mapProductLocation(location ResolvedLocation, packages []strin
 			location.AirQualityID = matches[0].Location.ID
 		}
 	}
-	if has("hydrometric") {
+	if has("climate_summary") && strings.TrimSpace(location.ClimateID) == "" {
+		if matches := s.capabilities.Nearest(locationdb.CapabilityClimate, latitude, longitude, location.Province, 1, climateSearchRadiusKM); len(matches) > 0 {
+			location.ClimateID = matches[0].Location.ID
+		}
+	}
+	if has("hydrometric") && strings.TrimSpace(location.HydrometricID) == "" {
 		if matches := s.capabilities.Nearest(locationdb.CapabilityHydrometric, latitude, longitude, location.Province, 1, hydrometricSearchRadiusKM); len(matches) > 0 {
 			location.HydrometricID = matches[0].Location.ID
 		}
@@ -103,6 +108,35 @@ func (s *Service) mapProductLocation(location ResolvedLocation, packages []strin
 	if has("marine_forecast") {
 		if matches := s.capabilities.Nearest(locationdb.CapabilityMarineForecast, latitude, longitude, location.Province, 1, marineSearchRadiusKM); len(matches) > 0 {
 			location.MarineForecastID = matches[0].Location.ID
+		}
+	}
+	return location
+}
+
+// mapMissingProductCapabilities covers callers of the HTTP product endpoint
+// that did not first travel through an IVR menu. Explicit validated targets
+// remain intact, while climate and river products still receive the nearest
+// usable capability for the resolved caller location.
+func (s *Service) mapMissingProductCapabilities(location ResolvedLocation, packages []string) ResolvedLocation {
+	if s == nil || s.capabilities == nil {
+		return location
+	}
+	latitude, longitude, ok := resolvedCoordinates(location)
+	if !ok {
+		return location
+	}
+	requested := make(map[string]struct{}, len(packages))
+	for _, packageID := range packages {
+		requested[strings.ToLower(strings.TrimSpace(packageID))] = struct{}{}
+	}
+	if _, requestedClimate := requested["climate_summary"]; requestedClimate && strings.TrimSpace(location.ClimateID) == "" {
+		if matches := s.capabilities.Nearest(locationdb.CapabilityClimate, latitude, longitude, location.Province, 1, climateSearchRadiusKM); len(matches) > 0 {
+			location.ClimateID = matches[0].Location.ID
+		}
+	}
+	if _, requestedHydrometric := requested["hydrometric"]; requestedHydrometric && strings.TrimSpace(location.HydrometricID) == "" {
+		if matches := s.capabilities.Nearest(locationdb.CapabilityHydrometric, latitude, longitude, location.Province, 1, hydrometricSearchRadiusKM); len(matches) > 0 {
+			location.HydrometricID = matches[0].Location.ID
 		}
 	}
 	return location

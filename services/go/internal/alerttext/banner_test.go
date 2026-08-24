@@ -115,6 +115,18 @@ AL|003|MOB|Baldwin|ALC003|Baldwin|001003|C|se|30.6592|-87.7461
 	}
 }
 
+func TestResolveAreaNamesUsesParentLabelForPartialSAMECode(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "managed", "csv", "CLC_Base_Zone.csv"), "CLC,NAME\n065435,Saskatoon area\n")
+	configPath := filepath.Join(dir, "config.yaml")
+
+	areas := ResolveAreaNames(configPath, nil, []string{"165435", "965435"})
+	want := []string{"northwest portion of Saskatoon area", "southeast portion of Saskatoon area"}
+	if strings.Join(areas, "|") != strings.Join(want, "|") {
+		t.Fatalf("areas = %#v, want %#v", areas, want)
+	}
+}
+
 func TestResolveAreaNamesUsesNWSMarineNames(t *testing.T) {
 	dir := t.TempDir()
 	mustWrite(t, filepath.Join(dir, "managed", "csv", "NWS_MARINE_ZONES.csv"), `region,zone_ugc,same_code,name,lon,lat,operational,source_url

@@ -10,7 +10,7 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
+use rusqlite::{named_params, params, Connection, OpenFlags, OptionalExtension, Row};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use strsim::jaro_winkler;
@@ -1305,7 +1305,8 @@ impl WorkerCatalog {
                         longitude,
                         radius_km,
                         options.limit.saturating_mul(20).clamp(50, 1000),
-                        options.as_of.as_deref(),
+                        filters,
+                        options,
                     )?,
                     PackFormat::Legacy => legacy_spatial_candidates(
                         &pack.connection,
@@ -1869,23 +1870,77 @@ fn normalized_spatial_candidates(
     longitude: f64,
     radius_km: f64,
     limit: usize,
-    as_of: Option<&str>,
+    filters: &QueryFilters,
+    options: &QueryOptions,
 ) -> Result<Vec<Candidate>, CatalogError> {
-    let as_of = as_of.unwrap_or("");
+    let as_of = options.as_of.as_deref().unwrap_or("");
     let bbox = bounding_box(latitude, longitude, radius_km);
+    let kinds =
+        Value::Array(filters.kinds.iter().cloned().map(Value::String).collect()).to_string();
+    let capabilities = Value::Array(
+        filters
+            .capabilities
+            .iter()
+            .cloned()
+            .map(Value::String)
+            .collect(),
+    )
+    .to_string();
+    let station_mode = match options.station_mode_requirement {
+        StationModeRequirement::Any => "any",
+        StationModeRequirement::Auto => "auto",
+        StationModeRequirement::Manual => "manual",
+    };
     let mut statement = connection.prepare(
         "SELECT DISTINCT g.entity_pk, g.latitude, g.longitude, g.geometry_wkb
          FROM entity_rtree r
          JOIN geometries g ON g.geometry_pk = r.geometry_pk
-         WHERE r.min_lon <= ?3 AND r.max_lon >= ?1
-           AND r.min_lat <= ?4 AND r.max_lat >= ?2
-           AND (?5 != '' OR g.is_current = 1)
-           AND (g.valid_from IS NULL OR date(g.valid_from) <= date(CASE WHEN ?5 = '' THEN 'now' ELSE ?5 END))
-           AND (g.valid_to IS NULL OR date(g.valid_to) >= date(CASE WHEN ?5 = '' THEN 'now' ELSE ?5 END))
-         LIMIT ?6",
+         JOIN entities e ON e.entity_pk = g.entity_pk
+         WHERE r.min_lon <= :max_lon AND r.max_lon >= :min_lon
+           AND r.min_lat <= :max_lat AND r.max_lat >= :min_lat
+           AND (:as_of != '' OR g.is_current = 1)
+           AND (g.valid_from IS NULL OR date(g.valid_from) <= date(CASE WHEN :as_of = '' THEN 'now' ELSE :as_of END))
+           AND (g.valid_to IS NULL OR date(g.valid_to) >= date(CASE WHEN :as_of = '' THEN 'now' ELSE :as_of END))
+           AND (:include_inactive = 1 OR lower(e.lifecycle_status) NOT IN ('inactive', 'retired'))
+           AND (:kinds = '[]' OR EXISTS(
+                SELECT 1 FROM json_each(:kinds) wanted
+                WHERE lower(e.kind) = lower(CAST(wanted.value AS TEXT))
+           ))
+           AND (:country = '' OR lower(COALESCE(e.country, '')) = lower(:country))
+           AND (:region = '' OR lower(COALESCE(e.region, '')) = lower(:region))
+           AND NOT EXISTS(
+                SELECT 1 FROM json_each(:capabilities) wanted
+                WHERE NOT EXISTS(
+                    SELECT 1 FROM entity_capabilities capability
+                    WHERE capability.entity_pk = g.entity_pk
+                      AND lower(capability.capability) = lower(CAST(wanted.value AS TEXT))
+                )
+           )
+           AND (:station_mode = 'any' OR lower(COALESCE(json_extract(e.attributes_json, '$.station_mode'), '')) = :station_mode)
+         ORDER BY
+           (COALESCE(g.latitude, (g.min_lat + g.max_lat) / 2.0) - :latitude) *
+           (COALESCE(g.latitude, (g.min_lat + g.max_lat) / 2.0) - :latitude) +
+           (COALESCE(g.longitude, (g.min_lon + g.max_lon) / 2.0) - :longitude) *
+           (COALESCE(g.longitude, (g.min_lon + g.max_lon) / 2.0) - :longitude)
+         LIMIT :limit",
     )?;
     let rows = statement.query_map(
-        params![bbox[0], bbox[1], bbox[2], bbox[3], as_of, limit as i64],
+        named_params! {
+            ":min_lon": bbox[0],
+            ":min_lat": bbox[1],
+            ":max_lon": bbox[2],
+            ":max_lat": bbox[3],
+            ":latitude": latitude,
+            ":longitude": longitude,
+            ":as_of": as_of,
+            ":include_inactive": i64::from(options.include_inactive),
+            ":kinds": &kinds,
+            ":country": filters.country.as_deref().unwrap_or_default(),
+            ":region": filters.region.as_deref().unwrap_or_default(),
+            ":capabilities": &capabilities,
+            ":station_mode": station_mode,
+            ":limit": limit as i64,
+        },
         |row| {
             Ok((
                 row.get::<_, i64>(0)?,
@@ -3922,6 +3977,7 @@ fn facet_for_kind(kind: &str) -> &str {
         | "marine_station"
         | "marine_buoy"
         | "climate_station"
+        | "virtual_climate_station"
         | "hydrometric_station" => "station",
         "airport" => "airport",
         "air_quality_station" => "air_quality",
@@ -3991,6 +4047,143 @@ mod tests {
                 .expect("count"),
             0
         );
+    }
+
+    #[test]
+    fn nearest_filters_capabilities_before_bounding_candidate_window() {
+        let connection = Connection::open_in_memory().expect("catalog");
+        connection.execute_batch(OVERLAY_SCHEMA).expect("schema");
+        for index in 0..80 {
+            insert_spatial_fixture(
+                &connection,
+                &format!("urn:haze:location:forecast-{index}"),
+                "forecast_zone",
+                "forecast.public",
+                50.0 + index as f64 / 1_000_000.0,
+                -104.0,
+            );
+        }
+        insert_spatial_fixture(
+            &connection,
+            "urn:haze:location:climate",
+            "climate_station",
+            "climate",
+            50.01,
+            -104.0,
+        );
+        let worker = spatial_worker(connection);
+        let results = worker
+            .nearest(
+                50.0,
+                -104.0,
+                &QueryFilters {
+                    capabilities: vec!["climate".to_string()],
+                    ..QueryFilters::default()
+                },
+                &QueryOptions {
+                    limit: 1,
+                    max_distance_km: Some(25.0),
+                    ..QueryOptions::default()
+                },
+            )
+            .expect("nearest climate candidate");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].entity.id, "urn:haze:location:climate");
+    }
+
+    #[test]
+    fn nearest_orders_rtree_candidates_before_limiting_results() {
+        let connection = Connection::open_in_memory().expect("catalog");
+        connection.execute_batch(OVERLAY_SCHEMA).expect("schema");
+        insert_spatial_fixture(
+            &connection,
+            "urn:haze:location:far",
+            "weather_station",
+            "observation.surface",
+            50.08,
+            -104.0,
+        );
+        insert_spatial_fixture(
+            &connection,
+            "urn:haze:location:near",
+            "weather_station",
+            "observation.surface",
+            50.001,
+            -104.0,
+        );
+        let worker = spatial_worker(connection);
+        let results = worker
+            .nearest(
+                50.0,
+                -104.0,
+                &QueryFilters::default(),
+                &QueryOptions {
+                    limit: 1,
+                    max_distance_km: Some(25.0),
+                    ..QueryOptions::default()
+                },
+            )
+            .expect("nearest station");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].entity.id, "urn:haze:location:near");
+    }
+
+    fn spatial_worker(connection: Connection) -> WorkerCatalog {
+        WorkerCatalog {
+            generation: "fixture".to_string(),
+            packs: vec![OpenPack {
+                id: "fixture".to_string(),
+                priority: 10,
+                format: PackFormat::Normalized,
+                connection,
+                legacy_name_index: None,
+            }],
+            geometry_packs: Vec::new(),
+            feed_bound_entities: HashSet::new(),
+        }
+    }
+
+    fn insert_spatial_fixture(
+        connection: &Connection,
+        canonical_id: &str,
+        kind: &str,
+        capability: &str,
+        latitude: f64,
+        longitude: f64,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO entities(
+                    canonical_id, kind, country, region, lifecycle_status,
+                    reporting_status, source_quality, attributes_json
+                 ) VALUES(?1, ?2, 'CA', 'SK', 'active', 'recently_reporting', 0.9, '{}')",
+                params![canonical_id, kind],
+            )
+            .expect("entity");
+        let entity_pk = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO entity_capabilities(entity_pk, capability) VALUES(?1, ?2)",
+                params![entity_pk, capability],
+            )
+            .expect("capability");
+        connection
+            .execute(
+                "INSERT INTO geometries(
+                    entity_pk, geometry_type, latitude, longitude,
+                    min_lon, max_lon, min_lat, max_lat, is_current
+                 ) VALUES(?1, 'point', ?2, ?3, ?3, ?3, ?2, ?2, 1)",
+                params![entity_pk, latitude, longitude],
+            )
+            .expect("geometry");
+        let geometry_pk = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO entity_rtree(geometry_pk, min_lon, max_lon, min_lat, max_lat)
+                 VALUES(?1, ?2, ?2, ?3, ?3)",
+                params![geometry_pk, longitude, latitude],
+            )
+            .expect("rtree");
     }
 
     #[test]

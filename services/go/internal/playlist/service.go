@@ -20,6 +20,7 @@ import (
 	"github.com/meowraii/haze-weather-radio/services/go/internal/alertmodel"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/alerttext"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/datastore"
+	"github.com/meowraii/haze-weather-radio/services/go/internal/lead"
 )
 
 const serviceID = "haze-playlist"
@@ -29,6 +30,7 @@ const pendingReplayInterval = 2 * time.Second
 const cachedRoutineFallbackMaxAge = 15 * time.Minute
 const cachedStartupFallbackMaxAge = 30 * time.Minute
 const productSegmentWorkerLimit = 4
+const configuredAlertLeadMaxBytes int64 = 16 << 20
 
 var errSystemShutdown = errors.New("system shutdown requested")
 
@@ -210,10 +212,15 @@ func (s *Service) handleEvent(ctx context.Context, event map[string]any) {
 		data := eventDataWithIdentity(event)
 		for _, planner := range s.matchFeedsFromEvent(event) {
 			if s.preparations == nil {
+				planner.publishAutomationDispatchStatus(data, "accepted", "")
 				planner.queuePriorityAlert(ctx, data)
 				continue
 			}
-			s.enqueuePriorityPreparation(ctx, planner, data)
+			if err := s.enqueuePriorityPreparation(ctx, planner, data); err != nil {
+				planner.publishAutomationDispatchStatus(data, "failed", err.Error())
+				continue
+			}
+			planner.publishAutomationDispatchStatus(data, "accepted", "")
 		}
 	case "cap.alert.cancelled":
 		data := eventDataWithIdentity(event)
@@ -1520,12 +1527,14 @@ func (p *feedPlanner) queuePriorityAlert(ctx context.Context, data map[string]an
 		cleanupSupersededAlertQueueParts(p.cfg.BaseDir, p.feed.ID, alertID, "")
 		p.lastError = ""
 		p.writeState()
+		p.publishAutomationDispatchStatus(data, "failed", "priority alert request is stale")
 		return
 	}
 	prepared, err := p.preparePriorityAlert(ctx, data)
 	if err != nil {
 		p.lastError = err.Error()
 		p.writeState()
+		p.publishAutomationDispatchStatus(data, "failed", p.lastError)
 		return
 	}
 	if priorityAlertRequestStale(data, time.Now().UTC()) {
@@ -1533,11 +1542,13 @@ func (p *feedPlanner) queuePriorityAlert(ctx context.Context, data map[string]an
 		p.discardPriorityAlertPreparation(prepared)
 		p.lastError = ""
 		p.writeState()
+		p.publishAutomationDispatchStatus(data, "failed", "priority alert request became stale during preparation")
 		return
 	}
 	if err := p.commitPriorityAlert(prepared); err != nil {
 		p.lastError = err.Error()
 		p.writeState()
+		p.publishAutomationDispatchStatus(data, "failed", p.lastError)
 		return
 	}
 	p.lastError = ""
@@ -1609,8 +1620,10 @@ func (p *feedPlanner) preparePriorityAlert(ctx context.Context, data map[string]
 			_ = os.Remove(audioPath + ".voice")
 		}
 	}()
+	leadIn, leadOut, leadName := p.configuredAlertLeadAudio(ctx, data, workID, alertSampleRate, alertChannels)
+	hasConfiguredLead := len(leadIn) > 0 || len(leadOut) > 0
 	voicePath := audioPath
-	if includeSame || includeAttentionTone {
+	if includeSame || includeAttentionTone || hasConfiguredLead {
 		voicePath = audioPath + ".voice"
 		defer func() { _ = os.Remove(voicePath) }()
 	}
@@ -1645,7 +1658,7 @@ func (p *feedPlanner) preparePriorityAlert(ctx context.Context, data map[string]
 		}
 	}
 	if includeSame {
-		if err := combineSAMEAlertAudio(audioPath, sameHeader.Audio, voicePath, sameEOM.Audio, alertSampleRate, alertChannels); err != nil {
+		if err := combineConfiguredLeadAlertAudio(audioPath, leadIn, sameHeader.Audio, voicePath, sameEOM.Audio, leadOut, alertSampleRate, alertChannels); err != nil {
 			return priorityAlertPreparation{}, fmt.Errorf("SAME alert assembly failed: %w", err)
 		}
 		if source == "cap-broadcast-audio" {
@@ -1654,7 +1667,7 @@ func (p *feedPlanner) preparePriorityAlert(ctx context.Context, data map[string]
 			source = "cap-same-tts"
 		}
 	} else if includeAttentionTone {
-		if err := combineAttentionAlertAudio(audioPath, attentionTone.Audio, voicePath, alertSampleRate, alertChannels); err != nil {
+		if err := combineConfiguredLeadAlertAudio(audioPath, leadIn, attentionTone.Audio, voicePath, nil, leadOut, alertSampleRate, alertChannels); err != nil {
 			return priorityAlertPreparation{}, fmt.Errorf("attention tone alert assembly failed: %w", err)
 		}
 		if source == "cap-broadcast-audio" {
@@ -1662,6 +1675,18 @@ func (p *feedPlanner) preparePriorityAlert(ctx context.Context, data map[string]
 		} else {
 			source = "cap-tone-tts"
 		}
+	} else if hasConfiguredLead {
+		if err := combineConfiguredLeadAlertAudio(audioPath, leadIn, nil, voicePath, nil, leadOut, alertSampleRate, alertChannels); err != nil {
+			return priorityAlertPreparation{}, fmt.Errorf("alert lead assembly failed: %w", err)
+		}
+		if source == "cap-broadcast-audio" {
+			source = "cap-lead-broadcast-audio"
+		} else {
+			source = "cap-lead-tts"
+		}
+	}
+	if hasConfiguredLead && leadName != "" {
+		log.Printf("priority alert %s applied lead statement %q", alertID, leadName)
 	}
 	info, err := pcmInfo(audioPath, alertSampleRate, alertChannels)
 	if err != nil {
@@ -1711,6 +1736,42 @@ func (p *feedPlanner) preparePriorityAlert(ctx context.Context, data map[string]
 	}, nil
 }
 
+func (p *feedPlanner) publishAutomationDispatchStatus(data map[string]any, status string, errorText string) {
+	dispatchKey := firstText(nil, data, "dispatch_key")
+	if p.bridge == nil || dispatchKey == "" {
+		return
+	}
+	status = strings.ToLower(strings.TrimSpace(status))
+	switch status {
+	case "accepted", "completed", "failed":
+	default:
+		return
+	}
+	statusData := map[string]any{
+		"dispatch_key":  dispatchKey,
+		"automation_id": firstText(nil, data, "automation_id"),
+		"feed_id":       p.feed.ID,
+		"scheduled_for": firstText(nil, data, "scheduled_for"),
+		"alert_id":      firstText(nil, data, "alert_id"),
+	}
+	if strings.TrimSpace(errorText) != "" {
+		statusData["error"] = strings.TrimSpace(errorText)
+	}
+	if err := p.bridge.Publish(map[string]any{
+		"type":    "automation.dispatch." + status,
+		"source":  serviceID,
+		"subject": dispatchKey,
+		"data":    statusData,
+	}); err != nil {
+		log.Printf(
+			"playlist automation %s acknowledgement failed for %s: %v",
+			status,
+			dispatchKey,
+			err,
+		)
+	}
+}
+
 func (p *feedPlanner) commitPriorityAlert(prepared priorityAlertPreparation) error {
 	manifest := prepared.Manifest
 	cleanupSupersededAlertQueueParts(p.cfg.BaseDir, p.feed.ID, manifest.AlertID, manifest.ID)
@@ -1722,6 +1783,7 @@ func (p *feedPlanner) commitPriorityAlert(prepared priorityAlertPreparation) err
 		return err
 	}
 	p.publishAlertAudioReady(manifest, prepared.Data, prepared.AlertText, prepared.SAMEHeader)
+	p.publishAutomationDispatchStatus(prepared.Data, "completed", "")
 	return nil
 }
 
@@ -1961,6 +2023,79 @@ func (p *feedPlanner) prepareLocalAlertAudio(ctx context.Context, rawPath string
 	convertCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
 	return convertAlertAudioToPCM(convertCtx, sourcePath, outputPath, sampleRate, channels)
+}
+
+func (p *feedPlanner) configuredAlertLeadAudio(ctx context.Context, data map[string]any, workID string, sampleRate int, channels int) ([]byte, []byte, string) {
+	configured := mapAt(data, "alert_lead")
+	if len(configured) == 0 {
+		return nil, nil, ""
+	}
+	name := strings.TrimSpace(stringAt(configured, "name"))
+	load := func(slot string) []byte {
+		rawPath := strings.TrimSpace(stringAt(configured, slot))
+		if rawPath == "" {
+			return nil
+		}
+		pcm, err := p.loadConfiguredAlertLeadAudio(ctx, rawPath, workID+"-"+slot, sampleRate, channels)
+		if err != nil {
+			log.Printf("priority alert lead %q %s skipped: %v", fallbackText(name, "unnamed"), slot, err)
+			return nil
+		}
+		return pcm
+	}
+	return load("lead_in"), load("lead_out"), name
+}
+
+func (p *feedPlanner) loadConfiguredAlertLeadAudio(ctx context.Context, rawPath string, workID string, sampleRate int, channels int) ([]byte, error) {
+	normalized, err := lead.NormalizeAudioPath(rawPath)
+	if err != nil {
+		return nil, err
+	}
+	if normalized == "" {
+		return nil, nil
+	}
+	sourcePath, err := lead.ResolveAudioPath(p.cfg.BaseDir, normalized)
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Stat(sourcePath)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("configured lead audio is not a regular file")
+	}
+	if info.Size() <= 0 || info.Size() > configuredAlertLeadMaxBytes {
+		return nil, fmt.Errorf("configured lead audio must be between 1 byte and %d MiB", configuredAlertLeadMaxBytes>>20)
+	}
+	tempDir := filepath.Join(p.cfg.BaseDir, "runtime", "audio", "alerts")
+	if err := os.MkdirAll(tempDir, 0o755); err != nil {
+		return nil, err
+	}
+	temp, err := os.CreateTemp(tempDir, safeID("lead-"+workID)+"-*.pcm16le")
+	if err != nil {
+		return nil, err
+	}
+	tempPath := temp.Name()
+	if err := temp.Close(); err != nil {
+		_ = os.Remove(tempPath)
+		return nil, err
+	}
+	if err := os.Remove(tempPath); err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	defer func() { _ = os.Remove(tempPath) }()
+	if err := p.prepareLocalAlertAudio(ctx, normalized, tempPath, sampleRate, channels, nil); err != nil {
+		return nil, err
+	}
+	pcm, err := os.ReadFile(tempPath)
+	if err != nil {
+		return nil, err
+	}
+	if len(pcm) == 0 || len(pcm) > int(configuredAlertLeadMaxBytes*2) {
+		return nil, fmt.Errorf("converted lead audio is outside the allowed size")
+	}
+	return pcm, nil
 }
 
 func (p *feedPlanner) resolveAlertAudioPath(rawPath string) (string, error) {
@@ -2417,7 +2552,15 @@ func combineAttentionAlertAudio(outputPath string, tone []byte, voicePath string
 	return combineAlertAudio(outputPath, tone, voicePath, nil, sampleRate, channels)
 }
 
+func combineConfiguredLeadAlertAudio(outputPath string, leadIn []byte, headerOrTone []byte, voicePath string, eom []byte, leadOut []byte, sampleRate int, channels int) error {
+	return combineAlertAudioSegments(outputPath, leadIn, headerOrTone, voicePath, eom, leadOut, sampleRate, channels)
+}
+
 func combineAlertAudio(outputPath string, lead []byte, voicePath string, tail []byte, sampleRate int, channels int) error {
+	return combineAlertAudioSegments(outputPath, nil, lead, voicePath, tail, nil, sampleRate, channels)
+}
+
+func combineAlertAudioSegments(outputPath string, preRoll []byte, lead []byte, voicePath string, tail []byte, postRoll []byte, sampleRate int, channels int) error {
 	voice, err := os.Open(voicePath)
 	if err != nil {
 		return err
@@ -2439,21 +2582,47 @@ func combineAlertAudio(outputPath string, lead []byte, voicePath string, tail []
 		return err
 	}
 	writeErr := func() error {
-		if len(lead) > 0 {
-			if _, err := file.Write(lead); err != nil {
+		writeSegmentWithGap := func(segment []byte) error {
+			if len(segment) == 0 {
+				return nil
+			}
+			if _, err := file.Write(segment); err != nil {
 				return err
 			}
-			if padding := alertTransitionPadding(lead, sampleRate, channels, time.Second); len(padding) > 0 {
+			if padding := alertTransitionPadding(segment, sampleRate, channels, time.Second); len(padding) > 0 {
 				if _, err := file.Write(padding); err != nil {
 					return err
 				}
 			}
+			return nil
+		}
+		if err := writeSegmentWithGap(preRoll); err != nil {
+			return err
+		}
+		if err := writeSegmentWithGap(lead); err != nil {
+			return err
 		}
 		if _, err := io.Copy(file, voice); err != nil {
 			return err
 		}
 		if len(tail) > 0 {
 			if _, err := file.Write(tail); err != nil {
+				return err
+			}
+		}
+		if len(postRoll) > 0 {
+			if len(tail) > 0 {
+				if padding := alertTransitionPadding(tail, sampleRate, channels, time.Second); len(padding) > 0 {
+					if _, err := file.Write(padding); err != nil {
+						return err
+					}
+				}
+			} else if padding := silencePCM(sampleRate, channels, time.Second); len(padding) > 0 {
+				if _, err := file.Write(padding); err != nil {
+					return err
+				}
+			}
+			if _, err := file.Write(postRoll); err != nil {
 				return err
 			}
 		}

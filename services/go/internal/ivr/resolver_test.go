@@ -591,6 +591,104 @@ func TestResolverAcceptsProvinceAndLocationShorthand(t *testing.T) {
 	}
 }
 
+func TestResolverAcceptsVariableLengthHelloWeatherShortCode(t *testing.T) {
+	cfg := loadedConfig{
+		IVR:   Config{DefaultLanguage: "en-CA"},
+		Feeds: []feedXML{{ID: "qc-0001", EnabledRaw: "true", Timezone: "America/Toronto"}},
+	}
+	resolver := resolverWithHelloWeather(cfg,
+		locationRecord{Code: "03013", Source: "hello_weather", Name: "Saint-Jérôme", Province: "QC", Forecast: "qc-13"},
+		locationRecord{Code: "03133", Source: "hello_weather", Name: "Quebec", Province: "QC", Forecast: "qc-133"},
+	)
+
+	location, err := resolver.Resolve("3133")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if location.Code != "03133" || location.Forecast != "qc-133" {
+		t.Fatalf("location = %#v", location)
+	}
+	if !resolver.helloWeatherShortCodeHasLongerMatch("313") {
+		t.Fatal("short-code prefix was not recognized as incomplete")
+	}
+	if resolver.CanAutoSubmitCallerCode("313") {
+		t.Fatal("ambiguous short-code prefix was auto-submittable")
+	}
+	if !resolver.CanAutoSubmitCallerCode("3133") {
+		t.Fatal("complete Quebec short code was not auto-submittable")
+	}
+}
+
+func TestResolverShortCodesCoverEveryLegacyProvinceFamily(t *testing.T) {
+	cfg := loadedConfig{
+		IVR:   Config{DefaultLanguage: "en-CA"},
+		Feeds: []feedXML{{ID: "default", EnabledRaw: "true", Timezone: "America/Regina"}},
+	}
+	records := []locationRecord{
+		{Code: "08074", Source: "hello_weather", Name: "Vancouver", Province: "BC", Forecast: "bc-74"},
+		{Code: "07052", Source: "hello_weather", Name: "Calgary", Province: "AB", Forecast: "ab-52"},
+		{Code: "06040", Source: "hello_weather", Name: "Saskatoon", Province: "SK", Forecast: "sk-40"},
+		{Code: "05038", Source: "hello_weather", Name: "Winnipeg", Province: "MB", Forecast: "mb-38"},
+		{Code: "04143", Source: "hello_weather", Name: "Toronto", Province: "ON", Forecast: "on-143"},
+		{Code: "03147", Source: "hello_weather", Name: "Montréal", Province: "QC", Forecast: "qc-147"},
+		{Code: "01723", Source: "hello_weather", Name: "Saint John", Province: "NB", Forecast: "nb-23"},
+		{Code: "01119", Source: "hello_weather", Name: "Halifax", Province: "NS", Forecast: "ns-19"},
+		{Code: "01805", Source: "hello_weather", Name: "Charlottetown", Province: "PE", Forecast: "pe-5"},
+		{Code: "02024", Source: "hello_weather", Name: "Mount Pearl", Province: "NL", Forecast: "nl-24"},
+		{Code: "09116", Source: "hello_weather", Name: "Whitehorse", Province: "YT", Forecast: "yt-16"},
+		{Code: "09524", Source: "hello_weather", Name: "Yellowknife", Province: "NT", Forecast: "nt-24"},
+		{Code: "09821", Source: "hello_weather", Name: "Iqaluit", Province: "NU", Forecast: "nu-21"},
+	}
+	resolver := resolverWithHelloWeather(cfg, records...)
+	for _, record := range records {
+		short := helloWeatherProvinceSelectorForTest(record.Province) + strings.TrimLeft(record.Code[2:], "0")
+		location, err := resolver.Resolve(short)
+		if err != nil {
+			t.Fatalf("Resolve(%q): %v", short, err)
+		}
+		if location.Code != record.Code {
+			t.Fatalf("Resolve(%q) = %#v, want %s", short, location, record.Code)
+		}
+	}
+}
+
+func helloWeatherProvinceSelectorForTest(province string) string {
+	switch province {
+	case "NS", "NB", "PE":
+		return "1"
+	case "NL":
+		return "2"
+	case "QC":
+		return "3"
+	case "ON":
+		return "4"
+	case "MB":
+		return "5"
+	case "SK":
+		return "6"
+	case "AB":
+		return "7"
+	case "BC":
+		return "8"
+	case "YT", "NT", "NU":
+		return "9"
+	default:
+		return ""
+	}
+}
+
+func TestResolverRejectsUnknownHelloWeatherCodeInsteadOfSynthesizingLocation(t *testing.T) {
+	cfg := loadedConfig{
+		IVR:   Config{DefaultLanguage: "en-CA"},
+		Feeds: []feedXML{{ID: "qc-0001", EnabledRaw: "true", Timezone: "America/Toronto"}},
+	}
+	resolver := resolverWithHelloWeather(cfg, locationRecord{Code: "03133", Source: "hello_weather", Name: "Quebec", Province: "QC", Forecast: "qc-133"})
+
+	if _, err := resolver.Resolve("03199"); err == nil {
+		t.Fatal("unknown legacy code resolved as a synthetic location")
+	}
+}
+
 func TestResolverPrefersHelloWeatherOverLeftPadCollision(t *testing.T) {
 	cfg := loadedConfig{
 		IVR: Config{DefaultLanguage: "en-CA"},

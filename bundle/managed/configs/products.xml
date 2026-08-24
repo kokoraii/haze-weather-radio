@@ -278,7 +278,7 @@
 
 
   <product id="climate_summary" variant="0" enabled="true">
-    <lang iso="en" readerid="01">
+    <lang iso="en" readerid="00">
       <text key="opener">The {source} climate summary.</text>
       <summary>
         <placeholder>The climate summary for {location} was not available.</placeholder>
@@ -302,7 +302,7 @@
   </product>
 
   <product id="marine_forecast" variant="0" enabled="true">
-    <lang iso="en" readerid="01">
+    <lang iso="en" readerid="00">
       <text key="opener">The {source} marine forecast for {area}, issued at {issue_hour} {issue_minute} {issue_ampm} {issue_timezone}.</text>
       <forecast>
         <warnings>

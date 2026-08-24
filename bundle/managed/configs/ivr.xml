@@ -12,20 +12,27 @@
     <line key="goodbye">Goodbye.</line>
   </defaults>
 
+  <menu id="language_select" timeout="8s" retries="2">
+    <option digit="1" action="language" language="en-US" next="entry">
+      <line key="main">1 for English.</line>
+    </option>
+    <option digit="1" action="language" language="en-US" next="entry">
+      <line key="main">deux pour le français.</line>
+    </option>
+    <option digit="1" action="language" language="en-US" next="entry">
+      <line key="main">tres para español.</line>
+    </option>
+  </menu>
+
   <menu id="entry" timeout="8s" retries="2">
     <line key="greeting">You have reached {extension_telephone_service_name}.</line>
     <line key="main">{language_options}, or press star for your NOAA Geophysical Alert Message.</line>
     <line key="main_single_language">Enter your province, or enter a former Hello Weather location code.</line>
-    <option digit="1" action="language" language="en-US" next="location_code"/>
-    <option digit="2" action="language" language="fr-CA" next="location_code"/>
-    <option digit="3" action="language" language="es" next="location_code"/>
     <option digit="0" action="product" packages="geophysical_alert"/>
     <option digit="*" action="product" packages="geophysical_alert"/>
   </menu>
 
-  <menu id="language_select" timeout="8s" retries="2">
-    <line key="main">1 for English. 2 for French. 3 for Spanish.</line>
-  </menu>
+
 
   <menu id="location_code" timeout="10s" retries="2">
     <line key="main">Enter your province, or enter a former Hello Weather location code.</line>
@@ -38,7 +45,7 @@
   </menu>
 
   <menu id="location_search" timeout="10s" retries="2">
-    <line key="main">Say a location, or type its name. Haze detects predictive T9 or repeated-key spelling automatically. Press 0 between words, pound to finish, or star to erase.</line>
+    <line key="main">Say a location, or type its name. Press 0 between words, pound to finish, or star to erase.</line>
     <line key="main" language="fr-CA">Dites un lieu ou tapez son nom. Haze détecte automatiquement le mode T9 prédictif ou les touches répétées. Appuyez sur 0 entre les mots, sur carré pour terminer ou sur étoile pour effacer.</line>
     <line key="voice_unavailable">Voice search is unavailable. Please use the keypad.</line>
     <line key="voice_unavailable" language="fr-CA">La recherche vocale est indisponible. Utilisez le clavier.</line>

@@ -210,6 +210,24 @@ func TestAccountLockAutomaticallyExpiresAfterTwoMinutes(t *testing.T) {
 	}
 }
 
+func TestAccountLockRepairIntervalIsBounded(t *testing.T) {
+	tests := []struct {
+		lockDuration time.Duration
+		want         time.Duration
+	}{
+		{lockDuration: 0, want: minimumAccountLockRepairInterval},
+		{lockDuration: time.Second, want: minimumAccountLockRepairInterval},
+		{lockDuration: 40 * time.Second, want: 10 * time.Second},
+		{lockDuration: 2 * time.Minute, want: maximumAccountLockRepairInterval},
+		{lockDuration: time.Hour, want: maximumAccountLockRepairInterval},
+	}
+	for _, test := range tests {
+		if got := accountLockRepairInterval(test.lockDuration); got != test.want {
+			t.Fatalf("repair interval for %s = %s, want %s", test.lockDuration, got, test.want)
+		}
+	}
+}
+
 func TestAdministratorAccountNeverLocks(t *testing.T) {
 	manager, _ := newTestAccountAuthManager(t, false)
 	defer manager.Close()

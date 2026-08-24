@@ -83,6 +83,22 @@ function filterRecordsByFeed(records) {
     return records.filter((record) => (record.feed_id || 'unassigned') === activeFeedFilter);
 }
 
+function isNotApplicableDecision(record) {
+    const decisionClass = String(record?.decision_class || '').trim().toLowerCase();
+    if (decisionClass) return decisionClass === 'not_applicable';
+    return String(record?.reason || '').trim().toLowerCase() === 'outside feed coverage';
+}
+
+function groupedNotApplicable(records) {
+    const groups = new Map();
+    for (const record of records) {
+        const key = record.id || `${record.sender || ''}\u0000${record.sent || ''}\u0000${record.headline || ''}`;
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(record);
+    }
+    return [...groups.values()];
+}
+
 function groupedAccepted(records) {
     const groups = new Map();
     for (const record of records) {
@@ -94,10 +110,11 @@ function groupedAccepted(records) {
 }
 
 function metaItems(record) {
+    const decisionLabel = record.decision_label || (isNotApplicableDecision(record) ? 'Not applicable to feed' : '');
     const items = [
         ['Event', record.event || 'unknown'],
         ['Feed', record.feed_id || 'none'],
-        ['Status', record.status || record.bucket || 'unknown'],
+        ['Status', decisionLabel || record.status || record.bucket || 'unknown'],
         ['Message', record.message_type || 'unknown'],
         ['Severity', record.severity || 'unknown'],
         ['Urgency', record.urgency || 'unknown'],
@@ -254,6 +271,62 @@ function renderAccepted(records) {
     `).join('');
 }
 
+function renderNotApplicableGroup(records) {
+    const representative = records[0] || {};
+    const feeds = [...new Set(records.map((record) => record.feed_id || 'unassigned'))]
+        .sort((left, right) => left.localeCompare(right, undefined, { numeric: true, sensitivity: 'base' }));
+    const headline = representative.headline || representative.event || 'Weather Alert';
+    const areas = Array.isArray(representative.areas) ? representative.areas.join('; ') : '';
+    return `
+        <details class="alert-routing-decision-group">
+            <summary>
+                <span>
+                    <strong>${escapeHtml(headline)}</strong>
+                    <small>${escapeHtml(areas || representative.sender || 'No area text available')}</small>
+                </span>
+                <span>${records.length} feed decision${records.length === 1 ? '' : 's'}</span>
+            </summary>
+            <p class="alert-routing-decision-note">This CAP message did not overlap the configured coverage for ${escapeHtml(feeds.join(', '))}. Expand the per-feed audit records below for details or manual actions.</p>
+            <div class="alert-routing-decision-records">
+                ${records.map(alertCard).join('')}
+            </div>
+        </details>
+    `;
+}
+
+function renderRejected(records) {
+    const operational = records.filter((record) => !isNotApplicableDecision(record));
+    const notApplicable = records.filter(isNotApplicableDecision);
+    const groups = groupedNotApplicable(notApplicable);
+    const sections = [];
+    if (operational.length) {
+        sections.push(`
+            <section class="alert-feed-group">
+                <div class="alert-feed-group-hd">
+                    <strong>Rejected by policy or validation</strong>
+                    <span>${operational.length} feed decision${operational.length === 1 ? '' : 's'}</span>
+                </div>
+                ${operational.map(alertCard).join('')}
+            </section>
+        `);
+    }
+    if (groups.length) {
+        sections.push(`
+            <section class="alert-feed-group alert-routing-decisions">
+                <div class="alert-feed-group-hd">
+                    <strong>Not applicable to configured feeds</strong>
+                    <span>${groups.length} CAP alert${groups.length === 1 ? '' : 's'}, ${notApplicable.length} feed decisions</span>
+                </div>
+                <p class="alert-routing-decisions-note">These are expected coverage decisions from the national CAP stream, not operational failures.</p>
+                ${groups.map(renderNotApplicableGroup).join('')}
+            </section>
+        `);
+    }
+    return sections.length
+        ? sections.join('')
+        : '<article class="alert-empty">No rejected alerts are archived.</article>';
+}
+
 function renderArchive() {
     renderFeedSelect();
     const acceptedAll = recordsForTab('accepted');
@@ -266,6 +339,8 @@ function renderArchive() {
     const records = filterRecordsByFeed(recordsForTab(activeTab));
     if (activeTab === 'accepted') {
         list.innerHTML = renderAccepted(records);
+    } else if (activeTab === 'rejected') {
+        list.innerHTML = renderRejected(records);
     } else {
         list.innerHTML = records.length
             ? records.map(alertCard).join('')

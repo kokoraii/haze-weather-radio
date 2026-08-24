@@ -14,6 +14,7 @@ func TestConfiguredIdentifierUsesQualifiedFeedNamespaces(t *testing.T) {
 		{"marine_forecast", "m0000109", "marine", "eccc"},
 		{"marine_observation", "9401177", "msc", "eccc"},
 		{"hydrometric", "05HG001", "hydrometric", "eccc"},
+		{"climate", "VSSK32V", "virtual_climate", "eccc"},
 	}
 	for _, test := range tests {
 		input, ok := ConfiguredIdentifier("eccc", test.purpose, test.value)

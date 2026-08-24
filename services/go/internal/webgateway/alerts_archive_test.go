@@ -139,6 +139,81 @@ func TestArchiveRecordPayloadIncludesCAPXMLURLAndSAMEPreviewFlag(t *testing.T) {
 	}
 }
 
+func TestClassifyArchiveDecision(t *testing.T) {
+	tests := []struct {
+		name               string
+		bucket             string
+		reason             string
+		wantClass          string
+		wantLabel          string
+		wantOperationalErr bool
+	}{
+		{name: "accepted", bucket: "accepted", wantClass: archiveDecisionAccepted, wantLabel: "Accepted"},
+		{name: "expired", bucket: "expired", wantClass: archiveDecisionExpired, wantLabel: "Expired"},
+		{name: "outside coverage", bucket: "rejected", reason: "outside feed coverage", wantClass: archiveDecisionNotApplicable, wantLabel: "Not applicable to feed"},
+		{name: "test message", bucket: "rejected", reason: "test alert", wantClass: archiveDecisionTest, wantLabel: "Test message ignored"},
+		{name: "feed policy", bucket: "rejected", reason: "below feed alert threshold", wantClass: archiveDecisionPolicy, wantLabel: "Filtered by feed policy"},
+		{name: "unclassified rejection", bucket: "rejected", reason: "invalid CAP", wantClass: archiveDecisionRejected, wantLabel: "Rejected", wantOperationalErr: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := classifyArchiveDecision(test.bucket, test.reason)
+			if got.Class != test.wantClass || got.Label != test.wantLabel || got.OperationalFailure != test.wantOperationalErr {
+				t.Fatalf("classifyArchiveDecision(%q, %q) = %#v", test.bucket, test.reason, got)
+			}
+		})
+	}
+}
+
+func TestArchiveRejectedSummarySeparatesCoverageFanout(t *testing.T) {
+	records := []archiveCAPRecord{
+		{ID: "urn:test:storm", FeedID: "feed-a", Reason: "outside feed coverage"},
+		{ID: "urn:test:storm", FeedID: "feed-b", Reason: "outside feed coverage"},
+		{ID: "urn:test:fog", FeedID: "feed-a", Reason: "outside feed coverage"},
+		{ID: "urn:test:invalid", FeedID: "feed-a", Reason: "invalid CAP"},
+	}
+
+	summary := archiveRejectedSummary(records)
+	if got := summary["alert_count"]; got != 3 {
+		t.Fatalf("alert_count = %v, want 3", got)
+	}
+	if got := summary["feed_decision_count"]; got != 4 {
+		t.Fatalf("feed_decision_count = %v, want 4", got)
+	}
+	if got := summary["not_applicable_alert_count"]; got != 2 {
+		t.Fatalf("not_applicable_alert_count = %v, want 2", got)
+	}
+	if got := summary["not_applicable_feed_decision_count"]; got != 3 {
+		t.Fatalf("not_applicable_feed_decision_count = %v, want 3", got)
+	}
+	if got := summary["operational_failure_count"]; got != 1 {
+		t.Fatalf("operational_failure_count = %v, want 1", got)
+	}
+}
+
+func TestArchiveRecordPayloadClassifiesOutsideCoverageAsNotApplicable(t *testing.T) {
+	baseDir := t.TempDir()
+	alert := parseArchiveTestAlert(t, archiveTestCAP("urn:test:national-fanout", "Alert", "yellow warning - severe thunderstorm - in effect", "2099-06-15T21:30:00-06:00", false))
+	payload := archiveRecordPayload(archiveCAPRecord{
+		ID:     alert.Identifier,
+		FeedID: "feed-outside",
+		Status: "rejected",
+		Reason: "outside feed coverage",
+		Alert:  alert,
+	}, "rejected", baseDir)
+
+	if got := payload["decision_class"]; got != archiveDecisionNotApplicable {
+		t.Fatalf("decision_class = %v, want %q", got, archiveDecisionNotApplicable)
+	}
+	if got := payload["decision_label"]; got != "Not applicable to feed" {
+		t.Fatalf("decision_label = %v", got)
+	}
+	if operational, ok := payload["operational_failure"].(bool); !ok || operational {
+		t.Fatalf("operational_failure = %#v, want false", payload["operational_failure"])
+	}
+}
+
 func TestArchiveBroadcastAudioOnlyAllowsWebURLs(t *testing.T) {
 	alert := capmodel.Alert{Infos: []capmodel.AlertInfo{{
 		Resources: []capmodel.Resource{

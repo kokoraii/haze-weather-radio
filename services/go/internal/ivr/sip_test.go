@@ -1049,8 +1049,57 @@ func TestCollectLocationInputAutoSubmitsValidCode(t *testing.T) {
 	if !ok || geophysical || code != "06040" {
 		t.Fatalf("code=%q geophysical=%v ok=%v", code, geophysical, ok)
 	}
-	if elapsed < 550*time.Millisecond || elapsed > 1200*time.Millisecond {
-		t.Fatalf("auto-submit delay = %s, want about 600ms", elapsed)
+	if elapsed < 900*time.Millisecond || elapsed > 1500*time.Millisecond {
+		t.Fatalf("auto-submit delay = %s, want about one second", elapsed)
+	}
+}
+
+func TestLocationCodeAutoSubmitDelayUsesTwoSecondsForShortCodes(t *testing.T) {
+	cfg := loadedConfig{
+		IVR:   Config{DefaultLanguage: "en-CA"},
+		Feeds: []feedXML{testFeedWithLanguages("sk-0001", "en-CA")},
+	}
+	call := &sipCall{service: &Service{
+		cfg:      cfg,
+		resolver: resolverWithHelloWeather(cfg, locationRecord{Code: "06040", Source: "hello_weather", Name: "Saskatoon", Province: "SK"}),
+	}}
+	if delay, ok := call.locationCodeAutoSubmitDelay("640", "640"); !ok || delay != 2*time.Second {
+		t.Fatalf("short-code delay=%s ok=%v", delay, ok)
+	}
+	if delay, ok := call.locationCodeAutoSubmitDelay("06040", "06040"); !ok || delay != time.Second {
+		t.Fatalf("full-code delay=%s ok=%v", delay, ok)
+	}
+}
+
+func TestCollectLocationInputWaitsForLongerHelloWeatherShortCode(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cfg := loadedConfig{
+		IVR:   Config{DigitTimeoutSeconds: 2, DefaultLanguage: "en-CA"},
+		Feeds: []feedXML{testFeedWithLanguages("qc-0001", "en-CA")},
+	}
+	call := &sipCall{
+		ctx:    ctx,
+		digits: make(chan string, 8),
+		service: &Service{
+			cfg: cfg,
+			resolver: resolverWithHelloWeather(cfg,
+				locationRecord{Code: "03013", Source: "hello_weather", Name: "Saint-Jérôme", Province: "QC", Forecast: "qc-13"},
+				locationRecord{Code: "03133", Source: "hello_weather", Name: "Quebec", Province: "QC", Forecast: "qc-133"},
+			),
+		},
+	}
+	for _, digit := range []string{"3", "1", "3"} {
+		call.pushDigit(digit)
+	}
+	go func() {
+		time.Sleep(750 * time.Millisecond)
+		call.pushDigit("3")
+	}()
+
+	code, geophysical, ok := call.collectLocationInput(2*time.Second, "")
+	if !ok || geophysical || code != "3133" {
+		t.Fatalf("code=%q geophysical=%v ok=%v", code, geophysical, ok)
 	}
 }
 

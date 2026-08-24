@@ -16,6 +16,7 @@ func testCapabilityService() *Service {
 		{Kind: locationdb.CapabilityObservation, ID: "CYC", Name: "Charlie Station", Region: "SK", Country: "CA", Latitude: 53.50, Longitude: -106},
 		{Kind: locationdb.CapabilityForecast, ID: "SK-40", Name: "Saskatoon", Region: "SK", Country: "CA", Latitude: 52.13, Longitude: -106.67},
 		{Kind: locationdb.CapabilityAirQuality, ID: "AQSASK", Name: "Saskatoon AQHI", Region: "SK", Country: "CA", Latitude: 52.14, Longitude: -106.65},
+		{Kind: locationdb.CapabilityClimate, ID: "4016699", Name: "Regina RCS", Region: "SK", Country: "CA", Latitude: 52.12, Longitude: -106.61},
 		{Kind: locationdb.CapabilityHydrometric, ID: "05HG001", Name: "South Saskatchewan River", Region: "SK", Country: "CA", Latitude: 52.10, Longitude: -106.70},
 		{Kind: locationdb.CapabilityMarineForecast, ID: "088800", Name: "Lake Diefenbaker", Region: "SK", Country: "CA", Latitude: 51.00, Longitude: -106.80},
 	})}
@@ -45,14 +46,37 @@ func TestMapProductLocationUsesCapabilitySpecificTargets(t *testing.T) {
 	t.Parallel()
 	service := testCapabilityService()
 	location := ResolvedLocation{Province: "SK", Latitude: "52.1", Longitude: "-106.6"}
-	packages := []string{"current_conditions", "forecast", "air_quality", "hydrometric", "marine_forecast"}
+	packages := []string{"current_conditions", "forecast", "air_quality", "climate_summary", "hydrometric", "marine_forecast"}
 
 	mapped := service.mapProductLocation(location, packages, nil)
 	if mapped.StationID != "CYB" {
 		t.Fatalf("station = %q", mapped.StationID)
 	}
-	if mapped.Forecast != "SK-40" || mapped.AirQualityID != "AQSASK" || mapped.HydrometricID != "05HG001" || mapped.MarineForecastID != "088800" {
+	if mapped.Forecast != "SK-40" || mapped.AirQualityID != "AQSASK" || mapped.ClimateID != "4016699" || mapped.HydrometricID != "05HG001" || mapped.MarineForecastID != "088800" {
 		t.Fatalf("mapped capabilities = %#v", mapped)
+	}
+}
+
+func TestMapMissingProductCapabilitiesPreservesExplicitTargets(t *testing.T) {
+	t.Parallel()
+	service := testCapabilityService()
+	location := ResolvedLocation{
+		Province:      "SK",
+		Latitude:      "52.1",
+		Longitude:     "-106.6",
+		ClimateID:     "EXPLICIT-CLIMATE",
+		HydrometricID: "EXPLICIT-RIVER",
+	}
+	mapped := service.mapMissingProductCapabilities(location, []string{"climate_summary", "hydrometric"})
+	if mapped.ClimateID != "EXPLICIT-CLIMATE" || mapped.HydrometricID != "EXPLICIT-RIVER" {
+		t.Fatalf("explicit capabilities changed: %#v", mapped)
+	}
+
+	location.ClimateID = ""
+	location.HydrometricID = ""
+	mapped = service.mapMissingProductCapabilities(location, []string{"climate_summary", "hydrometric"})
+	if mapped.ClimateID != "4016699" || mapped.HydrometricID != "05HG001" {
+		t.Fatalf("missing capabilities were not mapped: %#v", mapped)
 	}
 }
 

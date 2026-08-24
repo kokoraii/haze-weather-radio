@@ -198,6 +198,7 @@ type Resolver struct {
 	helloWeatherMu     sync.Mutex
 	helloWeatherCodes  map[string]locationRecord
 	helloWeatherLoaded bool
+	helloWeatherReady  bool
 	lookupHelloWeather helloWeatherLookup
 	telephoneCodesOnce sync.Once
 	telephoneCodes     []telephoneLocationCode
@@ -293,7 +294,7 @@ func (r *Resolver) resolveLegacy(input string) (ResolvedLocation, error) {
 	if code == "" {
 		return ResolvedLocation{}, fmt.Errorf("enter a location code followed by pound")
 	}
-	code = canonicalCallerLocationCode(code)
+	code = r.canonicalCallerLocationCode(code)
 	candidates := r.candidates(code)
 	if len(candidates) == 0 {
 		return ResolvedLocation{}, fmt.Errorf("no weather location matched %q", input)
@@ -325,7 +326,7 @@ func (r *Resolver) resolveLegacy(input string) (ResolvedLocation, error) {
 }
 
 func (r *Resolver) resolveCanonical(input string) (ResolvedLocation, error) {
-	code := canonicalCallerLocationCode(normalizeCallerCode(input))
+	code := r.canonicalCallerLocationCode(normalizeCallerCode(input))
 	if code == "" {
 		return ResolvedLocation{}, fmt.Errorf("enter a location code followed by pound")
 	}
@@ -555,8 +556,10 @@ func (r *Resolver) helloWeather(code string) (locationRecord, bool) {
 	codes := r.helloWeatherDirectory()
 	record, ok := codes[code]
 	if !ok {
-		if derived, derivedOK := deriveHelloWeatherRecord(code); derivedOK {
-			return r.enrichHelloWeatherRecord(derived), true
+		if !r.helloWeatherDirectoryReady() {
+			if derived, derivedOK := deriveHelloWeatherRecord(code); derivedOK {
+				return r.enrichHelloWeatherRecord(derived), true
+			}
 		}
 		return locationRecord{}, false
 	}
@@ -581,8 +584,19 @@ func (r *Resolver) helloWeatherDirectory() map[string]locationRecord {
 		codes = map[string]locationRecord{}
 	}
 	r.helloWeatherCodes = codes
+	r.helloWeatherReady = len(codes) > 0
 	r.helloWeatherLoaded = true
 	return codes
+}
+
+func (r *Resolver) helloWeatherDirectoryReady() bool {
+	if r == nil {
+		return false
+	}
+	_ = r.helloWeatherDirectory()
+	r.helloWeatherMu.Lock()
+	defer r.helloWeatherMu.Unlock()
+	return r.helloWeatherReady
 }
 
 func cloneLocationRecords(records map[string]locationRecord) map[string]locationRecord {
@@ -1019,36 +1033,21 @@ func leftPad6(code string) string {
 	return strings.Repeat("0", 6-len(code)) + code
 }
 
-func canonicalCallerLocationCode(code string) string {
-	if expanded, ok := helloWeatherShortCode(code); ok {
+func (r *Resolver) canonicalCallerLocationCode(code string) string {
+	if expanded, ok := r.helloWeatherShortCode(code); ok {
 		return expanded
 	}
 	return code
 }
 
-func helloWeatherShortCode(code string) (string, bool) {
+func (r *Resolver) helloWeatherShortCode(code string) (string, bool) {
 	code = strings.TrimSpace(code)
-	if len(code) != 3 {
+	if len(code) < 3 || len(code) > 4 {
 		return "", false
 	}
 	province := code[:1]
 	city := code[1:]
-	return helloWeatherCodeFromProvinceCity(province, city)
-}
-
-func helloWeatherCodeFromProvinceCity(province string, city string) (string, bool) {
-	province = strings.TrimSpace(province)
-	city = strings.TrimSpace(city)
-	if len(province) != 1 || province[0] < '1' || province[0] > '9' {
-		return "", false
-	}
-	if len(city) == 1 {
-		city = "0" + city
-	}
-	if len(city) != 2 || city[0] < '0' || city[0] > '9' || city[1] < '0' || city[1] > '9' {
-		return "", false
-	}
-	return "0" + province + "0" + city, true
+	return r.helloWeatherCodeForProvinceNumber(province, city)
 }
 
 func (r *Resolver) helloWeatherCodeForProvinceNumber(province string, number string) (string, bool) {
@@ -1095,7 +1094,72 @@ func (r *Resolver) helloWeatherCodeForProvinceNumber(province string, number str
 		return "", false
 	}
 	sort.Strings(matches)
+	if len(matches) != 1 {
+		return "", false
+	}
 	return matches[0], true
+}
+
+// helloWeatherShortCodeHasLongerMatch reports whether a typed legacy shortcut
+// is a prefix of another real legacy shortcut. It prevents an IVR auto-submit
+// from selecting a different place while the caller is still entering digits.
+func (r *Resolver) helloWeatherShortCodeHasLongerMatch(input string) bool {
+	input = digitsOnly(input)
+	if len(input) < 2 || len(input) > 3 {
+		return false
+	}
+	provinceCodes := helloWeatherProvinceCodes(input[:1])
+	if len(provinceCodes) == 0 {
+		return false
+	}
+	allowed := make(map[string]struct{}, len(provinceCodes))
+	for _, province := range provinceCodes {
+		allowed[province] = struct{}{}
+	}
+	for code, record := range r.helloWeatherDirectory() {
+		if len(code) != 5 {
+			continue
+		}
+		if _, ok := allowed[provinceCode(record.Province)]; !ok {
+			continue
+		}
+		local := strings.TrimLeft(code[2:], "0")
+		if local == "" {
+			continue
+		}
+		short := input[:1] + local
+		if len(short) > len(input) && strings.HasPrefix(short, input) {
+			return true
+		}
+	}
+	return false
+}
+
+// CanAutoSubmitCallerCode is intentionally stricter than Resolve. A valid
+// shorter legacy code can also be the prefix of a longer legacy code, so it
+// must wait for another digit, a pound key, or the regular digit timeout.
+func (r *Resolver) CanAutoSubmitCallerCode(input string) bool {
+	if r == nil {
+		return false
+	}
+	code := normalizeCallerCode(input)
+	if code == "" || r.helloWeatherShortCodeHasLongerMatch(code) {
+		return false
+	}
+	_, err := r.Resolve(code)
+	return err == nil
+}
+
+func (r *Resolver) IsFullHelloWeatherCode(input string) bool {
+	if r == nil {
+		return false
+	}
+	code := digitsOnly(input)
+	if len(code) != 5 {
+		return false
+	}
+	_, ok := r.helloWeatherDirectory()[code]
+	return ok
 }
 
 func helloWeatherProvinceCodes(selector string) []string {

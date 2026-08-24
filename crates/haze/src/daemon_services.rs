@@ -1,15 +1,16 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{sync_channel, Receiver, Sender, SyncSender};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Datelike, Local, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, Timelike, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -19,6 +20,13 @@ use crate::ServiceHostConfig;
 
 const DEFAULT_SETTINGS_FILE: &str = "runtime/state/daemonSettings.json";
 const ALERT_QUEUE_DIR: &str = "runtime/queues/alerts";
+const AUTOMATION_DISPATCH_STATE_FILE: &str = "state/automation-dispatches.json";
+const AUTOMATION_DISPATCH_CATCHUP_SECONDS: i64 = 24 * 60 * 60;
+const AUTOMATION_DISPATCH_RETENTION_DAYS: i64 = 14;
+const AUTOMATION_DISPATCH_RETRY_SECONDS: u64 = 30;
+const AUTOMATION_ACCEPTED_RETRY_SECONDS: u64 = 5 * 60;
+const AUTOMATION_ACK_BUFFER: usize = 256;
+const DEFAULT_AUTOMATION_SECONDS: [u32; 1] = [0];
 
 #[derive(Debug, Default, Deserialize)]
 struct RootConfig {
@@ -127,6 +135,7 @@ impl FlexibleU64 {
 pub(crate) struct DaemonServices {
     stop: Arc<AtomicBool>,
     threads: Vec<thread::JoinHandle<()>>,
+    automation_ack: Option<SyncSender<AutomationDispatchAck>>,
 }
 
 impl DaemonServices {
@@ -138,6 +147,7 @@ impl DaemonServices {
         let config: RootConfig =
             decode_config_with_overlay(&host.config_path, &host.app_dir, &host.runtime_dir)?;
         let stop = Arc::new(AtomicBool::new(false));
+        let mut automation_ack = None;
         let Some(daemon_cfg) = config
             .services
             .as_ref()
@@ -146,12 +156,14 @@ impl DaemonServices {
             return Ok(Self {
                 stop,
                 threads: Vec::new(),
+                automation_ack,
             });
         };
         if !daemon_cfg.enabled.unwrap_or(false) {
             return Ok(Self {
                 stop,
                 threads: Vec::new(),
+                automation_ack,
             });
         }
 
@@ -167,12 +179,26 @@ impl DaemonServices {
                 &host.config_path,
                 config.feeds_file.as_deref(),
             );
+            let automation_count = schedules.automations.len();
+            let automation_target_count = schedules
+                .automations
+                .iter()
+                .map(|automation| automation.targets.len())
+                .sum::<usize>();
             let tx = publisher.clone();
             let stop_flag = Arc::clone(&stop);
+            let runtime_dir = host.runtime_dir.clone();
+            let (automation_ack_tx, automation_ack_rx) = sync_channel(AUTOMATION_ACK_BUFFER);
+            automation_ack = Some(automation_ack_tx);
             threads.push(thread::spawn(move || {
-                scheduler_loop(schedules, tx, stop_flag);
+                scheduler_loop(schedules, tx, automation_ack_rx, stop_flag, runtime_dir);
             }));
-            info!("daemon scheduler service enabled");
+            info!(
+                automation_count,
+                automation_target_count,
+                automation_dispatch_catchup_seconds = AUTOMATION_DISPATCH_CATCHUP_SECONDS,
+                "daemon scheduler service enabled"
+            );
         }
 
         if daemon_cfg
@@ -289,7 +315,23 @@ impl DaemonServices {
             }
         }
 
-        Ok(Self { stop, threads })
+        Ok(Self {
+            stop,
+            threads,
+            automation_ack,
+        })
+    }
+
+    pub(crate) fn handle_event(&self, event: &Value) {
+        let Some(ack) = automation_dispatch_ack(event) else {
+            return;
+        };
+        let Some(sender) = &self.automation_ack else {
+            return;
+        };
+        if let Err(error) = sender.try_send(ack) {
+            warn!(%error, "automation acknowledgement queue is full or unavailable");
+        }
     }
 
     pub(crate) fn shutdown(&mut self) {
@@ -429,6 +471,7 @@ struct AutomationSame {
 #[derive(Debug, Clone)]
 struct AutomationContent {
     text: String,
+    reader_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -602,6 +645,8 @@ struct AutomationDurationXml {
 
 #[derive(Debug, Default, Deserialize)]
 struct AutomationContentXml {
+    #[serde(rename = "@reader_id", default)]
+    reader_id: String,
     #[serde(rename = "lang", default)]
     langs: Vec<AutomationLangXml>,
 }
@@ -626,7 +671,14 @@ struct AutomationFeedXml {
     id: String,
 }
 
+#[derive(Debug, Clone)]
+struct DueAutomation {
+    event: String,
+    scheduled_for: DateTime<Utc>,
+}
+
 impl AutomationPlan {
+    #[cfg(test)]
     fn matching_event_for_target(
         &self,
         now: DateTime<Utc>,
@@ -642,6 +694,53 @@ impl AutomationPlan {
                 self.matching_event_at(&local)
             }
         }
+    }
+
+    fn due_for_target(
+        &self,
+        now: DateTime<Utc>,
+        target: &AutomationFeedTarget,
+    ) -> Option<DueAutomation> {
+        match &target.timezone {
+            ScheduleZone::Local => {
+                let local = now.with_timezone(&Local);
+                self.due_at(&local)
+            }
+            ScheduleZone::Named(zone) => {
+                let local = now.with_timezone(zone);
+                self.due_at(&local)
+            }
+        }
+    }
+
+    fn due_at<TzImpl: chrono::TimeZone>(
+        &self,
+        now: &chrono::DateTime<TzImpl>,
+    ) -> Option<DueAutomation> {
+        let catchup = ChronoDuration::seconds(AUTOMATION_DISPATCH_CATCHUP_SECONDS);
+        let minutes_to_check = (AUTOMATION_DISPATCH_CATCHUP_SECONDS + 59) / 60;
+        for minute_offset in 0..=minutes_to_check {
+            let minute = now.clone() - ChronoDuration::minutes(minute_offset);
+            for &second in self.schedule_seconds() {
+                let Some(candidate) = minute
+                    .with_second(second)
+                    .and_then(|candidate| candidate.with_nanosecond(0))
+                else {
+                    continue;
+                };
+                let age = now.clone().signed_duration_since(candidate.clone());
+                if age < ChronoDuration::zero() || age > catchup {
+                    continue;
+                }
+                if let Some(event) = self.matching_event_at(&candidate) {
+                    return Some(DueAutomation {
+                        event,
+                        scheduled_for: candidate.with_timezone(&Utc),
+                    });
+                }
+            }
+        }
+        None
     }
 
     fn matching_event_at<TzImpl: chrono::TimeZone>(
@@ -663,7 +762,7 @@ impl AutomationPlan {
         if !matches_list(&self.schedule.minutes, now.minute()) {
             return None;
         }
-        if !matches_list(&self.schedule.seconds, now.second()) {
+        if !self.schedule_seconds().contains(&now.second()) {
             return None;
         }
         let week = week_of_month(now.day());
@@ -682,19 +781,45 @@ impl AutomationPlan {
         None
     }
 
-    fn event_payload(&self, event: String, target: &AutomationFeedTarget) -> Value {
+    fn schedule_seconds(&self) -> &[u32] {
+        if self.schedule.seconds.is_empty() {
+            &DEFAULT_AUTOMATION_SECONDS
+        } else {
+            &self.schedule.seconds
+        }
+    }
+
+    fn dispatch_key(&self, target: &AutomationFeedTarget, scheduled_for: DateTime<Utc>) -> String {
+        format!(
+            "{}:{}:{}",
+            self.id,
+            target.feed_id,
+            scheduled_for.timestamp_millis()
+        )
+    }
+
+    fn event_payload(
+        &self,
+        event: String,
+        target: &AutomationFeedTarget,
+        scheduled_for: DateTime<Utc>,
+    ) -> Value {
         let feed_id = target.feed_id.clone();
+        let scheduled_for_ms = scheduled_for.timestamp_millis();
+        let dispatch_key = self.dispatch_key(target, scheduled_for);
         json!({
             "type": "cap.alert.broadcast.requested",
             "source": "automation",
             "data": {
-                "alert_id": format!("automation-{}-{}-{}", self.id, feed_id, unix_now_ms()),
+                "alert_id": format!("automation-{}-{}-{}", self.id, feed_id, scheduled_for_ms),
                 "automation_id": self.id,
                 "title": self.name,
+                "dispatch_key": dispatch_key,
                 "description": self.description,
                 "feed_id": feed_id.clone(),
                 "feed_ids": [feed_id],
                 "timezone": target.timezone.name(),
+                "scheduled_for": scheduled_for.to_rfc3339(),
                 "include_same": self.same.enabled,
                 "same_originator": self.same.originator,
                 "same_event": event,
@@ -705,6 +830,7 @@ impl AutomationPlan {
                 "same_tone": self.same.tone,
                 "alert_text": self.content.text,
                 "message_type": "Alert",
+                "reader_id": self.content.reader_id,
                 "alert_sent_at": Utc::now().to_rfc3339(),
             }
         })
@@ -790,7 +916,8 @@ fn load_automation_plan(
                 tone: fallback_string(item.same.tone, "WXR".to_string()).to_uppercase(),
             },
             content: AutomationContent {
-                text: automation_text(item.content),
+                text: automation_text(&item.content),
+                reader_id: item.content.reader_id.trim().to_string(),
             },
             targets: automation_targets(item.target, automation_feeds),
         });
@@ -814,7 +941,7 @@ fn has_schedule_xml(schedule: &AutomationScheduleXml) -> bool {
         || !schedule.weeks.weeks.is_empty()
 }
 
-fn automation_text(content: AutomationContentXml) -> String {
+fn automation_text(content: &AutomationContentXml) -> String {
     for lang in &content.langs {
         if lang.code.trim().eq_ignore_ascii_case("en")
             || lang.code.trim().eq_ignore_ascii_case("en-CA")
@@ -959,20 +1086,232 @@ fn xml_bool(raw: &str, fallback: bool) -> bool {
     }
 }
 
-fn scheduler_loop(plan: SchedulePlan, publisher: Sender<Value>, stop: Arc<AtomicBool>) {
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct AutomationDispatchLedger {
+    #[serde(default)]
+    dispatched: HashMap<String, i64>,
+}
+
+impl AutomationDispatchLedger {
+    fn load(path: &Path) -> Self {
+        let raw = match fs::read(path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+            Err(error) => {
+                warn!(path = %path.display(), %error, "failed to read automation dispatch state");
+                return Self::default();
+            }
+        };
+        match serde_json::from_slice(&raw) {
+            Ok(ledger) => ledger,
+            Err(error) => {
+                warn!(path = %path.display(), %error, "failed to decode automation dispatch state");
+                Self::default()
+            }
+        }
+    }
+
+    fn has_dispatched(&self, key: &str) -> bool {
+        self.dispatched.contains_key(key)
+    }
+
+    fn record(&mut self, key: String, scheduled_for: DateTime<Utc>) {
+        self.dispatched.insert(key, scheduled_for.timestamp());
+        let oldest_allowed = Utc::now().timestamp()
+            - AUTOMATION_DISPATCH_RETENTION_DAYS.saturating_mul(24 * 60 * 60);
+        self.dispatched
+            .retain(|_, dispatched_at| *dispatched_at >= oldest_allowed);
+    }
+
+    fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create automation state directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+        let raw = serde_json::to_vec(self).context("failed to encode automation dispatch state")?;
+        let temporary_path = path.with_extension("json.tmp");
+        fs::write(&temporary_path, &raw).with_context(|| {
+            format!(
+                "failed to write automation dispatch state {}",
+                temporary_path.display()
+            )
+        })?;
+        if let Err(rename_error) = fs::rename(&temporary_path, path) {
+            // Windows does not replace an existing destination with rename. A direct write is
+            // still safe here because this scheduler has one writer and the state only guards a
+            // short catch-up window.
+            fs::write(path, raw).with_context(|| {
+                format!(
+                    "failed to replace automation dispatch state {} after rename error {}",
+                    path.display(),
+                    rename_error
+                )
+            })?;
+            let _ = fs::remove_file(&temporary_path);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutomationDispatchStatus {
+    Accepted,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+struct AutomationDispatchAck {
+    dispatch_key: String,
+    scheduled_for: Option<DateTime<Utc>>,
+    status: AutomationDispatchStatus,
+}
+
+#[derive(Debug)]
+struct PendingAutomationDispatch {
+    scheduled_for: DateTime<Utc>,
+    last_attempt: Instant,
+    accepted: bool,
+}
+
+fn automation_dispatch_ack(event: &Value) -> Option<AutomationDispatchAck> {
+    let status = match event.get("type")?.as_str()? {
+        "automation.dispatch.accepted" => AutomationDispatchStatus::Accepted,
+        "automation.dispatch.completed" => AutomationDispatchStatus::Completed,
+        "automation.dispatch.failed" => AutomationDispatchStatus::Failed,
+        _ => return None,
+    };
+    let data = event.get("data")?;
+    let dispatch_key = data.get("dispatch_key")?.as_str()?.trim().to_string();
+    if dispatch_key.is_empty() {
+        return None;
+    }
+    let scheduled_for = data
+        .get("scheduled_for")
+        .and_then(Value::as_str)
+        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+        .map(|value| value.with_timezone(&Utc));
+    Some(AutomationDispatchAck {
+        dispatch_key,
+        scheduled_for,
+        status,
+    })
+}
+
+fn scheduler_loop(
+    plan: SchedulePlan,
+    publisher: Sender<Value>,
+    automation_acks: Receiver<AutomationDispatchAck>,
+    stop: Arc<AtomicBool>,
+    runtime_dir: PathBuf,
+) {
+    let dispatch_state_path = runtime_dir.join(AUTOMATION_DISPATCH_STATE_FILE);
+    let mut dispatch_ledger = AutomationDispatchLedger::load(&dispatch_state_path);
+    let mut pending_dispatches = HashMap::<String, PendingAutomationDispatch>::new();
     let mut last_minute_key = String::new();
     let mut last_second_key = String::new();
     while !stop.load(Ordering::SeqCst) {
+        while let Ok(ack) = automation_acks.try_recv() {
+            match ack.status {
+                AutomationDispatchStatus::Accepted => {
+                    if let Some(pending) = pending_dispatches.get_mut(&ack.dispatch_key) {
+                        pending.accepted = true;
+                        pending.last_attempt = Instant::now();
+                        info!(dispatch_key = %ack.dispatch_key, "automation dispatch accepted");
+                    }
+                }
+                AutomationDispatchStatus::Completed => {
+                    let scheduled_for = pending_dispatches
+                        .remove(&ack.dispatch_key)
+                        .map(|pending| pending.scheduled_for)
+                        .or(ack.scheduled_for);
+                    let Some(scheduled_for) = scheduled_for else {
+                        warn!(dispatch_key = %ack.dispatch_key, "automation completion omitted scheduled time");
+                        continue;
+                    };
+                    dispatch_ledger.record(ack.dispatch_key.clone(), scheduled_for);
+                    if let Err(error) = dispatch_ledger.save(&dispatch_state_path) {
+                        warn!(
+                            path = %dispatch_state_path.display(),
+                            %error,
+                            "failed to persist automation dispatch state"
+                        );
+                    }
+                    info!(dispatch_key = %ack.dispatch_key, "automation dispatch completed");
+                }
+                AutomationDispatchStatus::Failed => {
+                    if let Some(pending) = pending_dispatches.get_mut(&ack.dispatch_key) {
+                        pending.accepted = false;
+                        pending.last_attempt = Instant::now();
+                    }
+                    warn!(
+                        dispatch_key = %ack.dispatch_key,
+                        "automation dispatch failed downstream and will be retried"
+                    );
+                }
+            }
+        }
         let now_utc = Utc::now();
-        let now = Local::now();
+        let now = now_utc.with_timezone(&Local);
         let second = now.second();
         let second_key = now_utc.format("%Y%m%dT%H%M%S").to_string();
         if second_key != last_second_key {
             for automation in &plan.automations {
                 for target in &automation.targets {
-                    if let Some(event) = automation.matching_event_for_target(now_utc, target) {
-                        let _ = publisher.send(automation.event_payload(event, target));
+                    let Some(due) = automation.due_for_target(now_utc, target) else {
+                        continue;
+                    };
+                    let dispatch_key = automation.dispatch_key(target, due.scheduled_for);
+                    if dispatch_ledger.has_dispatched(&dispatch_key) {
+                        continue;
                     }
+                    if let Some(pending) = pending_dispatches.get(&dispatch_key) {
+                        let retry_after = Duration::from_secs(if pending.accepted {
+                            AUTOMATION_ACCEPTED_RETRY_SECONDS
+                        } else {
+                            AUTOMATION_DISPATCH_RETRY_SECONDS
+                        });
+                        if pending.last_attempt.elapsed() < retry_after {
+                            continue;
+                        }
+                    }
+                    let event = due.event.clone();
+                    let scheduled_for = due.scheduled_for;
+                    if let Err(error) =
+                        publisher.send(automation.event_payload(due.event, target, scheduled_for))
+                    {
+                        warn!(
+                            automation_id = %automation.id,
+                            feed_id = %target.feed_id,
+                            timezone = %target.timezone.name(),
+                            %event,
+                            scheduled_for = %scheduled_for.to_rfc3339(),
+                            %error,
+                            "automation dispatch failed"
+                        );
+                        continue;
+                    }
+                    pending_dispatches.insert(
+                        dispatch_key.clone(),
+                        PendingAutomationDispatch {
+                            scheduled_for,
+                            last_attempt: Instant::now(),
+                            accepted: false,
+                        },
+                    );
+                    info!(
+                        automation_id = %automation.id,
+                        feed_id = %target.feed_id,
+                        timezone = %target.timezone.name(),
+                        %event,
+                        scheduled_for = %scheduled_for.to_rfc3339(),
+                        dispatch_key = %dispatch_key,
+                        "automation dispatch requested"
+                    );
                 }
             }
             last_second_key = second_key;
@@ -2062,6 +2401,7 @@ mod tests {
             },
             content: AutomationContent {
                 text: String::new(),
+                reader_id: "000".to_string(),
             },
             targets,
         }
@@ -2146,6 +2486,172 @@ mod tests {
                 .as_deref(),
             Some("RWT")
         );
+    }
+
+    #[test]
+    fn automation_schedule_catches_up_after_the_exact_second_is_missed() {
+        let toronto = AutomationFeedTarget {
+            feed_id: "cwxr-on01".to_string(),
+            timezone: ScheduleZone::Named("America/Toronto".parse().expect("toronto timezone")),
+        };
+        let plan = weekly_test_plan(vec![toronto.clone()]);
+        let forty_five_seconds_after_noon = Utc
+            .with_ymd_and_hms(2026, 7, 8, 16, 0, 45)
+            .single()
+            .expect("UTC datetime");
+
+        let due = plan
+            .due_for_target(forty_five_seconds_after_noon, &toronto)
+            .expect("weekly test should catch up within the recovery window");
+
+        assert_eq!(due.event, "RWT");
+        assert_eq!(due.scheduled_for.to_rfc3339(), "2026-07-08T16:00:00+00:00");
+    }
+
+    #[test]
+    fn automation_schedule_catches_up_after_a_service_outage() {
+        let toronto = AutomationFeedTarget {
+            feed_id: "cwxr-on01".to_string(),
+            timezone: ScheduleZone::Named("America/Toronto".parse().expect("toronto timezone")),
+        };
+        let plan = weekly_test_plan(vec![toronto.clone()]);
+        let six_hours_after_noon = Utc
+            .with_ymd_and_hms(2026, 7, 8, 22, 0, 0)
+            .single()
+            .expect("UTC datetime");
+
+        let due = plan
+            .due_for_target(six_hours_after_noon, &toronto)
+            .expect("weekly test should catch up after a same-day outage");
+
+        assert_eq!(due.event, "RWT");
+        assert_eq!(due.scheduled_for.to_rfc3339(), "2026-07-08T16:00:00+00:00");
+    }
+
+    #[test]
+    fn automation_scheduled_time_discards_loop_subseconds() {
+        let toronto = AutomationFeedTarget {
+            feed_id: "cwxr-on01".to_string(),
+            timezone: ScheduleZone::Named("America/Toronto".parse().expect("toronto timezone")),
+        };
+        let plan = weekly_test_plan(vec![toronto.clone()]);
+        let first_loop = Utc
+            .with_ymd_and_hms(2026, 7, 8, 16, 0, 1)
+            .single()
+            .expect("UTC datetime")
+            .with_nanosecond(84_945_290)
+            .expect("nanoseconds");
+        let second_loop = first_loop
+            .with_second(2)
+            .and_then(|value| value.with_nanosecond(991_113_282))
+            .expect("second loop time");
+
+        let first_due = plan
+            .due_for_target(first_loop, &toronto)
+            .expect("first loop should find the weekly test");
+        let second_due = plan
+            .due_for_target(second_loop, &toronto)
+            .expect("second loop should find the weekly test");
+
+        assert_eq!(first_due.scheduled_for, second_due.scheduled_for);
+        assert_eq!(
+            first_due.scheduled_for.timestamp_millis(),
+            1_783_526_400_000
+        );
+        assert_eq!(
+            plan.dispatch_key(&toronto, first_due.scheduled_for),
+            plan.dispatch_key(&toronto, second_due.scheduled_for)
+        );
+    }
+
+    #[test]
+    fn automation_catch_up_uses_each_target_timezone() {
+        let toronto = AutomationFeedTarget {
+            feed_id: "cwxr-on01".to_string(),
+            timezone: ScheduleZone::Named("America/Toronto".parse().expect("toronto timezone")),
+        };
+        let regina = AutomationFeedTarget {
+            feed_id: "cwxr-sk01".to_string(),
+            timezone: ScheduleZone::Named("America/Regina".parse().expect("regina timezone")),
+        };
+        let plan = weekly_test_plan(vec![toronto.clone(), regina.clone()]);
+        let shortly_after_toronto_noon = Utc
+            .with_ymd_and_hms(2026, 7, 8, 16, 0, 45)
+            .single()
+            .expect("UTC datetime");
+
+        assert!(plan
+            .due_for_target(shortly_after_toronto_noon, &toronto)
+            .is_some());
+        assert!(plan
+            .due_for_target(shortly_after_toronto_noon, &regina)
+            .is_none());
+    }
+
+    #[test]
+    fn automation_payload_includes_stable_dispatch_contract() {
+        let target = AutomationFeedTarget {
+            feed_id: "cwxr-on01".to_string(),
+            timezone: ScheduleZone::Named("America/Toronto".parse().expect("toronto timezone")),
+        };
+        let plan = weekly_test_plan(vec![target.clone()]);
+        let scheduled_for = Utc
+            .with_ymd_and_hms(2026, 7, 8, 16, 0, 0)
+            .single()
+            .expect("scheduled time");
+        let payload = plan.event_payload("RWT".to_string(), &target, scheduled_for);
+        let data = payload
+            .get("data")
+            .and_then(Value::as_object)
+            .expect("automation payload data");
+
+        assert_eq!(
+            data.get("dispatch_key").and_then(Value::as_str),
+            Some("required_weekly_test:cwxr-on01:1783526400000")
+        );
+        assert_eq!(data.get("reader_id").and_then(Value::as_str), Some("000"));
+    }
+
+    #[test]
+    fn automation_completion_event_decodes_acknowledgement() {
+        let scheduled_for = Utc
+            .with_ymd_and_hms(2026, 7, 8, 16, 0, 0)
+            .single()
+            .expect("scheduled time");
+        let ack = automation_dispatch_ack(&json!({
+            "type": "automation.dispatch.completed",
+            "data": {
+                "dispatch_key": "required_weekly_test:cwxr-on01:1783526400000",
+                "scheduled_for": scheduled_for.to_rfc3339(),
+            }
+        }))
+        .expect("automation acknowledgement");
+
+        assert_eq!(ack.status, AutomationDispatchStatus::Completed);
+        assert_eq!(
+            ack.dispatch_key,
+            "required_weekly_test:cwxr-on01:1783526400000"
+        );
+        assert_eq!(ack.scheduled_for, Some(scheduled_for));
+    }
+
+    #[test]
+    fn automation_dispatch_ledger_prevents_a_restart_duplicate() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory
+            .path()
+            .join("state")
+            .join("automation-dispatches.json");
+        let scheduled_for = Utc::now();
+        let mut ledger = AutomationDispatchLedger::default();
+        ledger.record(
+            "required_weekly_test:cwxr-on01:1783526400000".to_string(),
+            scheduled_for,
+        );
+        ledger.save(&path).expect("save dispatch state");
+
+        let restored = AutomationDispatchLedger::load(&path);
+        assert!(restored.has_dispatched("required_weekly_test:cwxr-on01:1783526400000"));
     }
 
     #[test]

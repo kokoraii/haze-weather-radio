@@ -515,7 +515,11 @@ class ReceiverSupervisor:
 
     async def _run_once(self) -> str:
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=4, sock_read=None)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        # Private Haze deployments may intentionally use a self-signed
+        # certificate. TLS verification is relaxed only when the explicit
+        # --allow-insecure-dev flag is present in the receiver service.
+        connector = aiohttp.TCPConnector(ssl=False) if self.config.allow_insecure_dev else None
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
             receiver_session = await self._start_receiver_session(session)
             ws_url = str(receiver_session.get('ws_url') or '').strip()
             if not ws_url:

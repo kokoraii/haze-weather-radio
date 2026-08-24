@@ -8,7 +8,7 @@
 
     <alerts>
       <cap_cp enabled="true">
-        <filter use_feed_locations="true">
+        <filter use_feed_locations="true" coverage_mode="polygon_first">
           <blocklist>
             <severity>Minor</severity>
             <severity>Unknown</severity>
@@ -79,6 +79,10 @@
         <location id="sk-26" source="eccc"/>
       </observationLocations>
 
+      <aviationReportLocations>
+        <location id="CYXE" source="eccc" name_override="Saskatoon Diefenbaker International Airport"/>
+      </aviationReportLocations>
+
       <airQualityLocations>
         <location id="HAHJJ" source="eccc"/>
       </airQualityLocations>
@@ -86,6 +90,18 @@
       <climateLocations>
         <location id="4057165" source="eccc" name_override="Saskatoon" normal_id="4057120"/>
       </climateLocations>
+
+      <hydrometricLocations>
+        <location id="05HG001" source="eccc"/>
+        <upstream>
+          <location id="05JG006" source="eccc"/>
+          <location id="05HD039" source="eccc"/>
+          <location id="05HC005" source="eccc"/>
+        </upstream>
+        <downstream>
+          <location id="05KD007" source="eccc"/>
+        </downstream>
+      </hydrometricLocations>
 
     </locations>
 
@@ -106,7 +122,7 @@
 
     <alerts>
       <cap_cp enabled="true">
-        <filter use_feed_locations="true">
+        <filter use_feed_locations="true" coverage_mode="polygon_first">
           <blocklist>
             <severity>Minor</severity>
             <severity>Unknown</severity>
@@ -172,7 +188,7 @@
 
     <alerts>
       <cap_cp enabled="true">
-        <filter use_feed_locations="true">
+        <filter use_feed_locations="true" coverage_mode="polygon_first">
           <blocklist>
             <severity>Minor</severity>
             <severity>Unknown</severity>
@@ -240,7 +256,7 @@
 
     <alerts>
       <cap_cp enabled="true">
-        <filter use_feed_locations="true">
+        <filter use_feed_locations="true" coverage_mode="polygon_first">
           <blocklist>
             <severity>Minor</severity>
             <severity>Unknown</severity>
@@ -313,7 +329,7 @@
 
     <alerts>
       <cap_cp enabled="true">
-        <filter use_feed_locations="true">
+        <filter use_feed_locations="true" coverage_mode="polygon_first">
           <blocklist>
             <severity>Minor</severity>
             <severity>Unknown</severity>
@@ -379,7 +395,7 @@
 
     <alerts>
       <cap_cp enabled="true">
-        <filter use_feed_locations="true">
+        <filter use_feed_locations="true" coverage_mode="polygon_first">
           <blocklist>
             <severity>Minor</severity>
             <severity>Unknown</severity>
@@ -465,7 +481,7 @@
 
     <alerts>
       <cap_cp enabled="true">
-        <filter use_feed_locations="true">
+        <filter use_feed_locations="true" coverage_mode="polygon_first">
           <blocklist>
             <severity>Minor</severity>
             <severity>Unknown</severity>
@@ -550,7 +566,7 @@
 
     <alerts>
       <cap_cp enabled="true">
-        <filter use_feed_locations="true">
+        <filter use_feed_locations="true" coverage_mode="polygon_first">
           <blocklist>
             <severity>Minor</severity>
             <severity>Unknown</severity>
@@ -630,7 +646,7 @@
 
     <alerts>
       <cap_cp enabled="true">
-        <filter use_feed_locations="true">
+        <filter use_feed_locations="true" coverage_mode="polygon_first">
           <blocklist>
             <severity>Minor</severity>
             <severity>Unknown</severity>
@@ -720,7 +736,7 @@
 
     <alerts>
       <cap_cp enabled="true">
-        <filter use_feed_locations="true">
+        <filter use_feed_locations="true" coverage_mode="polygon_first">
           <blocklist>
             <severity>Minor</severity>
             <severity>Unknown</severity>
@@ -798,7 +814,7 @@
 
     <alerts>
       <cap_cp enabled="true">
-        <filter use_feed_locations="true">
+        <filter use_feed_locations="true" coverage_mode="polygon_first">
           <allowlist></allowlist>
           <blocklist></blocklist>
         </filter>

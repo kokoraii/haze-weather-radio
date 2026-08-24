@@ -121,6 +121,9 @@ func (s *Service) handleEvent(event map[string]any) {
 	case "cap.alert.received":
 		s.handleCAPAlert(event)
 		return
+	case "lead.config.updated":
+		s.refreshConfigNow()
+		return
 	case "wx.on_demand.request":
 		s.handleWxOnDemand(event)
 		return
@@ -226,6 +229,10 @@ func (s *Service) refreshConfigIfNeeded() {
 	if s.options.Refresh <= 0 || time.Since(s.lastLoaded) < s.options.Refresh {
 		return
 	}
+	s.refreshConfigNow()
+}
+
+func (s *Service) refreshConfigNow() {
 	cfg, err := loadConfig(s.options.ConfigPath)
 	if err != nil {
 		log.Printf("product render config refresh failed: %v", err)

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/meowraii/haze-weather-radio/services/go/internal/capmodel"
+	"github.com/meowraii/haze-weather-radio/services/go/internal/lead"
 )
 
 func TestCAPSAMEPayloadSuppressesCancellations(t *testing.T) {
@@ -125,7 +126,7 @@ func TestCAPSAMEPayloadUsesWatchMetadataBeforeRawNAADSEvent(t *testing.T) {
 	}
 }
 
-func TestCAPSAMEPayloadConvertsBroadcastImmediateCAPToSAMEWithNPAS(t *testing.T) {
+func TestCAPSAMEPayloadKeepsConfiguredToneForAlertReadyBroadcastImmediate(t *testing.T) {
 	dir := t.TempDir()
 	mustWrite(t, filepath.Join(dir, "managed", "sameMapping.json"), `{"eas":{"CEM":"Civil Emergency Message"},"naadsToEas":{"civilEmerg":"CEM"}}`)
 	raw, err := os.ReadFile(filepath.Join("..", "..", "testdata", "cap", "example_civilEmerg_AlertReady_2026_04_10T19_08_12_03_00IA99FB9E1_6FB6_4951_B234_863F1341C4C1.xml"))
@@ -148,12 +149,47 @@ func TestCAPSAMEPayloadConvertsBroadcastImmediateCAPToSAMEWithNPAS(t *testing.T)
 	if payload["same_originator"] != "CIV" {
 		t.Fatalf("same_originator = %#v, want CIV", payload["same_originator"])
 	}
-	if payload["same_tone"] != "NPAS" {
-		t.Fatalf("same_tone = %#v, want NPAS", payload["same_tone"])
+	if payload["same_tone"] != "EAS" {
+		t.Fatalf("same_tone = %#v, want configured EAS", payload["same_tone"])
 	}
 	locations, ok := payload["same_locations"].([]string)
 	if !ok || len(locations) == 0 || locations[0] != "000000" {
 		t.Fatalf("same_locations = %#v, want national code first", payload["same_locations"])
+	}
+}
+
+func TestCAPLeadPayloadUsesConfiguredCAPParameterRule(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "testdata", "cap", "example_civilEmerg_AlertReady_2026_04_10T19_08_12_03_00IA99FB9E1_6FB6_4951_B234_863F1341C4C1.xml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	alert := parseTestAlert(t, string(raw))
+	info := chooseAlertInfo(alert, "en-CA")
+	if info == nil {
+		t.Fatal("Alert Ready fixture has no usable info")
+	}
+	document := lead.Document{Statements: []lead.Statement{{
+		Enabled: true,
+		Name:    "Alert Ready lead",
+		Conditions: []lead.Condition{{
+			Type: "if", Key: "layer:SOREM:1.0:Broadcast_Immediately", Equals: "yes",
+		}},
+		LeadIn:  "audio/NPAS_Preroll.wav",
+		LeadOut: "audio/Canadian_Alerting_Attention_Signal.wav",
+	}}}
+	document, err = lead.Normalize(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := capLeadPayload(document, alert, *info, feedXML{ID: "CAP-IT-ALL"}, []string{"000000"})
+	if payload["name"] != "Alert Ready lead" || payload["lead_in"] != "audio/NPAS_Preroll.wav" {
+		t.Fatalf("lead payload = %#v", payload)
+	}
+
+	nonMatching := document
+	nonMatching.Statements[0].Conditions[0].Equals = "no"
+	if payload := capLeadPayload(nonMatching, alert, *info, feedXML{}, nil); payload != nil {
+		t.Fatalf("nonmatching lead was selected: %#v", payload)
 	}
 }
 
@@ -428,8 +464,172 @@ func TestCAPUpdateBroadcastRequiresFeedRelevantNewlyActiveArea(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(noNewAreaUpdates) != 1 || noNewAreaUpdates[0].Broadcast {
-		t.Fatalf("CAP update without newly active areas should stay routine-only: %#v", noNewAreaUpdates)
+	if len(noNewAreaUpdates) != 1 || !noNewAreaUpdates[0].Broadcast {
+		t.Fatalf("fresh first-seen CAP update entering feed coverage should priority broadcast: %#v", noNewAreaUpdates)
+	}
+}
+
+func TestReferencedDLCUpdateBroadcastUsesAuthoritativeLocationDelta(t *testing.T) {
+	dir := t.TempDir()
+	writeFixture(t, dir)
+	writeCAPCoverageGeometryFixture(t, dir, capCoverageGeometryFixture{
+		Source: "clc", Code: "065435", Rings: [][]capCoveragePoint{capCoverageSquare(0, 0, 3, 3)},
+	})
+	cfg := loadFixtureConfig(t, dir)
+	feed := cfg.Feeds[0]
+	feed.Locations.Coverage.Regions = []coverageRegionXML{{ID: "065435", Source: "eccc"}}
+	feed.Alerts.CapCP.Filter.UseFeedLocations = "true"
+	feed.Alerts.CapCP.Filter.CoverageMode = capCoverageModePolygonFirst
+	cfg.Feeds = []feedXML{feed}
+	service := &Service{cfg: cfg}
+
+	initial := parseTestAlert(t, testDLCGridCAP(
+		"urn:test:dlc:initial",
+		"Alert",
+		"",
+		"2026-08-13T03:00:00Z",
+		[]dlcGridArea{{Status: "issued", Polygon: capCoverageSquareText(2.2, 0.2, 2.8, 0.8)}},
+	))
+	initialUpdates, err := service.recordCAPAlert(initial, time.Date(2026, 8, 13, 3, 1, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(initialUpdates) != 1 || !initialUpdates[0].Broadcast {
+		t.Fatalf("initial DLC alert = %#v", initialUpdates)
+	}
+	assertCAPLocations(t, initialUpdates[0].AddedLocations, "165435")
+
+	shifted := parseTestAlert(t, testDLCGridCAP(
+		"urn:test:dlc:shifted",
+		"Update",
+		"cap-pac@canada.ca,urn:test:dlc:initial,2026-08-13T03:00:00Z",
+		"2026-08-13T03:02:00Z",
+		[]dlcGridArea{
+			{Status: "continued", Polygon: capCoverageSquareText(2.2, 0.2, 2.8, 0.8)},
+			{Status: "issued", Polygon: capCoverageSquareText(2.2, 2.2, 2.8, 2.8)},
+		},
+	))
+	shiftedUpdates, err := service.recordCAPAlert(shifted, time.Date(2026, 8, 13, 3, 3, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(shiftedUpdates) != 1 || !shiftedUpdates[0].Broadcast {
+		t.Fatalf("referenced DLC expansion must broadcast its new assignment: %#v", shiftedUpdates)
+	}
+	assertCAPLocations(t, shiftedUpdates[0].AddedLocations, "365435")
+	assertCAPLocations(t, shiftedUpdates[0].RetainedLocations, "165435")
+
+	continued := parseTestAlert(t, testDLCGridCAP(
+		"urn:test:dlc:continued",
+		"Update",
+		"cap-pac@canada.ca,urn:test:dlc:shifted,2026-08-13T03:02:00Z",
+		"2026-08-13T03:04:00Z",
+		[]dlcGridArea{
+			{Status: "continued", Polygon: capCoverageSquareText(2.2, 0.2, 2.8, 0.8)},
+			{Status: "continued", Polygon: capCoverageSquareText(2.2, 2.2, 2.8, 2.8)},
+		},
+	))
+	continuedUpdates, err := service.recordCAPAlert(continued, time.Date(2026, 8, 13, 3, 5, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(continuedUpdates) != 1 || continuedUpdates[0].Broadcast {
+		t.Fatalf("continued-only DLC update must not rebroadcast unchanged assignments: %#v", continuedUpdates)
+	}
+	assertCAPLocations(t, continuedUpdates[0].RetainedLocations, "165435", "365435")
+}
+
+func TestReferencedDLCUpdateContractionDoesNotBroadcast(t *testing.T) {
+	dir := t.TempDir()
+	writeFixture(t, dir)
+	writeCAPCoverageGeometryFixture(t, dir, capCoverageGeometryFixture{
+		Source: "clc", Code: "065435", Rings: [][]capCoveragePoint{capCoverageSquare(0, 0, 3, 3)},
+	})
+	cfg := loadFixtureConfig(t, dir)
+	feed := cfg.Feeds[0]
+	feed.Locations.Coverage.Regions = []coverageRegionXML{{ID: "065435", Source: "eccc"}}
+	feed.Alerts.CapCP.Filter.UseFeedLocations = "true"
+	feed.Alerts.CapCP.Filter.CoverageMode = capCoverageModePolygonFirst
+	cfg.Feeds = []feedXML{feed}
+	service := &Service{cfg: cfg}
+
+	initial := parseTestAlert(t, testDLCGridCAP(
+		"urn:test:dlc:whole",
+		"Alert",
+		"",
+		"2026-08-13T03:00:00Z",
+		[]dlcGridArea{{Status: "issued", Polygon: capCoverageSquareText(-1, -1, 4, 4)}},
+	))
+	initialUpdates, err := service.recordCAPAlert(initial, time.Date(2026, 8, 13, 3, 1, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(initialUpdates) != 1 || !initialUpdates[0].Broadcast {
+		t.Fatalf("whole-area initial DLC alert = %#v", initialUpdates)
+	}
+	assertCAPLocations(t, initialUpdates[0].AddedLocations, "065435")
+
+	contracted := parseTestAlert(t, testDLCGridCAP(
+		"urn:test:dlc:contracted",
+		"Update",
+		"cap-pac@canada.ca,urn:test:dlc:whole,2026-08-13T03:00:00Z",
+		"2026-08-13T03:02:00Z",
+		[]dlcGridArea{{Status: "continued", Polygon: capCoverageSquareText(2.2, 0.2, 2.8, 0.8)}},
+	))
+	contractedUpdates, err := service.recordCAPAlert(contracted, time.Date(2026, 8, 13, 3, 3, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(contractedUpdates) != 1 || contractedUpdates[0].Broadcast {
+		t.Fatalf("DLC contraction must not broadcast: %#v", contractedUpdates)
+	}
+	assertCAPLocations(t, contractedUpdates[0].RetainedLocations, "165435")
+	assertCAPLocations(t, contractedUpdates[0].RemovedLocations, "065435")
+}
+
+func TestDLCGridLocationDeltaIsDirectional(t *testing.T) {
+	dir := t.TempDir()
+	writeFixture(t, dir)
+
+	tests := []struct {
+		name         string
+		previous     []string
+		current      []string
+		wantAdded    []string
+		wantRetained []string
+		wantRemoved  []string
+	}{
+		{
+			name:         "whole parent contracts to child",
+			previous:     []string{"065435"},
+			current:      []string{"165435"},
+			wantRetained: []string{"165435"},
+			wantRemoved:  []string{"065435"},
+		},
+		{
+			name:         "child expands to whole parent",
+			previous:     []string{"165435"},
+			current:      []string{"065435"},
+			wantAdded:    []string{"065435"},
+			wantRetained: nil,
+		},
+		{
+			name:        "different children remain distinct",
+			previous:    []string{"165435"},
+			current:     []string{"365435"},
+			wantAdded:   []string{"365435"},
+			wantRemoved: []string{"165435"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			added, retained, removed := capLocationDeltaForBase(test.previous, test.current, dir)
+			if !reflect.DeepEqual(added, test.wantAdded) || !reflect.DeepEqual(retained, test.wantRetained) || !reflect.DeepEqual(removed, test.wantRemoved) {
+				t.Fatalf("delta = added %#v retained %#v removed %#v, want added %#v retained %#v removed %#v",
+					added, retained, removed, test.wantAdded, test.wantRetained, test.wantRemoved)
+			}
+		})
 	}
 }
 
@@ -863,4 +1063,57 @@ func testECCCWatchCAP(identifier string, eventCodes string) string {
 
 func capAsUpdate(raw string) string {
 	return strings.Replace(raw, "<msgType>Alert</msgType>", "<msgType>Update</msgType>", 1)
+}
+
+type dlcGridArea struct {
+	Status  string
+	Polygon string
+}
+
+func testDLCGridCAP(identifier string, messageType string, references string, sent string, threatAreas []dlcGridArea) string {
+	var areas strings.Builder
+	for _, area := range threatAreas {
+		areas.WriteString(`
+    <area>
+      <areaDesc>` + area.Status + ` threat area</areaDesc>
+      <polygon>` + area.Polygon + `</polygon>
+      <geocode><valueName>layer:EC-MSC-SMC:DLC:1.1</valueName><value>` + area.Status + `</value></geocode>
+    </area>`)
+	}
+	referenceXML := "<references/>"
+	if strings.TrimSpace(references) != "" {
+		referenceXML = "<references>" + references + "</references>"
+	}
+	return `<?xml version="1.0" encoding="UTF-8"?>
+<alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
+  <identifier>` + identifier + `</identifier>
+  <sender>cap-pac@canada.ca</sender>
+  <sent>` + sent + `</sent>
+  <status>Actual</status>
+  <msgType>` + messageType + `</msgType>
+  <scope>Public</scope>
+  ` + referenceXML + `
+  <info>
+    <language>en-CA</language>
+    <category>Met</category>
+    <event>thunderstorm</event>
+    <responseType>Shelter</responseType>
+    <urgency>Immediate</urgency>
+    <severity>Severe</severity>
+    <certainty>Observed</certainty>
+    <effective>` + sent + `</effective>
+    <onset>` + sent + `</onset>
+    <expires>2099-08-13T04:00:00Z</expires>
+    <senderName>Environment Canada</senderName>
+    <headline>yellow warning - severe thunderstorm - in effect</headline>
+    <description>A dangerous severe thunderstorm is moving through the warned area.</description>
+    <parameter><valueName>layer:EC-MSC-SMC:1.0:Alert_Location_Status</valueName><value>active</value></parameter>
+    <parameter><valueName>layer:EC-MSC-SMC:1.0:Alert_Name</valueName><value>yellow warning - severe thunderstorm</value></parameter>
+    <area>
+      <areaDesc>Test CLC</areaDesc>
+      <polygon>` + capCoverageSquareText(0, 0, 3, 3) + `</polygon>
+      <geocode><valueName>layer:EC-MSC-SMC:1.0:CLC</valueName><value>065435</value></geocode>
+    </area>` + areas.String() + `
+  </info>
+</alert>`
 }

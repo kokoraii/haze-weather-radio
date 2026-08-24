@@ -34,6 +34,8 @@ const (
 	sipG722FrameSamples           = sipG722SampleRate / 50
 	sipTrustedSourceLookupTimeout = 3 * time.Second
 	sipTrustedSourceRefreshEvery  = 5 * time.Minute
+	sipLocationAutoSubmitDelay    = 2 * time.Second
+	sipFullHelloAutoSubmitDelay   = time.Second
 )
 
 type sipAudioCodec int
@@ -1657,9 +1659,9 @@ func (c *sipCall) collectLocationInput(timeout time.Duration, initial string) (s
 				}
 			}
 		}
-		if c.locationCodeCurrentlyValid(builder.String()) {
+		if delay, valid := c.locationCodeAutoSubmitDelay(builder.String(), builder.String()); valid {
 			stopSubmitTimer()
-			submitTimer = time.NewTimer(600 * time.Millisecond)
+			submitTimer = time.NewTimer(delay)
 			submit = submitTimer.C
 		} else {
 			stopSubmitTimer()
@@ -1728,15 +1730,16 @@ func (c *sipCall) collectLocationNumberInput(timeout time.Duration, province str
 				builder.WriteString(digit)
 			}
 		}
-		if code, ok := c.service.resolver.helloWeatherCodeForProvinceNumber(province, builder.String()); ok && c.locationCodeCurrentlyValid(code) {
-			stopSubmitTimer()
-			submitTimer = time.NewTimer(600 * time.Millisecond)
-			submit = submitTimer.C
+		if code, ok := c.service.resolver.helloWeatherCodeForProvinceNumber(province, builder.String()); ok {
+			if delay, valid := c.locationCodeAutoSubmitDelay(builder.String(), code); valid {
+				stopSubmitTimer()
+				submitTimer = time.NewTimer(delay)
+				submit = submitTimer.C
+			} else {
+				stopSubmitTimer()
+			}
 		} else {
 			stopSubmitTimer()
-		}
-		if builder.Len() >= 5 {
-			return true, false, true
 		}
 		return false, false, false
 	}
@@ -1770,8 +1773,21 @@ func (c *sipCall) locationCodeCurrentlyValid(code string) bool {
 	if strings.TrimSpace(code) == "" || c == nil || c.service == nil {
 		return false
 	}
+	if c.service.resolver != nil {
+		return c.service.resolver.CanAutoSubmitCallerCode(code)
+	}
 	_, err := c.service.resolveLocation(code)
 	return err == nil
+}
+
+func (c *sipCall) locationCodeAutoSubmitDelay(typedCode string, resolvedCode string) (time.Duration, bool) {
+	if !c.locationCodeCurrentlyValid(resolvedCode) {
+		return 0, false
+	}
+	if c != nil && c.service != nil && c.service.resolver != nil && c.service.resolver.IsFullHelloWeatherCode(typedCode) {
+		return sipFullHelloAutoSubmitDelay, true
+	}
+	return sipLocationAutoSubmitDelay, true
 }
 
 func appendCollectedDigit(builder *strings.Builder, digit string) (bool, bool) {

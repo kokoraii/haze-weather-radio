@@ -86,12 +86,44 @@ impl EventPublisher {
             let stream = TcpStream::connect(addr)
                 .await
                 .with_context(|| format!("failed to connect to host bridge at {addr}"))?;
-            *guard = Some(BufWriter::new(stream));
+            let mut writer = BufWriter::new(stream);
+            let registration = publisher_registration();
+            writer
+                .write_all(&registration)
+                .await
+                .context("failed to register CAP publisher with host bridge")?;
+            writer
+                .write_all(b"\n")
+                .await
+                .context("failed to terminate CAP publisher bridge registration")?;
+            writer
+                .flush()
+                .await
+                .context("failed to flush CAP publisher bridge registration")?;
+            *guard = Some(writer);
         }
         let writer = guard.as_mut().expect("bridge writer exists");
         writer.write_all(line).await?;
         writer.write_all(b"\n").await?;
         writer.flush().await?;
         Ok(())
+    }
+}
+
+fn publisher_registration() -> Vec<u8> {
+    br#"{"type":"bridge.client","source":"haze-cap-ingest","data":{"client_id":"haze-cap-ingest","receive_events":false,"subscriptions":[]}}"#.to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cap_publisher_registers_as_publish_only() {
+        let registration: Value =
+            serde_json::from_slice(&publisher_registration()).expect("registration JSON");
+        assert_eq!(registration["type"], "bridge.client");
+        assert_eq!(registration["data"]["client_id"], "haze-cap-ingest");
+        assert_eq!(registration["data"]["receive_events"], false);
     }
 }

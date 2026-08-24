@@ -9,6 +9,7 @@ var configuredCitypagePattern = regexp.MustCompile(`(?i)^[a-z]{2}-\d+$`)
 var configuredICAOPattern = regexp.MustCompile(`(?i)^[a-z]{4}$`)
 var configuredIATAPattern = regexp.MustCompile(`(?i)^[a-z]{3}$`)
 var configuredMarineMSCIDPattern = regexp.MustCompile(`^\d{5,8}$`)
+var configuredVirtualClimatePattern = regexp.MustCompile(`(?i)^vs[a-z]{2}[a-z0-9]*v$`)
 
 // ConfiguredIdentifier translates a feed location purpose into the same
 // qualified namespace used by haze-location. It deliberately does not use a
@@ -56,7 +57,11 @@ func ConfiguredIdentifier(source string, purpose string, value string) (Input, b
 			scheme, authority = "aqhi", "eccc"
 		}
 	case purpose == "climate":
-		scheme = "climate"
+		if configuredVirtualClimatePattern.MatchString(value) {
+			scheme, authority = "virtual_climate", "eccc"
+		} else {
+			scheme = "climate"
+		}
 	case purpose == "marine_forecast":
 		if source == "nws" {
 			scheme, authority = "nws_marine_zone", "nws"

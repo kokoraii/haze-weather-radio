@@ -140,10 +140,11 @@ func Run(ctx context.Context, options Options) error {
 		service.resolver = NewResolver(cfg)
 		if capabilities, loaded := locationdb.LoadCapabilityCatalog(cfg.BaseDir); loaded {
 			service.capabilities = capabilities
-			log.Printf("IVR capability targets indexed forecasts=%d observations=%d air_quality=%d hydrometric=%d marine=%d",
+			log.Printf("IVR capability targets indexed forecasts=%d observations=%d air_quality=%d climate=%d hydrometric=%d marine=%d",
 				capabilities.Count(locationdb.CapabilityForecast),
 				capabilities.Count(locationdb.CapabilityObservation),
 				capabilities.Count(locationdb.CapabilityAirQuality),
+				capabilities.Count(locationdb.CapabilityClimate),
 				capabilities.Count(locationdb.CapabilityHydrometric),
 				capabilities.Count(locationdb.CapabilityMarineForecast))
 		}
@@ -627,7 +628,7 @@ func (s *Service) handleEntryDigit(writer http.ResponseWriter, request *http.Req
 }
 
 func (s *Service) handleLocationCodeTwiML(writer http.ResponseWriter, request *http.Request) {
-	code := firstNonBlank(request.FormValue("Digits"), request.URL.Query().Get("code"))
+	code := locationCodeFromRequest(request)
 	if strings.TrimSpace(code) == "" {
 		s.writeLocationCodePrompt(writer, request, request.URL.Query().Get("lang"))
 		return
@@ -668,6 +669,10 @@ func (s *Service) handleLocationCodeWithLanguageTwiML(writer http.ResponseWriter
 		s.writeLocationNumberPrompt(writer, request, language, code)
 		return
 	}
+	if s.resolver != nil && s.resolver.helloWeatherShortCodeHasLongerMatch(normalizeCallerCode(code)) {
+		s.writeLocationCodeContinuationPrompt(writer, request, language, code)
+		return
+	}
 	location, err := s.resolveLocation(code)
 	if err != nil {
 		body := twimlPlay(promptURL(request, "error", "invalid_code", nil)) +
@@ -679,6 +684,40 @@ func (s *Service) handleLocationCodeWithLanguageTwiML(writer http.ResponseWriter
 		location.Language = lang
 	}
 	s.writeLocationMenu(writer, request, location)
+}
+
+func locationCodeFromRequest(request *http.Request) string {
+	if request == nil {
+		return ""
+	}
+	entered := firstNonBlank(request.FormValue("Digits"), request.URL.Query().Get("code"))
+	prefix := digitsOnly(request.URL.Query().Get("prefix"))
+	if prefix == "" {
+		return entered
+	}
+	entered = normalizeCallerCode(entered)
+	if entered == "" || strings.HasPrefix(entered, prefix) {
+		return firstNonBlank(entered, prefix)
+	}
+	return prefix + entered
+}
+
+func (s *Service) writeLocationCodeContinuationPrompt(writer http.ResponseWriter, request *http.Request, language string, prefix string) {
+	menu, _ := s.cfg.Prompts.Menu("location_code")
+	params := map[string]string{
+		"state":  "location_code",
+		"lang":   language,
+		"prefix": digitsOnly(prefix),
+	}
+	body := twimlGather(
+		twimlURL(request, "/ivr/v1/twiml", params),
+		"",
+		"#",
+		menu.Timeout,
+		nil,
+		[]string{twimlTimeoutHangup(request, nil)},
+	)
+	writeTwiML(writer, body)
 }
 
 func (s *Service) writeLocationNumberPrompt(writer http.ResponseWriter, request *http.Request, language string, province string) {
@@ -1167,7 +1206,7 @@ func languageDisplayName(language string) string {
 }
 
 func locationCodeAutoSubmitTimeout() time.Duration {
-	return time.Second
+	return 2 * time.Second
 }
 
 func locationCodeAutoSubmitTimeoutForMenu(timeout time.Duration) time.Duration {
@@ -1429,6 +1468,8 @@ func (s *Service) productForCode(ctx context.Context, code string, packages []st
 }
 
 func (s *Service) productForLocation(ctx context.Context, location ResolvedLocation, packages []string, force bool) (CachedProduct, error) {
+	packages = normalizePackages(packages, s.cfg.IVR.DefaultPackages)
+	location = s.mapMissingProductCapabilities(location, packages)
 	s.metrics.CacheRequests.Add(1)
 	product, err := s.cache.Get(ctx, location, packages, force)
 	if err != nil {

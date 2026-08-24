@@ -505,13 +505,45 @@ func ResolveAreaNames(configPath string, provided []string, locations []string) 
 		if cleanCode == "" {
 			continue
 		}
-		name := locationNames[cleanCode]
+		name := sameLocationLabel(locationNames, cleanCode)
 		if name == "" {
 			name = "Unknown Location (" + cleanCode + ")"
 		}
 		add(name)
 	}
 	return out
+}
+
+// sameLocationLabel returns a configured label for a whole or NWS-style
+// partial SAME location code. A nonzero first digit denotes one of nine
+// parent-area partitions, so the parent label remains useful for speech.
+func sameLocationLabel(labels map[string]string, code string) string {
+	if name := strings.TrimSpace(labels[code]); name != "" {
+		return name
+	}
+	if len(code) != 6 || code[0] < '1' || code[0] > '9' {
+		return ""
+	}
+	parent := "0" + code[1:]
+	name := strings.TrimSpace(labels[parent])
+	if name == "" {
+		return ""
+	}
+	direction := map[byte]string{
+		'1': "northwest",
+		'2': "north",
+		'3': "northeast",
+		'4': "west",
+		'5': "central",
+		'6': "east",
+		'7': "southwest",
+		'8': "south",
+		'9': "southeast",
+	}[code[0]]
+	if direction == "" {
+		return ""
+	}
+	return direction + " portion of " + name
 }
 
 func isUnknownLocationName(value string) bool {

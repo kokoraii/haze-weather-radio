@@ -71,6 +71,23 @@ func TestCurrentConditionsProductUsesOpenerPackageAndRepeatSegments(t *testing.T
 	}
 }
 
+func TestConfiguredCurrentConditionsRendersUnavailableAnnouncementWhenDataIsMissing(t *testing.T) {
+	dir := t.TempDir()
+	writeFixture(t, dir)
+	cfg := loadFixtureConfig(t, dir)
+
+	product, err := newRenderer(cfg).Render(renderRequest{FeedID: "sk-0001", PackageID: "current_conditions"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if product.Title != "Current Conditions" || !strings.Contains(product.Text, "temporarily unavailable") {
+		t.Fatalf("product = %#v", product)
+	}
+	if len(product.Segments) != 1 || product.Segments[0].Label != "unavailable" {
+		t.Fatalf("segments = %#v", product.Segments)
+	}
+}
+
 func TestCurrentConditionsDeduplicatesNearbyStationNames(t *testing.T) {
 	dir := t.TempDir()
 	writeFixture(t, dir)
@@ -632,6 +649,7 @@ func TestTelephoneWxOnDemandUsesTelephoneForecastAndSkipsConditionRepeat(t *test
 	dir := t.TempDir()
 	writeFixture(t, dir)
 	cfg := loadFixtureConfig(t, dir)
+	cfg.Feeds[0].Playout.Routine = "false"
 	storeObservationJSON(t, cfg.Store, "sk-99", `{
   "source": "eccc",
   "observed_at": "2026-06-15T20:00:00-06:00",
@@ -685,6 +703,59 @@ func TestTelephoneWxOnDemandUsesTelephoneForecastAndSkipsConditionRepeat(t *test
 		if strings.Contains(product.Text, unwanted) {
 			t.Fatalf("telephone product contained %q:\n%s", unwanted, product.Text)
 		}
+	}
+}
+
+func TestWxOnDemandIsIndependentOfFeedEnablementAndRoutinePlayout(t *testing.T) {
+	tests := []struct {
+		name           string
+		feedID         string
+		disableFeed    bool
+		disableRoutine bool
+	}{
+		{name: "disabled configured feed", feedID: "sk-0001", disableFeed: true, disableRoutine: true},
+		{name: "routine disabled configured feed", feedID: "sk-0001", disableRoutine: true},
+		{name: "unknown feed identifier", feedID: "telephone-only"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeFixture(t, dir)
+			cfg := loadFixtureConfig(t, dir)
+			if test.disableFeed {
+				cfg.Feeds[0].EnabledRaw = "false"
+			}
+			if test.disableRoutine {
+				cfg.Feeds[0].Playout.Routine = "false"
+			}
+			storeObservationJSON(t, cfg.Store, "sk-99", `{
+  "source": "eccc",
+  "observed_at": "2026-06-15T20:00:00-06:00",
+  "station": {"en": "Regina International Airport"},
+  "station_id": "sk-99",
+  "properties": {
+    "condition": {"en": "Clear"},
+    "temp": 21,
+    "wind": {"direction": "SE", "speed": 14}
+  }
+}`)
+
+			product, err := newRenderer(cfg).RenderWxOnDemand(wxOnDemandRequest{
+				RequestID:    "wx-independent-" + test.name,
+				FeedID:       test.feedID,
+				Code:         "06099",
+				Source:       "hello_weather",
+				LocationName: "sk-99",
+				StationID:    "sk-99",
+				Packages:     []string{"current_conditions"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(product.Text, "Regina International Airport") {
+				t.Fatalf("on-demand product did not render requested observation: %s", product.Text)
+			}
+		})
 	}
 }
 
@@ -1237,14 +1308,17 @@ func TestThunderstormOutlookSkipsNearbyPolygonRows(t *testing.T) {
 	}
 }
 
-func TestMissingProductDataReturnsSkippableError(t *testing.T) {
+func TestConfiguredMissingProductDataRendersUnavailableAnnouncement(t *testing.T) {
 	dir := t.TempDir()
 	writeFixture(t, dir)
 	cfg := loadFixtureConfig(t, dir)
 
-	_, err := newRenderer(cfg).Render(renderRequest{FeedID: "sk-0001", PackageID: "forecast"})
-	if err == nil || !strings.Contains(err.Error(), "forecast information is unavailable") {
-		t.Fatalf("error = %v", err)
+	product, err := newRenderer(cfg).Render(renderRequest{FeedID: "sk-0001", PackageID: "forecast"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(product.Text, "forecast is temporarily unavailable") {
+		t.Fatalf("product text = %q", product.Text)
 	}
 }
 
@@ -2489,5 +2563,30 @@ func TestOnDemandFeedOverridesCapabilitySpecificLocations(t *testing.T) {
 	}
 	if got := feed.Locations.MarineForecastLocations.Locations[0].ID; got != "088800" {
 		t.Fatalf("marine forecast = %q", got)
+	}
+}
+
+func TestOnDemandFeedDoesNotUseConfiguredClimateOrRiverForUnresolvedCallerLocation(t *testing.T) {
+	configured := feedXML{ID: "sk-0001", EnabledRaw: "true"}
+	configured.Locations.ClimateLocations.Locations = []locationXML{{ID: "4057165", Source: "eccc"}}
+	configured.Locations.HydrometricLocations.Locations = []locationXML{{ID: "05HG001", Source: "eccc"}}
+	configured.Locations.HydrometricLocations.Upstream.Locations = []locationXML{{ID: "05HG002", Source: "eccc"}}
+
+	feed, err := newRenderer(loadedConfig{Feeds: []feedXML{configured}}).onDemandFeed(wxOnDemandRequest{
+		FeedID:   "sk-0001",
+		Code:     "06040",
+		Packages: []string{"climate_summary", "hydrometric"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := feed.Locations.ClimateLocations.Locations; len(got) != 1 || got[0] != onDemandUnavailableLocation() {
+		t.Fatalf("climate locations = %#v", got)
+	}
+	if got := feed.Locations.HydrometricLocations.Locations; len(got) != 1 || got[0] != onDemandUnavailableLocation() {
+		t.Fatalf("hydrometric locations = %#v", got)
+	}
+	if len(feed.Locations.HydrometricLocations.Upstream.Locations) != 0 || len(feed.Locations.HydrometricLocations.Downstream.Locations) != 0 {
+		t.Fatalf("related hydrometric locations = %#v", feed.Locations.HydrometricLocations)
 	}
 }

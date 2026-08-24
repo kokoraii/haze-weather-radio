@@ -3,13 +3,25 @@ import json
 import sqlite3
 import tempfile
 import unittest
+import urllib.error
 import zipfile
 from pathlib import Path
+from unittest import mock
 
-from build_location_catalog import build, extract_shapefile_archive, identifier_value, stable_id
+from build_location_catalog import build, extract_shapefile_archive, identifier_value, source_bytes, stable_id
 
 
 class CatalogBuilderGoldenTest(unittest.TestCase):
+    def test_source_download_retries_transient_failure(self) -> None:
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b"catalog-source"
+        with mock.patch(
+            "build_location_catalog.urllib.request.urlopen",
+            side_effect=[urllib.error.URLError("temporary failure"), response],
+        ) as urlopen:
+            self.assertEqual(source_bytes("https://catalog.example.test/source", True), b"catalog-source")
+        self.assertEqual(urlopen.call_count, 2)
+
     def test_statcan_population_enriches_existing_csd_without_new_geometry(self) -> None:
         with tempfile.TemporaryDirectory(prefix="haze-location-census-") as directory:
             root = Path(directory)
@@ -635,6 +647,255 @@ class CatalogBuilderGoldenTest(unittest.TestCase):
                         connection.execute("SELECT attributes_json FROM entities").fetchone()[0]
                     ),
                     {"generic": "Montreal", "name_rank": "1"},
+                )
+            finally:
+                connection.close()
+
+    def test_ltce_virtual_station_crosswalks_to_current_physical_station(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="haze-location-ltce-") as directory:
+            root = Path(directory)
+            physical_path = root / "physical.geojson"
+            virtual_path = root / "virtual.geojson"
+            manifest_path = root / "manifest.json"
+            output_path = root / "fixture.sqlite"
+            physical_path.write_text(
+                json.dumps(
+                    {
+                        "type": "FeatureCollection",
+                        "features": [
+                            {
+                                "type": "Feature",
+                                "properties": {
+                                    "CLIMATE_IDENTIFIER": "4016699",
+                                    "STATION_NAME": "Regina RCS",
+                                    "PROV_STATE_TERR_CODE": "SK",
+                                },
+                                "geometry": {"type": "Point", "coordinates": [-104.61, 50.45]},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            virtual_path.write_text(
+                json.dumps(
+                    {
+                        "type": "FeatureCollection",
+                        "features": [
+                            {
+                                "type": "Feature",
+                                "properties": {
+                                    "VIRTUAL_CLIMATE_ID": "VSSK32V",
+                                    "VIRTUAL_STATION_NAME_E": "Regina Area",
+                                    "VIRTUAL_STATION_NAME_F": "Région de Regina",
+                                    "WXO_CITY_CODE": "sk-32",
+                                    "CLIMATE_IDENTIFIER": "4016560",
+                                    "PROVINCE_CODE": "SK",
+                                    "END_DATE": "2007-11-30T00:00:00Z",
+                                },
+                                "geometry": {"type": "Point", "coordinates": [-104.60, 50.44]},
+                            },
+                            {
+                                "type": "Feature",
+                                "properties": {
+                                    "VIRTUAL_CLIMATE_ID": "VSSK32V",
+                                    "VIRTUAL_STATION_NAME_E": "Regina Area",
+                                    "WXO_CITY_CODE": "sk-32",
+                                    "CLIMATE_IDENTIFIER": "4016699",
+                                    "PROVINCE_CODE": "SK",
+                                    "END_DATE": None,
+                                },
+                                "geometry": {"type": "Point", "coordinates": [-104.61, 50.45]},
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "packs": [
+                            {
+                                "id": "fixture",
+                                "sources": [
+                                    {
+                                        "id": "physical-climate",
+                                        "adapter": "geojson",
+                                        "identity_authority": "eccc-climate",
+                                        "location": str(physical_path),
+                                        "kind": "climate_station",
+                                        "id_fields": ["CLIMATE_IDENTIFIER"],
+                                        "name_fields": ["STATION_NAME"],
+                                        "country": "CA",
+                                        "region_fields": ["PROV_STATE_TERR_CODE"],
+                                        "capabilities": ["climate"],
+                                        "identifiers": [
+                                            {
+                                                "authority": "eccc",
+                                                "scheme": "climate",
+                                                "field": "CLIMATE_IDENTIFIER",
+                                                "primary": True,
+                                            }
+                                        ],
+                                        "expected_min": 1,
+                                    },
+                                    {
+                                        "id": "ltce-virtual",
+                                        "adapter": "eccc_ltce_virtual",
+                                        "identity_authority": "eccc-ltce",
+                                        "location": str(virtual_path),
+                                        "expected_min": 1,
+                                    },
+                                ],
+                            }
+                        ],
+                    },
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+
+            build(manifest_path, "fixture", output_path, "2026-08-11T00:00:00Z", False)
+
+            connection = sqlite3.connect(output_path)
+            try:
+                virtual_entity = connection.execute(
+                    "SELECT canonical_id, attributes_json FROM entities WHERE kind = 'virtual_climate_station'"
+                ).fetchone()
+                self.assertIsNotNone(virtual_entity)
+                virtual_id, attributes_json = virtual_entity
+                self.assertEqual(
+                    json.loads(attributes_json)["current_climate_identifier"],
+                    "4016699",
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT normalized_value FROM identifiers WHERE entity_pk = ("
+                        "SELECT entity_pk FROM entities WHERE canonical_id = ?) AND scheme = 'virtual_climate'",
+                        (virtual_id,),
+                    ).fetchone()[0],
+                    "VSSK32V",
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT to_id FROM relationships WHERE from_id = ? AND relationship_type = 'served_by'",
+                        (virtual_id,),
+                    ).fetchone()[0],
+                    stable_id("eccc-climate", "climate_station", "4016699"),
+                )
+            finally:
+                connection.close()
+
+    def test_eccc_climate_only_advertises_recent_daily_stations(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="haze-location-climate-status-") as directory:
+            root = Path(directory)
+            source_path = root / "climate.geojson"
+            manifest_path = root / "manifest.json"
+            output_path = root / "fixture.sqlite"
+            source_path.write_text(
+                json.dumps(
+                    {
+                        "type": "FeatureCollection",
+                        "features": [
+                            {
+                                "type": "Feature",
+                                "properties": {
+                                    "CLIMATE_IDENTIFIER": "4016699",
+                                    "STATION_NAME": "Regina RCS",
+                                    "PROV_STATE_TERR_CODE": "SK",
+                                    "LAST_DATE": "2026-08-10T00:00:00Z",
+                                },
+                                "geometry": {"type": "Point", "coordinates": [-104.61, 50.45]},
+                            },
+                            {
+                                "type": "Feature",
+                                "properties": {
+                                    "CLIMATE_IDENTIFIER": "4016695",
+                                    "STATION_NAME": "Regina Normandy Heights",
+                                    "PROV_STATE_TERR_CODE": "SK",
+                                    "LAST_DATE": "1975-12-01T00:00:00Z",
+                                },
+                                "geometry": {"type": "Point", "coordinates": [-104.59, 50.47]},
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "packs": [
+                            {
+                                "id": "fixture",
+                                "sources": [
+                                    {
+                                        "id": "eccc-climate",
+                                        "adapter": "eccc_climate",
+                                        "identity_authority": "eccc-climate",
+                                        "location": str(source_path),
+                                        "kind": "climate_station",
+                                        "id_fields": ["CLIMATE_IDENTIFIER"],
+                                        "name_fields": ["STATION_NAME"],
+                                        "country": "CA",
+                                        "region_fields": ["PROV_STATE_TERR_CODE"],
+                                        "daily_reporting_window_days": 730,
+                                        "identifiers": [
+                                            {
+                                                "authority": "eccc",
+                                                "scheme": "climate",
+                                                "field": "CLIMATE_IDENTIFIER",
+                                                "primary": True,
+                                            }
+                                        ],
+                                        "expected_min": 2,
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            build(manifest_path, "fixture", output_path, "2026-08-11T00:00:00Z", False)
+
+            connection = sqlite3.connect(output_path)
+            try:
+                status_by_station = {
+                    identifier: (reporting, has_daily_capability, attributes_json)
+                    for identifier, reporting, has_daily_capability, attributes_json in connection.execute(
+                        """SELECT identifiers.normalized_value, entities.reporting_status,
+                                  EXISTS(
+                                      SELECT 1 FROM entity_capabilities
+                                      WHERE entity_capabilities.entity_pk = entities.entity_pk
+                                        AND capability = 'climate'
+                                  ),
+                                  entities.attributes_json
+                           FROM entities
+                           JOIN identifiers USING(entity_pk)
+                           WHERE identifiers.scheme = 'climate'
+                           ORDER BY identifiers.normalized_value"""
+                    )
+                }
+                self.assertEqual(status_by_station["4016699"][0], "recently_reporting")
+                self.assertTrue(status_by_station["4016699"][1])
+                self.assertTrue(json.loads(status_by_station["4016699"][2])["daily_data_recent"])
+                self.assertEqual(status_by_station["4016695"][0], "historical")
+                self.assertFalse(status_by_station["4016695"][1])
+                self.assertFalse(json.loads(status_by_station["4016695"][2])["daily_data_recent"])
+                self.assertEqual(
+                    connection.execute(
+                        """SELECT COUNT(*) FROM entity_capabilities
+                           JOIN identifiers USING(entity_pk)
+                           WHERE identifiers.scheme = 'climate'
+                             AND identifiers.normalized_value = '4016695'
+                             AND capability = 'climate_records'"""
+                    ).fetchone()[0],
+                    1,
                 )
             finally:
                 connection.close()

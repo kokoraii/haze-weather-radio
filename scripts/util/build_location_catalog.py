@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from datetime import datetime, timedelta
 import hashlib
 import io
 import json
@@ -21,6 +22,7 @@ import struct
 import tempfile
 import unicodedata
 import urllib.parse
+import urllib.error
 import urllib.request
 import uuid
 import zipfile
@@ -29,6 +31,8 @@ from typing import Any, Iterable, Iterator
 
 LOCATION_NAMESPACE = uuid.UUID("f987bc4e-56fe-5f41-8bcf-fdcf8c5a8e3e")
 USER_AGENT = "haze-location-catalog-builder/1.0"
+DOWNLOAD_TIMEOUT_SECONDS = 45
+DOWNLOAD_ATTEMPTS = 3
 SCHEMA = Path(__file__).resolve().parents[2] / "crates" / "haze-location" / "schema" / "v1.sql"
 GEOMETRY_SCHEMA = (
     Path(__file__).resolve().parents[2]
@@ -111,9 +115,30 @@ def source_bytes(location: str, allow_downloads: bool) -> bytes:
     if parsed.scheme in {"http", "https"}:
         if not allow_downloads:
             raise RuntimeError(f"network input requires --allow-downloads: {location}")
-        request = urllib.request.Request(location, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(request, timeout=120) as response:
-            return response.read()
+        last_error: Exception | None = None
+        for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+            request = urllib.request.Request(
+                location,
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Accept": "*/*",
+                    "Connection": "close",
+                },
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
+                    return response.read()
+            except urllib.error.HTTPError as error:
+                if 400 <= error.code < 500:
+                    raise RuntimeError(f"download failed for {location}: HTTP {error.code}") from error
+                last_error = error
+            except (OSError, TimeoutError, urllib.error.URLError) as error:
+                last_error = error
+            if attempt < DOWNLOAD_ATTEMPTS:
+                continue
+        raise RuntimeError(
+            f"download failed for {location} after {DOWNLOAD_ATTEMPTS} attempts: {last_error}"
+        ) from last_error
     return Path(location).read_bytes()
 
 
@@ -653,6 +678,39 @@ class Catalog:
         self.source_counts[source_id] += 1
         return canonical_id
 
+    def add_relationship(
+        self,
+        *,
+        from_id: str,
+        to_id: str,
+        relationship_type: str,
+        source_id: str,
+        confidence: str = "exact",
+        score: float = 1.0,
+        method: str = "provider_crosswalk",
+        valid_from: str | None = None,
+        valid_to: str | None = None,
+        evidence: dict[str, Any] | None = None,
+    ) -> None:
+        self.connection.execute(
+            """INSERT OR IGNORE INTO relationships(
+                   from_id, to_id, relationship_type, confidence, score, method,
+                   valid_from, valid_to, source_id, evidence_json
+               ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                from_id,
+                to_id,
+                relationship_type,
+                confidence,
+                score,
+                method,
+                valid_from,
+                valid_to,
+                source_id,
+                json.dumps(evidence or {}, sort_keys=True, separators=(",", ":")),
+            ),
+        )
+
     def _add_area_geometry(
         self,
         *,
@@ -938,6 +996,136 @@ def eccc_citypage_record(catalog: Catalog, source: dict[str, Any], feature: dict
     )
 
 
+def catalog_date(value: Any) -> datetime.date | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
+    except ValueError:
+        try:
+            return datetime.strptime(raw[:10], "%Y-%m-%d").date()
+        except ValueError:
+            return None
+
+
+def eccc_climate_station_record(catalog: Catalog, source: dict[str, Any], feature: dict[str, Any]) -> None:
+    """Preserve historical climate stations without advertising stale daily data."""
+    properties = feature.get("properties", {})
+    reference_date = catalog_date(catalog.retrieved_at)
+    last_report_date = catalog_date(first(properties, "LAST_DATE", "DLY_LAST_DATE"))
+    recent_days = int(source.get("daily_reporting_window_days", 730))
+    recently_reporting = bool(
+        reference_date
+        and last_report_date
+        and last_report_date >= reference_date - timedelta(days=recent_days)
+    )
+    capabilities = ["climate_records"]
+    if recently_reporting:
+        capabilities.insert(0, "climate")
+    generic_geojson_record(
+        catalog,
+        source,
+        feature,
+        capabilities=capabilities,
+        reporting="recently_reporting" if recently_reporting else "historical",
+        extra_attributes={
+            "daily_reporting_window_days": recent_days,
+            "daily_data_recent": recently_reporting,
+        },
+    )
+
+
+def eccc_ltce_virtual_records(catalog: Catalog, source: dict[str, Any], features: Iterable[dict[str, Any]]) -> None:
+    """Add one virtual climate entity per ECCC LTCE station.
+
+    LTCE virtual stations are long-term record composites. They are deliberately
+    distinct from daily climate stations and retain their active physical member
+    as a typed provider crosswalk rather than becoming daily-observation targets.
+    """
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for feature in features:
+        properties = feature.get("properties", {})
+        identifier = normalize_identifier("virtual_climate", first(properties, "VIRTUAL_CLIMATE_ID"))
+        if not identifier:
+            continue
+        grouped.setdefault(identifier, []).append(feature)
+    for identifier in sorted(grouped):
+        members = grouped[identifier]
+        name_en = ""
+        name_fr = ""
+        citypage = ""
+        all_physical_ids: set[str] = set()
+        current_counts: dict[str, int] = {}
+        preferred_geometry: dict[str, Any] | None = None
+        fallback_geometry: dict[str, Any] | None = None
+        for feature in members:
+            properties = feature.get("properties", {})
+            name_en = name_en or str(first(properties, "VIRTUAL_STATION_NAME_E") or "").strip()
+            name_fr = name_fr or str(first(properties, "VIRTUAL_STATION_NAME_F") or "").strip()
+            citypage = citypage or str(first(properties, "WXO_CITY_CODE") or "").strip()
+            physical_id = normalize_identifier("climate", first(properties, "CLIMATE_IDENTIFIER"))
+            geometry = feature.get("geometry")
+            if fallback_geometry is None and geometry:
+                fallback_geometry = geometry
+            end_date = str(first(properties, "END_DATE") or "").strip().casefold()
+            if not physical_id:
+                continue
+            all_physical_ids.add(physical_id)
+            if end_date in {"", "none", "null"}:
+                current_counts[physical_id] = current_counts.get(physical_id, 0) + 1
+                if preferred_geometry is None and geometry:
+                    preferred_geometry = geometry
+        current_ids = sorted(current_counts, key=lambda value: (-current_counts[value], value))
+        current_id = current_ids[0] if current_ids else ""
+        attributes = {
+            "virtual_climate_identifier": identifier,
+            "wxo_city_code": citypage,
+            "current_climate_identifier": current_id,
+            "current_climate_identifiers": current_ids,
+            "member_climate_identifiers": sorted(all_physical_ids),
+            "member_station_count": len(all_physical_ids),
+            "purpose": "long_term_climate_extremes",
+        }
+        canonical_id = catalog.add_entity(
+            source_id=source["id"],
+            identity_authority=source.get("identity_authority", "eccc-ltce"),
+            provider_id=identifier,
+            kind="virtual_climate_station",
+            names=(
+                ("en-CA", name_en or identifier, "canonical", True),
+                ("fr-CA", name_fr, "canonical", False),
+            ),
+            identifiers=(
+                ("eccc", "virtual_climate", identifier, True),
+                ("eccc", "eccc_citypage", citypage, False),
+            ),
+            geometry=preferred_geometry or fallback_geometry,
+            capabilities=("climate_records",),
+            country="CA",
+            region=first(members[0].get("properties", {}), "PROVINCE_CODE"),
+            lifecycle="active",
+            reporting="recently_reporting" if current_id else "historical",
+            source_quality=float(source.get("source_quality", 0.97)),
+            attributes=attributes,
+        )
+        for physical_id in current_ids:
+            physical_canonical_id = stable_id("eccc-climate", "climate_station", physical_id)
+            if catalog.connection.execute(
+                "SELECT 1 FROM entities WHERE canonical_id = ?", (physical_canonical_id,)
+            ).fetchone():
+                catalog.add_relationship(
+                    from_id=canonical_id,
+                    to_id=physical_canonical_id,
+                    relationship_type="served_by",
+                    source_id=source["id"],
+                    evidence={
+                        "virtual_climate_identifier": identifier,
+                        "current_climate_identifier": physical_id,
+                    },
+                )
+
+
 def ogc_source(catalog: Catalog, source: dict[str, Any], allow_downloads: bool) -> None:
     location = source["location"]
     raw = source_bytes(location, allow_downloads)
@@ -965,11 +1153,26 @@ def ogc_source(catalog: Catalog, source: dict[str, Any], allow_downloads: bool) 
             eccc_zone_record(catalog, source, feature)
         elif source["adapter"] == "eccc_citypage":
             eccc_citypage_record(catalog, source, feature)
+        elif source["adapter"] == "eccc_climate":
+            eccc_climate_station_record(catalog, source, feature)
+        elif source["adapter"] == "eccc_ltce_virtual":
+            # The LTCE adapter groups all source features below.
+            continue
         else:
             generic_geojson_record(catalog, source, feature)
+    if source["adapter"] == "eccc_ltce_virtual":
+        eccc_ltce_virtual_records(catalog, source, features)
 
 
-def generic_geojson_record(catalog: Catalog, source: dict[str, Any], feature: dict[str, Any]) -> None:
+def generic_geojson_record(
+    catalog: Catalog,
+    source: dict[str, Any],
+    feature: dict[str, Any],
+    *,
+    capabilities: Iterable[str] | None = None,
+    reporting: str | None = None,
+    extra_attributes: dict[str, Any] | None = None,
+) -> None:
     properties = feature.get("properties", {})
     provider_id = first(properties, *(source.get("id_fields") or ["id", "code"])) or feature.get("id")
     if provider_id is None:
@@ -1011,7 +1214,7 @@ def generic_geojson_record(catalog: Catalog, source: dict[str, Any], feature: di
     inactive_field = source.get("inactive_when_field_present")
     if inactive_field and first(properties, inactive_field) is not None:
         lifecycle = "inactive"
-    reporting = source.get("reporting", "unknown")
+    reporting = source.get("reporting", "unknown") if reporting is None else reporting
     raw_region = first(properties, *(source.get("region_fields") or []))
     region = source.get("region_map", {}).get(str(raw_region), raw_region)
     if source.get("region_normalizer") == "canada":
@@ -1029,6 +1232,8 @@ def generic_geojson_record(catalog: Catalog, source: dict[str, Any], feature: di
             for field in source["attribute_fields"]
             if (value := first(properties, field)) is not None
         }
+    if extra_attributes:
+        attributes = {**attributes, **extra_attributes}
     catalog.add_entity(
         source_id=source["id"],
         identity_authority=source.get("identity_authority"),
@@ -1037,7 +1242,7 @@ def generic_geojson_record(catalog: Catalog, source: dict[str, Any], feature: di
         names=names,
         identifiers=identifiers,
         geometry=feature.get("geometry"),
-        capabilities=source.get("capabilities", []),
+        capabilities=source.get("capabilities", []) if capabilities is None else capabilities,
         country=source.get("country") or first(properties, *(source.get("country_fields") or [])),
         region=region,
         source_quality=float(source.get("source_quality", 0.8)),

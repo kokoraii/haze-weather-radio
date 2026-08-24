@@ -233,6 +233,33 @@
         .location-raw-response { margin-top: 9px; }
         .location-raw-response summary { color: var(--muted); cursor: pointer; font-size: 11.5px; }
         .location-raw-response pre { max-height: 360px; overflow: auto; white-space: pre-wrap; }
+        .leads-page { padding: 10px 14px 34px; }
+        .leads-layout { display: grid; grid-template-columns: minmax(260px, .58fr) minmax(0, 1.42fr); gap: 10px; align-items: start; }
+        .lead-list { display: flex; flex-direction: column; gap: 5px; min-height: 360px; max-height: calc(100vh - 252px); overflow: auto; padding: 7px; }
+        .lead-list-entry { align-items: center; background: linear-gradient(180deg, var(--surface-raised-top), var(--surface-raised-bot)); border: 1px solid var(--border-deep); border-radius: var(--radius-sm); box-shadow: var(--bevel-raised); color: var(--text); cursor: pointer; display: grid; gap: 2px; min-height: 48px; padding: 7px 8px; text-align: left; width: 100%; }
+        .lead-list-entry:hover { border-color: color-mix(in srgb, var(--accent) 60%, var(--border-deep)); }
+        .lead-list-entry.active { background: color-mix(in srgb, var(--accent) 16%, var(--surface)); border-color: var(--accent); }
+        .lead-list-entry strong { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .lead-list-entry span { color: var(--muted); font-size: 10.75px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .lead-editor-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+        .lead-wide { grid-column: 1 / -1; }
+        .lead-condition-block { border: 1px solid var(--border-subtle); border-radius: var(--radius-sm); overflow: hidden; }
+        .lead-condition-toolbar { align-items: center; border-bottom: 1px solid var(--border-subtle); display: flex; flex-wrap: wrap; gap: 7px; justify-content: space-between; padding: 7px 8px; }
+        .lead-condition-toolbar p { color: var(--muted); font-size: 11px; line-height: 1.35; margin: 0; }
+        .lead-condition-table { overflow-x: auto; }
+        .lead-condition-table table { border-collapse: collapse; min-width: 760px; width: 100%; }
+        .lead-condition-table th { background: color-mix(in srgb, var(--surface) 78%, var(--bg)); color: var(--muted); font-size: 10.5px; padding: 6px; text-align: left; }
+        .lead-condition-table td { border-top: 1px solid var(--border-subtle); padding: 4px; vertical-align: middle; }
+        .lead-condition-table input, .lead-condition-table select { min-height: 28px; min-width: 0; padding: 4px 5px; width: 100%; }
+        .lead-condition-table .lead-condition-target { min-width: 100px; }
+        .lead-condition-table .lead-condition-value { min-width: 140px; }
+        .lead-condition-checkboxes { align-items: center; display: flex; gap: 6px; white-space: nowrap; }
+        .lead-condition-checkboxes label { align-items: center; color: var(--muted); display: inline-flex; font-size: 10px; gap: 3px; }
+        .lead-condition-checkboxes input { min-height: auto; width: auto; }
+        .lead-condition-join { color: var(--muted); font-size: 11px; padding: 3px 2px; }
+        .lead-preview-box { display: grid; gap: 7px; }
+        .lead-preview-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+        .lead-preview-player { min-height: 34px; width: 100%; }
 
         @media (min-width: 900px) {
             .daemon-page { padding: 12px 14px 32px; }
@@ -280,6 +307,8 @@
             .tts-editor-grid,
             .feeds-layout,
             .feed-editor-grid,
+            .leads-layout,
+            .lead-editor-grid,
             .location-utility-layout { grid-template-columns: 1fr; }
             .location-catalog-import-form { grid-template-columns: 1fr; }
             .breakin-side,
@@ -334,6 +363,10 @@
                 <a class="sidebar-link" href="#/same" data-view="same">
                     <i data-lucide="radio-tower" width="15" height="15"></i>
                     Broadcast Alert
+                </a>
+                <a class="sidebar-link" href="#/leads" data-view="leads">
+                    <i data-lucide="audio-lines" width="15" height="15"></i>
+                    Lead Statements
                 </a>
                 <a class="sidebar-link" href="#/automations" data-view="automations">
                     <i data-lucide="calendar-clock" width="15" height="15"></i>
@@ -1813,6 +1846,131 @@
                             </section>
                         </aside>
                     </div>
+                </main>
+            </div>
+
+            <div class="view" data-view="leads">
+                <header class="topbar">
+                    <div class="topbar-inner">
+                        <div class="topbar-title">
+                            <p class="topbar-eyebrow">Alert Audio</p>
+                            <h1>Lead Statements</h1>
+                            <p>Apply managed lead-in and lead-out audio to matching alerts without changing Alert Ready attention-tone behavior.</p>
+                        </div>
+                        <div class="metric-strip">
+                            <article class="metric-card">
+                                <p>Statements</p>
+                                <strong id="leadStatementsCount">0</strong>
+                            </article>
+                            <article class="metric-card">
+                                <p>Active</p>
+                                <strong id="leadStatementsEnabled">0</strong>
+                            </article>
+                        </div>
+                    </div>
+                </header>
+
+                <main class="dashboard leads-page">
+                    <p id="leadStatementsStatus" class="status-banner" aria-live="polite">Loading lead statements…</p>
+
+                    <div class="leads-layout">
+                        <section class="section-block">
+                            <div class="section-hd">
+                                <span>Statements</span>
+                                <span class="section-hd-sub" id="leadStatementsPath">managed/configs/lead.xml</span>
+                            </div>
+                            <div class="section-body pad-none">
+                                <div id="leadStatementList" class="lead-list" role="listbox" aria-label="Lead statements"></div>
+                            </div>
+                            <div class="section-body">
+                                <div class="daemon-actions">
+                                    <button id="leadStatementAddButton" class="btn-action" type="button">
+                                        <i data-lucide="plus" width="13" height="13"></i>
+                                        Add lead
+                                    </button>
+                                    <button id="leadStatementsSaveButton" class="btn-primary" type="button">
+                                        <i data-lucide="save" width="13" height="13"></i>
+                                        Save
+                                    </button>
+                                </div>
+                            </div>
+                        </section>
+
+                        <section class="section-block">
+                            <div class="section-hd">
+                                <span id="leadStatementEditorTitle">Lead statement</span>
+                                <div class="daemon-actions">
+                                    <button id="leadStatementDeleteButton" class="btn-danger" type="button">
+                                        <i data-lucide="trash-2" width="13" height="13"></i>
+                                        Delete
+                                    </button>
+                                </div>
+                            </div>
+                            <div class="section-body lead-editor-grid">
+                                <label class="daemon-field">
+                                    <span>Name</span>
+                                    <input id="leadStatementName" type="text" maxlength="120" autocomplete="off" placeholder="NPAS preroll">
+                                </label>
+                                <label class="ba-switch bulletin-enabled-row">
+                                    <input id="leadStatementEnabled" type="checkbox" checked>
+                                    <span>Enabled</span>
+                                </label>
+                                <label class="daemon-field">
+                                    <span>Lead in</span>
+                                    <input id="leadStatementLeadIn" type="text" list="leadStatementAudioFiles" maxlength="512" autocomplete="off" placeholder="audio/NPAS_Preroll.wav">
+                                </label>
+                                <label class="daemon-field">
+                                    <span>Lead out</span>
+                                    <input id="leadStatementLeadOut" type="text" list="leadStatementAudioFiles" maxlength="512" autocomplete="off" placeholder="Optional audio/lead-out.wav">
+                                </label>
+
+                                <section class="lead-wide lead-condition-block" aria-labelledby="leadConditionsTitle">
+                                    <div class="lead-condition-toolbar">
+                                        <div>
+                                            <strong id="leadConditionsTitle">Matching conditions</strong>
+                                            <p>Statements run in order. The first enabled match is used.</p>
+                                        </div>
+                                        <button id="leadConditionAddButton" class="btn-action" type="button">
+                                            <i data-lucide="plus" width="13" height="13"></i>
+                                            Add condition
+                                        </button>
+                                    </div>
+                                    <div class="lead-condition-table">
+                                        <table>
+                                            <thead>
+                                                <tr>
+                                                    <th>Rule</th>
+                                                    <th>Field</th>
+                                                    <th>Key or location</th>
+                                                    <th>Match</th>
+                                                    <th>Value</th>
+                                                    <th>Options</th>
+                                                    <th></th>
+                                                </tr>
+                                            </thead>
+                                            <tbody id="leadConditionsBody"></tbody>
+                                        </table>
+                                    </div>
+                                </section>
+
+                                <section class="lead-wide lead-preview-box">
+                                    <div class="lead-preview-actions">
+                                        <button id="leadStatementPreviewButton" class="btn-action" type="button">
+                                            <i data-lucide="play" width="13" height="13"></i>
+                                            Preview audio
+                                        </button>
+                                        <button id="leadStatementPreviewSameButton" class="btn-action" type="button">
+                                            <i data-lucide="radio" width="13" height="13"></i>
+                                            Preview with SAME test audio
+                                        </button>
+                                    </div>
+                                    <audio id="leadStatementPreviewAudio" class="lead-preview-player" controls hidden></audio>
+                                    <p id="leadStatementPreviewMeta" class="form-hint">Previews are generated locally and are never sent to a live feed.</p>
+                                </section>
+                            </div>
+                        </section>
+                    </div>
+                    <datalist id="leadStatementAudioFiles"></datalist>
                 </main>
             </div>
 

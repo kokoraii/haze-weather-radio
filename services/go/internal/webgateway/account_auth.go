@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -101,6 +102,9 @@ type accountAuth struct {
 	expiryAuditLimiter  *attemptLimiter
 	preauthAuditLimiter *attemptLimiter
 	accountMutationMu   sync.Mutex
+	lockRepairMu        sync.Mutex
+	lockRepairCancel    context.CancelFunc
+	lockRepairDone      chan struct{}
 	argonSlots          chan struct{}
 	dummyPasswordHash   string
 	configured          bool
@@ -117,6 +121,12 @@ type attemptLimiter struct {
 }
 
 const maxAttemptLimiterKeys = 4096
+
+const (
+	minimumAccountLockRepairInterval = 5 * time.Second
+	maximumAccountLockRepairInterval = 15 * time.Second
+	accountLockRepairTimeout         = 5 * time.Second
+)
 
 func newAttemptLimiter() *attemptLimiter {
 	return &attemptLimiter{windows: map[string]attemptWindow{}}
@@ -305,6 +315,7 @@ func newAccountAuth(config Config, configPath string) *accountAuth {
 	}
 	h.dummyPasswordHash = dummy
 	h.configured = true
+	h.startAccountLockRepair()
 	return h
 }
 
@@ -312,12 +323,81 @@ func (h *accountAuth) Close() {
 	if h == nil {
 		return
 	}
+	h.stopAccountLockRepair()
 	if h.sessions != nil {
 		_ = h.sessions.Close()
 	}
 	if h.store != nil {
 		h.store.Close()
 	}
+}
+
+// startAccountLockRepair makes temporary account locks truly time-bounded.
+// Login and startup still repair expired locks immediately, while this bounded
+// background pass covers idle accounts that do not make another request.
+func (h *accountAuth) startAccountLockRepair() {
+	if h == nil || h.store == nil || h.initializationError != nil {
+		return
+	}
+	h.lockRepairMu.Lock()
+	if h.lockRepairCancel != nil {
+		h.lockRepairMu.Unlock()
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	h.lockRepairCancel = cancel
+	h.lockRepairDone = done
+	interval := accountLockRepairInterval(h.accountLockDuration)
+	h.lockRepairMu.Unlock()
+
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				repairCtx, repairCancel := context.WithTimeout(ctx, accountLockRepairTimeout)
+				err := h.repairAccountLocks(repairCtx, time.Now().UTC())
+				repairCancel()
+				if err != nil && !errors.Is(err, context.Canceled) {
+					log.Printf("web account lock repair failed")
+				}
+			}
+		}
+	}()
+}
+
+func (h *accountAuth) stopAccountLockRepair() {
+	if h == nil {
+		return
+	}
+	h.lockRepairMu.Lock()
+	cancel := h.lockRepairCancel
+	done := h.lockRepairDone
+	h.lockRepairCancel = nil
+	h.lockRepairDone = nil
+	h.lockRepairMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		<-done
+	}
+}
+
+func accountLockRepairInterval(lockDuration time.Duration) time.Duration {
+	interval := lockDuration / 4
+	if interval < minimumAccountLockRepairInterval {
+		return minimumAccountLockRepairInterval
+	}
+	if interval > maximumAccountLockRepairInterval {
+		return maximumAccountLockRepairInterval
+	}
+	return interval
 }
 
 func (h *accountAuth) bootstrapFirstAdmin(ctx context.Context, usernameEnv string, passwordEnv string) error {

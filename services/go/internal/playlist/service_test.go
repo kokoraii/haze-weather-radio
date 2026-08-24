@@ -140,6 +140,66 @@ func TestMatchFeedsFromEventReturnsAllTargetFeeds(t *testing.T) {
 	}
 }
 
+func TestPublishAutomationDispatchStatus(t *testing.T) {
+	tests := []struct {
+		name      string
+		status    string
+		errorText string
+		wantError string
+	}{
+		{name: "accepted", status: "accepted"},
+		{name: "completed", status: "completed"},
+		{name: "failed", status: "failed", errorText: "tts unavailable", wantError: "tts unavailable"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			clientConn, serverConn := net.Pipe()
+			defer clientConn.Close()
+			defer serverConn.Close()
+			planner := &feedPlanner{
+				feed:   feedXML{ID: "cwxr-sk01"},
+				bridge: &bridgeClient{conn: clientConn},
+			}
+			message := make(chan map[string]any, 1)
+			decodeErr := make(chan error, 1)
+			go func() {
+				var event map[string]any
+				if err := json.NewDecoder(serverConn).Decode(&event); err != nil {
+					decodeErr <- err
+					return
+				}
+				message <- event
+			}()
+
+			planner.publishAutomationDispatchStatus(map[string]any{
+				"dispatch_key":  "required_weekly_test:cwxr-sk01:1786557600000",
+				"automation_id": "required_weekly_test",
+				"scheduled_for": "2026-08-12T18:00:00Z",
+				"alert_id":      "automation-required_weekly_test-cwxr-sk01-1786557600000",
+			}, test.status, test.errorText)
+
+			select {
+			case err := <-decodeErr:
+				t.Fatalf("decode acknowledgement: %v", err)
+			case event := <-message:
+				if got := stringAt(event, "type"); got != "automation.dispatch."+test.status {
+					t.Fatalf("event type = %q", got)
+				}
+				data := mapAt(event, "data")
+				if got := firstText(nil, data, "dispatch_key"); got != "required_weekly_test:cwxr-sk01:1786557600000" {
+					t.Fatalf("dispatch key = %q", got)
+				}
+				if got := firstText(nil, data, "error"); got != test.wantError {
+					t.Fatalf("error = %q, want %q", got, test.wantError)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for automation acknowledgement")
+			}
+		})
+	}
+}
+
 func TestCleanupSupersededAlertQueuePartsPreservesInFlightAlert(t *testing.T) {
 	dir := t.TempDir()
 	queueDir := filepath.Join(dir, "runtime", "queues", "alerts")
@@ -1562,6 +1622,40 @@ func TestCombineAttentionAlertAudioPrependsToneAndVoice(t *testing.T) {
 	}
 	if !bytes.Equal(raw[:len(tone)], tone) || !bytes.Equal(raw[len(raw)-len(voice):], voice) {
 		t.Fatalf("combined audio did not preserve tone and voice: %#v", raw)
+	}
+}
+
+func TestCombineConfiguredLeadAlertAudioPlacesLeadsAroundSAME(t *testing.T) {
+	dir := t.TempDir()
+	voicePath := filepath.Join(dir, "voice.pcm16le")
+	outputPath := filepath.Join(dir, "alert.pcm16le")
+	preRoll := []byte{1, 0}
+	header := []byte{2, 0}
+	voice := []byte{3, 0}
+	eom := []byte{4, 0}
+	postRoll := []byte{5, 0}
+	if err := os.WriteFile(voicePath, voice, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := combineConfiguredLeadAlertAudio(outputPath, preRoll, header, voicePath, eom, postRoll, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	silence := []byte{0, 0}
+	want := append([]byte{}, preRoll...)
+	want = append(want, silence...)
+	want = append(want, header...)
+	want = append(want, silence...)
+	want = append(want, voice...)
+	want = append(want, eom...)
+	want = append(want, silence...)
+	want = append(want, postRoll...)
+	if !bytes.Equal(raw, want) {
+		t.Fatalf("configured lead sequence = %#v, want %#v", raw, want)
 	}
 }
 

@@ -1472,6 +1472,12 @@ func (s *wsSession) executeCommand(command string, payload map[string]any) (any,
 		return loadSAMEMapping(s.configPath)
 	case "same.location_names":
 		return loadLocationNames(s.configPath)
+	case "lead_statements.get":
+		return loadLeadStatements(s.configPath)
+	case "lead_statements.save":
+		return s.saveLeadStatements(payload)
+	case "lead_statements.preview":
+		return s.previewLeadStatement(payload)
 	case "automations.get", "same.templates.get":
 		return loadAlertTemplates(s.configPath)
 	case "automations.put", "same.templates.put":

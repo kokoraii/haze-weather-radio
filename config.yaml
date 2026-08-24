@@ -549,6 +549,4 @@ same:
     - EAN: WXR
     - HUW: WXR
   
-  alert_ready_on_NAADS_BIP: true # use the NPAS attention tone for NAADS CAP-CP alerts if they are marked for BI (Broadcast Immediate) on Alert Ready.
-
   send_txp_on_startup: false # whether to send a Transmitter Primary On SAME message on startup.

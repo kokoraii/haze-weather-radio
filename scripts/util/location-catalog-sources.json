@@ -267,7 +267,7 @@
         {
           "id": "eccc-climate-stations",
           "title": "ECCC climate stations",
-          "adapter": "geojson",
+          "adapter": "eccc_climate",
           "identity_authority": "eccc-climate",
           "location": "https://api.weather.gc.ca/collections/climate-stations/items?f=json&lang=en&limit=10000",
           "kind": "climate_station",
@@ -275,13 +275,24 @@
           "name_fields": ["STATION_NAME"],
           "country": "CA",
           "region_fields": ["PROV_STATE_TERR_CODE"],
-          "capabilities": ["climate"],
+          "daily_reporting_window_days": 730,
           "identifiers": [
             {"authority": "eccc", "scheme": "climate", "field": "CLIMATE_IDENTIFIER", "primary": true},
             {"authority": "wmo", "scheme": "wmo", "field": "WMO_IDENTIFIER", "primary": false},
             {"authority": "eccc", "scheme": "eccc_station", "field": "TC_IDENTIFIER", "primary": false}
           ],
           "expected_min": 8000,
+          "source_quality": 0.97,
+          "licence": "Environment and Climate Change Canada data server licence",
+          "attribution": "Data provided by Environment and Climate Change Canada."
+        },
+        {
+          "id": "eccc-ltce-virtual-climate-stations",
+          "title": "ECCC long-term climate extremes virtual stations",
+          "adapter": "eccc_ltce_virtual",
+          "identity_authority": "eccc-ltce",
+          "location": "https://api.weather.gc.ca/collections/ltce-stations/items?f=json&lang=en&limit=10000",
+          "expected_min": 650,
           "source_quality": 0.97,
           "licence": "Environment and Climate Change Canada data server licence",
           "attribution": "Data provided by Environment and Climate Change Canada."

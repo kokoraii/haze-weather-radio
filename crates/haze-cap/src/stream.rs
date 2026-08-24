@@ -1,11 +1,12 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures::StreamExt;
 use reqwest::header::ACCEPT;
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde_json::json;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
@@ -21,6 +22,9 @@ const MAX_STREAM_BUFFER_BYTES: usize = 8 << 20;
 const MAX_CAP_XML_BYTES: usize = 5 << 20;
 const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
 const READ_CHUNK_BYTES: usize = 16 * 1024;
+const ECCC_DATAMART_CAP_BASE_URL: &str = "https://dd.weather.gc.ca/today/alerts/cap";
+const ECCC_DATAMART_POLL_INTERVAL: Duration = Duration::from_secs(30);
+const ECCC_DATAMART_LOOKBACK_HOURS: i64 = 1;
 
 #[derive(Clone, Debug)]
 pub struct StreamConfig {
@@ -102,6 +106,24 @@ impl NaadsTcpIngest {
             tasks.push(tokio::spawn(async move { worker.run_forever().await }));
         }
 
+        let fallback_worker = StreamWorker {
+            source_id: self.config.source_id.clone(),
+            stream_url: ECCC_DATAMART_CAP_BASE_URL.to_string(),
+            archive_urls: self.config.archive_urls.clone(),
+            shadow: self.config.shadow,
+            startup_seed: self.config.startup_seed,
+            publisher: Arc::clone(&self.publisher),
+            http: self.http.clone(),
+            state: Arc::clone(&self.state),
+        };
+        tasks.push(tokio::spawn(async move {
+            EcccDatamartFallback {
+                worker: fallback_worker,
+            }
+            .run_forever()
+            .await
+        }));
+
         for task in tasks {
             task.await??;
         }
@@ -118,6 +140,240 @@ struct StreamWorker {
     publisher: Arc<EventPublisher>,
     http: Client,
     state: Arc<Mutex<StreamState>>,
+}
+
+struct EcccDatamartFallback {
+    worker: StreamWorker,
+}
+
+#[derive(Debug, Default)]
+struct DatamartPollStats {
+    date_directories: usize,
+    alert_directories: usize,
+    candidate_files: usize,
+    processed_files: usize,
+}
+
+impl EcccDatamartFallback {
+    async fn run_forever(self) -> Result<()> {
+        let mut announced_ready = false;
+        loop {
+            match self.poll_once().await {
+                Ok(stats) => {
+                    if !announced_ready {
+                        info!(
+                            source = self.worker.source_id,
+                            source_url = self.worker.stream_url,
+                            poll_interval_seconds = ECCC_DATAMART_POLL_INTERVAL.as_secs(),
+                            lookback_hours = ECCC_DATAMART_LOOKBACK_HOURS,
+                            "ECCC Datamart CAP fallback enabled"
+                        );
+                        announced_ready = true;
+                    }
+                    if stats.processed_files > 0 {
+                        info!(
+                            source = self.worker.source_id,
+                            date_directories = stats.date_directories,
+                            alert_directories = stats.alert_directories,
+                            candidate_files = stats.candidate_files,
+                            processed_files = stats.processed_files,
+                            "processed ECCC Datamart CAP fallback files"
+                        );
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        source = self.worker.source_id,
+                        source_url = self.worker.stream_url,
+                        %error,
+                        "ECCC Datamart CAP fallback poll failed"
+                    );
+                    self.worker
+                        .publish_status(json!({
+                            "source_id": self.worker.source_id,
+                            "source": "naads",
+                            "mode": "tcp",
+                            "shadow": self.worker.shadow,
+                            "status": "datamart_fallback_error",
+                            "transport": "eccc_datamart_https",
+                            "url": self.worker.stream_url,
+                            "error": error.to_string(),
+                            "timestamp_unix_ms": unix_ms(),
+                        }))
+                        .await
+                        .ok();
+                }
+            }
+            sleep(ECCC_DATAMART_POLL_INTERVAL).await;
+        }
+    }
+
+    async fn poll_once(&self) -> Result<DatamartPollStats> {
+        let mut stats = DatamartPollStats::default();
+        for (date, hours) in datamart_date_hours(Utc::now()) {
+            let date_url = format!("{}/{date}/", self.worker.stream_url.trim_end_matches('/'));
+            let offices = match self.fetch_listing(&date_url, false).await {
+                Ok(entries) => listing_directories(&entries),
+                Err(error) => {
+                    warn!(
+                        source = self.worker.source_id,
+                        url = %date_url,
+                        %error,
+                        "failed to list ECCC Datamart CAP date directory"
+                    );
+                    continue;
+                }
+            };
+            stats.date_directories += 1;
+            for office in offices {
+                for hour in &hours {
+                    let directory_url = format!("{date_url}{office}/{hour}/");
+                    let files = match self.fetch_listing(&directory_url, true).await {
+                        Ok(entries) => listing_cap_files(&entries),
+                        Err(error) => {
+                            warn!(
+                                source = self.worker.source_id,
+                                url = %directory_url,
+                                %error,
+                                "failed to list ECCC Datamart CAP alert directory"
+                            );
+                            continue;
+                        }
+                    };
+                    stats.alert_directories += 1;
+                    stats.candidate_files += files.len();
+                    for file in files {
+                        let cap_url = format!("{directory_url}{file}");
+                        match self.fetch_cap(&cap_url).await {
+                            Ok(true) => stats.processed_files += 1,
+                            Ok(false) => {}
+                            Err(error) => warn!(
+                                source = self.worker.source_id,
+                                url = %cap_url,
+                                %error,
+                                "failed to process ECCC Datamart CAP file"
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+        if stats.date_directories == 0 {
+            return Err(anyhow!(
+                "no ECCC Datamart CAP date directories were reachable"
+            ));
+        }
+        Ok(stats)
+    }
+
+    async fn fetch_listing(&self, url: &str, missing_is_empty: bool) -> Result<Vec<u8>> {
+        let response = self
+            .worker
+            .http
+            .get(url)
+            .header(ACCEPT, "text/html,application/xhtml+xml;q=0.9,*/*;q=0.1")
+            .send()
+            .await
+            .with_context(|| format!("failed to fetch ECCC Datamart CAP listing {url}"))?;
+        if response.status() == StatusCode::NOT_FOUND && missing_is_empty {
+            return Ok(Vec::new());
+        }
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "unexpected HTTP status {} from {url}",
+                response.status()
+            ));
+        }
+        read_limited_response(response).await
+    }
+
+    async fn fetch_cap(&self, url: &str) -> Result<bool> {
+        let started = Instant::now();
+        let response = self
+            .worker
+            .http
+            .get(url)
+            .header(
+                ACCEPT,
+                "application/cap+xml, application/xml;q=0.9, */*;q=0.1",
+            )
+            .send()
+            .await
+            .with_context(|| format!("failed to fetch ECCC Datamart CAP file {url}"))?;
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "unexpected HTTP status {} from {url}",
+                response.status()
+            ));
+        }
+        let bytes = read_limited_response(response).await?;
+        let fetch_ms = started.elapsed().as_millis();
+        let parse_started = Instant::now();
+        let alert = parse_cap(&bytes).with_context(|| format!("failed to parse CAP file {url}"))?;
+        self.worker
+            .handle_alert(
+                alert,
+                "eccc_datamart_https",
+                Some(url.to_string()),
+                fetch_ms,
+                parse_started.elapsed().as_millis(),
+            )
+            .await
+    }
+}
+
+fn datamart_date_hours(now: DateTime<Utc>) -> BTreeMap<String, Vec<String>> {
+    let mut result = BTreeMap::<String, Vec<String>>::new();
+    for offset in 0..=ECCC_DATAMART_LOOKBACK_HOURS {
+        let instant = now - ChronoDuration::hours(offset);
+        let date = instant.format("%Y%m%d").to_string();
+        let hour = instant.format("%H").to_string();
+        let hours = result.entry(date).or_default();
+        if !hours.contains(&hour) {
+            hours.push(hour);
+        }
+    }
+    result
+}
+
+fn listing_directories(raw: &[u8]) -> Vec<String> {
+    listing_links(raw)
+        .into_iter()
+        .filter_map(|link| link.strip_suffix('/').map(ToOwned::to_owned))
+        .filter(|name| is_safe_datamart_component(name))
+        .collect()
+}
+
+fn listing_cap_files(raw: &[u8]) -> Vec<String> {
+    listing_links(raw)
+        .into_iter()
+        .filter(|name| name.ends_with(".cap") && is_safe_datamart_component(name))
+        .collect()
+}
+
+fn listing_links(raw: &[u8]) -> Vec<String> {
+    let raw = String::from_utf8_lossy(raw);
+    let mut rest = raw.as_ref();
+    let mut links = Vec::new();
+    while let Some(start) = rest.find("href=\"") {
+        let after_start = &rest[start + "href=\"".len()..];
+        let Some(end) = after_start.find('"') else {
+            break;
+        };
+        links.push(after_start[..end].to_string());
+        rest = &after_start[end + 1..];
+    }
+    links.sort();
+    links.dedup();
+    links
+}
+
+fn is_safe_datamart_component(value: &str) -> bool {
+    !matches!(value, "." | "..")
+        && !value.is_empty()
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+        })
 }
 
 impl StreamWorker {
@@ -256,6 +512,7 @@ impl StreamWorker {
         }
         self.handle_alert(alert, "tcp_stream", None, 0, parse_ms)
             .await
+            .map(|_| ())
     }
 
     async fn handle_heartbeat(&self, alert: &Alert, parse_ms: u128) -> Result<()> {
@@ -389,7 +646,7 @@ impl StreamWorker {
         cap_url: Option<String>,
         fetch_ms: u128,
         parse_ms: u128,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let key = AlertKey {
             identifier: alert.identifier.clone(),
             sent: alert.sent.clone(),
@@ -411,7 +668,7 @@ impl StreamWorker {
                 identifier = alert.identifier,
                 "deduped NAADS TCP alert"
             );
-            return Ok(());
+            return Ok(false);
         }
 
         let alert_value = serde_json::to_value(&alert)?;
@@ -433,7 +690,7 @@ impl StreamWorker {
                 "timestamp_unix_ms": unix_ms(),
             }))
             .await?;
-            return Ok(());
+            return Ok(true);
         }
 
         let ingest = json!({
@@ -454,7 +711,15 @@ impl StreamWorker {
                 alert_value,
                 ingest,
             ))
-            .await
+            .await?;
+        info!(
+            source = self.source_id,
+            identifier = alert.identifier,
+            message_type = alert.message_type,
+            %transport,
+            "published CAP alert"
+        );
+        Ok(true)
     }
 
     async fn publish_status(&self, data: serde_json::Value) -> Result<()> {
@@ -600,6 +865,7 @@ pub fn default_archive_urls() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn stream_message_drain_waits_for_complete_alert() {
@@ -623,5 +889,35 @@ mod tests {
             archive_url("http://capcp1.naad-adna.pelmorex.com/", &reference).unwrap(),
             "http://capcp1.naad-adna.pelmorex.com/2026-06-22/2026_06_22T12_38_00_06_00I2.49.0.1.124.abc.xml"
         );
+    }
+
+    #[test]
+    fn datamart_listing_keeps_only_safe_directories_and_cap_files() {
+        let listing = br#"
+            <a href="LAND/">LAND/</a>
+            <a href="CWTO/">CWTO/</a>
+            <a href="../">parent</a>
+            <a href="T_ONCN00_C_LAND_202608121625_0588622998.cap">cap</a>
+            <a href="not-a-cap.xml">xml</a>
+            <a href="../../unsafe.cap">unsafe</a>
+        "#;
+
+        assert_eq!(listing_directories(listing), vec!["CWTO", "LAND"]);
+        assert_eq!(
+            listing_cap_files(listing),
+            vec!["T_ONCN00_C_LAND_202608121625_0588622998.cap"]
+        );
+    }
+
+    #[test]
+    fn datamart_lookback_crosses_midnight_without_losing_the_prior_hour() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 8, 12, 0, 5, 0)
+            .single()
+            .expect("UTC datetime");
+        let buckets = datamart_date_hours(now);
+
+        assert_eq!(buckets["20260811"], vec!["23"]);
+        assert_eq!(buckets["20260812"], vec!["00"]);
     }
 }

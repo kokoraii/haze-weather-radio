@@ -872,7 +872,14 @@ func handleSynthesisJob(ctx context.Context, conn net.Conn, state *serviceState,
 			providerID = decision.providerID
 			request.VoiceID = decision.voiceID
 			backupUsed = decision.backupUsed
-			readerBackup = nil
+			// Keep the configured backup when the primary health probe passed.
+			// SpeakyAPI can report healthy voices and still fail a subsequent
+			// synthesis request (for example when Maki rejects one voice). The
+			// synthesis path must then be able to fall back to Piper. A route
+			// already pinned to the backup has no further reader fallback.
+			if decision.backupUsed {
+				readerBackup = nil
+			}
 			voiceRouteLocked = true
 		}
 	}

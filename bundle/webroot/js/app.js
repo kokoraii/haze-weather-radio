@@ -16,6 +16,7 @@ import { initFeedsView } from './feeds.js';
 import { initAccountsView } from './accounts.js?v=accounts-20260717-2';
 import { initLogsView } from './logs.js';
 import { initUtilitiesView } from './utilities.js';
+import { initLeadStatementsView } from './leads.js';
 
 const authPill = document.getElementById('authPill');
 const healthPill = document.getElementById('healthPill');
@@ -28,7 +29,7 @@ const refreshButton = document.getElementById('refreshButton');
 let healthState = { auth_required: true, auth_enabled: true };
 let dashboardInitialized = false;
 let allowedViews = null;
-const viewInit = { same: false, automations: false, wx: false, feeds: false, tts: false, daemon: false, breakin: false, cgen: false, bulletins: false, alerts: false, dictionary: false, utilities: false, accounts: false, logs: false };
+const viewInit = { same: false, leads: false, automations: false, wx: false, feeds: false, tts: false, daemon: false, breakin: false, cgen: false, bulletins: false, alerts: false, dictionary: false, utilities: false, accounts: false, logs: false };
 
 session.importUrlToken();
 initTheme(themeToggle);
@@ -162,6 +163,10 @@ function navigate(view) {
     if (view === 'same' && !viewInit.same) {
         viewInit.same = true;
         initSameView();
+    }
+    if (view === 'leads' && !viewInit.leads) {
+        viewInit.leads = true;
+        initLeadStatementsView();
     }
     if (view === 'automations' && !viewInit.automations) {
         viewInit.automations = true;

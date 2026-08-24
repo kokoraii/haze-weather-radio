@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Audio lead in/out configuration.
+    Use this to set your pre-roll/lead in or lead out audios and apply them on a specific type of alert or all of them. Priority goes from top to bottom.
+    Lead in is placed one-second before the SAME headers (if applicable) and attention tone, while lead out is placed one second after the concluding EOM signal (if applicable).
+-->
+<leads>
+    <lead enabled="true">
+        <name>NPAS preroll</name>
+        <conditions> <!-- if, and, or -->
+            <if key="layer:SOREM:1.0:Broadcast_Immediately" equals="no" matchcase="false" matchwhole="false" useregex="true" />  <!-- available targets: key (CAP XML), location (any type including FIPS, SGC, CLC...)
+            available operators: equals, includes, startswith, endswith -->
+            <and />
+        </conditions>
+        <audio>
+            <lead_in>./audio/NPAS_Preroll.wav</lead_in>
+            <lead_out></lead_out>
+        </audio>
+    </lead>
+</leads>

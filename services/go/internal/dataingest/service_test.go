@@ -22,6 +22,29 @@ func TestDataIngestHTTPClientUsesReusableTransport(t *testing.T) {
 	}
 }
 
+func TestFetchJSONRetriesTransientServerFailure(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		attempts++
+		if attempts == 1 {
+			http.Error(writer, "temporary upstream failure", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = writer.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer server.Close()
+
+	var payload struct {
+		Status string `json:"status"`
+	}
+	if err := fetchJSON(context.Background(), server.Client(), server.URL, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 || payload.Status != "ok" {
+		t.Fatalf("attempts=%d payload=%#v", attempts, payload)
+	}
+}
+
 func TestDataIngestCycleTimeoutIsBounded(t *testing.T) {
 	tests := []struct {
 		name           string

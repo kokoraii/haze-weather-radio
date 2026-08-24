@@ -129,13 +129,16 @@ func (r renderer) Render(request renderRequest) (Product, error) {
 		feed = *request.FeedOverride
 		ok = true
 	}
-	if !ok {
+	// On-demand requests use a synthesized request feed. They must not depend
+	// on a configured broadcast feed, because IVR and web weather generation
+	// remain available while routine feed playout is disabled.
+	if !ok && !feed.OnDemand {
 		return Product{}, fmt.Errorf("feed %q is not configured", request.FeedID)
 	}
-	if strings.TrimSpace(feed.ID) == "" || !xmlBool(feed.EnabledRaw, true) {
+	if !feed.OnDemand && (strings.TrimSpace(feed.ID) == "" || !xmlBool(feed.EnabledRaw, true)) {
 		return Product{}, fmt.Errorf("feed %q is disabled", request.FeedID)
 	}
-	if !xmlBool(feed.Playout.Routine, true) {
+	if !feed.OnDemand && !xmlBool(feed.Playout.Routine, true) {
 		return Product{}, fmt.Errorf("routine playout is disabled for feed %q", request.FeedID)
 	}
 	if !r.cfg.packageEnabled(request.PackageID) {
@@ -176,7 +179,11 @@ func (r renderer) Render(request renderRequest) (Product, error) {
 		return Product{}, fmt.Errorf("package %q is not supported by product-render yet", request.PackageID)
 	}
 	if err != nil {
-		return Product{}, err
+		if r.feedConfiguresPackage(feed, request.PackageID) {
+			product = unavailableProduct(base, titleForPackage(request.PackageID), unavailableText(request.PackageID))
+		} else {
+			return Product{}, err
+		}
 	}
 	product.Text = flattenSegments(product.Segments)
 	product.GeneratedAt = time.Now().UTC()
@@ -184,6 +191,52 @@ func (r renderer) Render(request renderRequest) (Product, error) {
 		product.ID = safeID(fmt.Sprintf("%s-%s-%d", product.FeedID, product.PackageID, product.GeneratedAt.UnixNano()))
 	}
 	return product, nil
+}
+
+func (r renderer) feedConfiguresPackage(feed feedXML, packageID string) bool {
+	switch strings.ToLower(strings.TrimSpace(packageID)) {
+	case "current_conditions":
+		return len(feed.Locations.ObservationLocations.Locations) > 0
+	case "aviation_reports":
+		return len(feed.Locations.AviationReportLocations.Locations) > 0
+	case "marine_reports":
+		return len(feed.Locations.MarineConditions.Locations) > 0
+	case "marine_forecast":
+		return len(feed.Locations.MarineForecastLocations.Locations) > 0 || len(feed.Locations.MarineForecastLocations.Subregions) > 0
+	case "forecast":
+		return len(feed.Locations.Coverage.Regions) > 0
+	case "air_quality":
+		return len(feed.Locations.AirQualityLocations.Locations) > 0
+	case "climate_summary":
+		return len(feed.Locations.ClimateLocations.Locations) > 0
+	case "hydrometric":
+		return len(feed.Locations.HydrometricLocations.Locations) > 0 || len(feed.Locations.HydrometricLocations.Upstream.Locations) > 0 || len(feed.Locations.HydrometricLocations.Downstream.Locations) > 0
+	default:
+		return false
+	}
+}
+
+func unavailableText(packageID string) string {
+	switch strings.ToLower(strings.TrimSpace(packageID)) {
+	case "current_conditions":
+		return "Current weather conditions are temporarily unavailable. Please check again shortly."
+	case "aviation_reports":
+		return "Aviation weather reports are temporarily unavailable. Please check again shortly."
+	case "marine_reports":
+		return "Marine weather reports are temporarily unavailable. Please check again shortly."
+	case "marine_forecast":
+		return "The marine forecast is temporarily unavailable. Please check again shortly."
+	case "forecast":
+		return "The weather forecast is temporarily unavailable. Please check again shortly."
+	case "air_quality":
+		return "Air quality information is temporarily unavailable. Please check again shortly."
+	case "climate_summary":
+		return "The climate summary is temporarily unavailable. Please check again shortly."
+	case "hydrometric":
+		return "River conditions are temporarily unavailable. Please check again shortly."
+	default:
+		return "This weather product is temporarily unavailable. Please check again shortly."
+	}
 }
 
 func (r renderer) onDemandFeed(request wxOnDemandRequest) (feedXML, error) {
@@ -198,14 +251,16 @@ func (r renderer) onDemandFeed(request wxOnDemandRequest) (feedXML, error) {
 	}
 	if feedID != "" {
 		configured, ok := r.cfg.feedByID(feedID)
-		if !ok {
-			return feedXML{}, fmt.Errorf("feed %q is not configured", request.FeedID)
+		if ok {
+			feed = configured
 		}
-		if strings.TrimSpace(configured.ID) == "" || !xmlBool(configured.EnabledRaw, true) {
-			return feedXML{}, fmt.Errorf("feed %q is disabled", request.FeedID)
-		}
-		feed = configured
+		// Keep the requested feed identifier for correlation and diagnostics,
+		// but do not require it to be present or enabled in the broadcast feed
+		// catalog. The request-specific location identifiers below are the
+		// authoritative inputs for on-demand rendering.
+		feed.ID = feedID
 	}
+	feed.EnabledRaw = "true"
 	feed.OnDemand = true
 
 	locationName := firstNonBlank(request.LocationName, request.Code, request.ForecastID, request.StationID)
@@ -241,9 +296,21 @@ func (r renderer) onDemandFeed(request wxOnDemandRequest) (feedXML, error) {
 	}
 	if id := strings.TrimSpace(request.ClimateID); id != "" {
 		feed.Locations.ClimateLocations.Locations = []locationXML{{ID: id, Source: "eccc"}}
+	} else if strings.TrimSpace(request.Code) != "" && onDemandRequestsPackage(request, "climate_summary") {
+		// A caller-selected location must not silently inherit the feed's
+		// configured climate station. The marker preserves the package so it
+		// renders the normal unavailable announcement instead of another city's
+		// climate summary.
+		feed.Locations.ClimateLocations.Locations = []locationXML{onDemandUnavailableLocation()}
 	}
 	if id := strings.TrimSpace(request.HydrometricID); id != "" {
 		feed.Locations.HydrometricLocations.Locations = []locationXML{{ID: id, Source: "eccc"}}
+		feed.Locations.HydrometricLocations.Upstream.Locations = nil
+		feed.Locations.HydrometricLocations.Downstream.Locations = nil
+	} else if strings.TrimSpace(request.Code) != "" && onDemandRequestsPackage(request, "hydrometric") {
+		// As with climate, never substitute the configured feed river for a
+		// caller-selected location when the location catalog has no nearby gauge.
+		feed.Locations.HydrometricLocations.Locations = []locationXML{onDemandUnavailableLocation()}
 		feed.Locations.HydrometricLocations.Upstream.Locations = nil
 		feed.Locations.HydrometricLocations.Downstream.Locations = nil
 	}
@@ -258,6 +325,20 @@ func (r renderer) onDemandFeed(request wxOnDemandRequest) (feedXML, error) {
 		feed.Transmitter.Transmitters = []transmitterXML{telephoneTransmitter(feed, locationName)}
 	}
 	return feed, nil
+}
+
+func onDemandRequestsPackage(request wxOnDemandRequest, wanted string) bool {
+	wanted = strings.ToLower(strings.TrimSpace(wanted))
+	for _, packageID := range cleanStringList(request.Packages) {
+		if packageID == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+func onDemandUnavailableLocation() locationXML {
+	return locationXML{ID: "unresolved", Source: "haze-unresolved"}
 }
 
 func telephoneTransmitter(feed feedXML, locationName string) transmitterXML {

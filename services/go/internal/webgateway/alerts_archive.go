@@ -34,6 +34,21 @@ type archiveCAPRecord struct {
 	CanonicalLocations []alertmodel.LocationReference `json:"canonical_locations,omitempty"`
 }
 
+const (
+	archiveDecisionAccepted      = "accepted"
+	archiveDecisionExpired       = "expired"
+	archiveDecisionNotApplicable = "not_applicable"
+	archiveDecisionPolicy        = "policy"
+	archiveDecisionTest          = "test"
+	archiveDecisionRejected      = "rejected"
+)
+
+type archiveDecision struct {
+	Class              string
+	Label              string
+	OperationalFailure bool
+}
+
 func alertsArchivePayload(configPath string) (map[string]any, error) {
 	now := time.Now().UTC()
 	baseDir := filepath.Dir(filepath.Clean(configPath))
@@ -41,8 +56,60 @@ func alertsArchivePayload(configPath string) (map[string]any, error) {
 	return map[string]any{
 		"accepted_by_feed": archiveRecordsPayload(active, "accepted", baseDir),
 		"rejected":         archiveRecordsPayload(rejected, "rejected", baseDir),
+		"rejected_summary": archiveRejectedSummary(rejected),
 		"expired":          archiveRecordsPayload(expiredWithin(expired, now, 30*24*time.Hour), "expired", baseDir),
 	}, nil
+}
+
+func classifyArchiveDecision(bucket string, reason string) archiveDecision {
+	bucket = strings.ToLower(strings.TrimSpace(bucket))
+	reason = strings.ToLower(strings.TrimSpace(reason))
+	switch {
+	case bucket == "accepted":
+		return archiveDecision{Class: archiveDecisionAccepted, Label: "Accepted"}
+	case bucket == "expired":
+		return archiveDecision{Class: archiveDecisionExpired, Label: "Expired"}
+	case bucket == "rejected" && reason == "outside feed coverage":
+		return archiveDecision{Class: archiveDecisionNotApplicable, Label: "Not applicable to feed"}
+	case bucket == "rejected" && reason == "test alert":
+		return archiveDecision{Class: archiveDecisionTest, Label: "Test message ignored"}
+	case bucket == "rejected" && reason == "below feed alert threshold":
+		return archiveDecision{Class: archiveDecisionPolicy, Label: "Filtered by feed policy"}
+	case bucket == "rejected":
+		return archiveDecision{Class: archiveDecisionRejected, Label: "Rejected", OperationalFailure: true}
+	default:
+		return archiveDecision{Class: fallbackString(bucket, "unknown"), Label: fallbackString(bucket, "Unknown")}
+	}
+}
+
+func archiveRejectedSummary(records []archiveCAPRecord) map[string]any {
+	alerts := map[string]struct{}{}
+	notApplicableAlerts := map[string]struct{}{}
+	notApplicableDecisions := 0
+	operationalFailures := 0
+	for _, record := range records {
+		id := fallbackString(record.ID, record.Alert.Identifier)
+		if id != "" {
+			alerts[id] = struct{}{}
+		}
+		decision := classifyArchiveDecision("rejected", record.Reason)
+		if decision.Class == archiveDecisionNotApplicable {
+			notApplicableDecisions++
+			if id != "" {
+				notApplicableAlerts[id] = struct{}{}
+			}
+		}
+		if decision.OperationalFailure {
+			operationalFailures++
+		}
+	}
+	return map[string]any{
+		"alert_count":                        len(alerts),
+		"feed_decision_count":                len(records),
+		"not_applicable_alert_count":         len(notApplicableAlerts),
+		"not_applicable_feed_decision_count": notApplicableDecisions,
+		"operational_failure_count":          operationalFailures,
+	}
 }
 
 func archiveStoreRecords(configPath string, bucket string, since time.Time) []archiveCAPRecord {
@@ -291,12 +358,16 @@ func archiveRecordPayloadWithQueue(record archiveCAPRecord, bucket string, baseD
 		Severity: info.Severity,
 		Event:    strings.Join([]string{info.Event, info.Headline, alerttext.AlertSubject(info), message}, " "),
 	}})
+	decision := classifyArchiveDecision(bucket, record.Reason)
 	return map[string]any{
 		"id":                     fallbackString(record.ID, record.Alert.Identifier),
 		"feed_id":                record.FeedID,
 		"bucket":                 bucket,
 		"status":                 fallbackString(record.Status, bucket),
 		"reason":                 record.Reason,
+		"decision_class":         decision.Class,
+		"decision_label":         decision.Label,
+		"operational_failure":    decision.OperationalFailure,
 		"updated_at":             record.UpdatedAt,
 		"sender":                 record.Alert.Sender,
 		"sent":                   record.Alert.Sent,

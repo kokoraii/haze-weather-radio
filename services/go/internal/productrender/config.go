@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/meowraii/haze-weather-radio/services/go/internal/datastore"
+	"github.com/meowraii/haze-weather-radio/services/go/internal/lead"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/locationdb"
 	"gopkg.in/yaml.v3"
 )
@@ -128,6 +129,7 @@ type feedLangXML struct {
 
 type alertFilterXML struct {
 	UseFeedLocations string             `xml:"use_feed_locations,attr"`
+	CoverageMode     string             `xml:"coverage_mode,attr"`
 	Allowlist        alertFilterListXML `xml:"allowlist"`
 	Blocklist        alertFilterListXML `xml:"blocklist"`
 }
@@ -280,6 +282,7 @@ type loadedConfig struct {
 	ProductText   map[string]map[string]map[string]string
 	ProductAudio  map[string]map[string]map[string]string
 	ForecastNames map[string]forecastRegionName
+	Leads         lead.Document
 	BaseDir       string
 	Store         datastore.Store
 }
@@ -312,6 +315,10 @@ func loadConfig(configPath string) (loadedConfig, error) {
 	if len(forecastNames) == 0 {
 		forecastNames = loadForecastRegionNames(resolvePath(baseDir, "managed/csv/FORECAST_LOCATIONS.csv"))
 	}
+	leads, err := lead.Load(resolvePath(baseDir, "managed/configs/lead.xml"))
+	if err != nil {
+		return loadedConfig{}, err
+	}
 	return loadedConfig{
 		Root:          root,
 		Feeds:         feeds,
@@ -319,6 +326,7 @@ func loadConfig(configPath string) (loadedConfig, error) {
 		ProductText:   productText,
 		ProductAudio:  productAudio,
 		ForecastNames: forecastNames,
+		Leads:         leads,
 		BaseDir:       baseDir,
 	}, nil
 }

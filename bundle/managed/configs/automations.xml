@@ -29,7 +29,7 @@
       <sender_id/>
       <tone>WXR</tone>
     </same>
-    <content attention_tone="WXR">
+    <content attention_tone="WXR" reader_id="000">
       <lang code="en">
         <text>The preceding signal was a test of the weather radio alarm system. During particularly dangerous situations, specially built receivers will be automatically activated to warn of the impending hazard. Tests of this system are normally activated by the operator of this radio network. Required Weekly Tests are normally sent each Wednesday at noon, with the Required Monthly Test sent on the first Wednesday of the month. This concludes this test of the weather radio alarm system.</text>
         <file/>

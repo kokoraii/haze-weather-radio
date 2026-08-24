@@ -21,6 +21,7 @@ import (
 	"github.com/meowraii/haze-weather-radio/services/go/internal/capmodel"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/capsame"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/datastore"
+	"github.com/meowraii/haze-weather-radio/services/go/internal/lead"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/locationclient"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/locationdb"
 )
@@ -99,6 +100,9 @@ func (s *Service) handleCAPAlert(event map[string]any) {
 			}
 			if item.AlertText != "" {
 				extra["alert_text"] = item.AlertText
+			}
+			if len(item.Lead) > 0 {
+				extra["alert_lead"] = item.Lead
 			}
 			data := alertmodel.WithLegacyFields(item.AlertPacket, extra)
 			_ = s.bridge.Publish(map[string]any{
@@ -180,7 +184,7 @@ func capSAMEPayload(alert capmodel.Alert, feed feedXML, baseDir string, now time
 	if expires := parseCAPTime(info.Expires); !expires.IsZero() {
 		payload["same_expires_at"] = expires.Format(time.RFC3339Nano)
 	}
-	payload["same_tone"] = sameToneForCAP(*info, feed)
+	payload["same_tone"] = sameToneForCAP(feed)
 	return payload
 }
 
@@ -450,14 +454,87 @@ func sameDurationForCAP(alert capmodel.Alert, info capmodel.AlertInfo) string {
 	return fmt.Sprintf("%02d%02d", minutes/60, minutes%60)
 }
 
-func sameToneForCAP(info capmodel.AlertInfo, feed feedXML) string {
-	if isBroadcastImmediateInfo(info) {
-		return "NPAS"
-	}
+func sameToneForCAP(feed feedXML) string {
 	if tone := strings.ToUpper(strings.TrimSpace(feed.Playout.SAMEAttentionTone)); tone != "" {
 		return tone
 	}
 	return "WXR"
+}
+
+func capLeadPayload(document lead.Document, alert capmodel.Alert, info capmodel.AlertInfo, feed feedXML, assignedLocations []string) map[string]any {
+	statement, ok := document.Select(capLeadContext(alert, info, feed, assignedLocations))
+	if !ok {
+		return nil
+	}
+	payload := map[string]any{"name": statement.Name}
+	if statement.LeadIn != "" {
+		payload["lead_in"] = statement.LeadIn
+	}
+	if statement.LeadOut != "" {
+		payload["lead_out"] = statement.LeadOut
+	}
+	return payload
+}
+
+func capLeadContext(alert capmodel.Alert, info capmodel.AlertInfo, feed feedXML, assignedLocations []string) lead.Context {
+	context := lead.Context{Values: map[string][]string{}, Locations: []string{}}
+	addValue := func(key string, values ...string) {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			return
+		}
+		for _, value := range values {
+			if value = strings.TrimSpace(value); value != "" {
+				context.Values[key] = append(context.Values[key], value)
+			}
+		}
+	}
+	addLocation := func(values ...string) {
+		for _, value := range values {
+			for _, part := range strings.FieldsFunc(value, func(r rune) bool {
+				return r == ',' || r == ';' || r == '|' || r == '\n' || r == '\r' || r == '\t'
+			}) {
+				if part = strings.TrimSpace(part); part != "" {
+					context.Locations = append(context.Locations, part)
+				}
+			}
+		}
+	}
+	addValue("identifier", alert.Identifier)
+	addValue("sender", alert.Sender)
+	addValue("status", alert.Status)
+	addValue("message_type", alert.MessageType)
+	addValue("scope", alert.Scope)
+	addValue("feed_id", feed.ID)
+	addValue("event", info.Event)
+	addValue("headline", info.Headline)
+	addValue("severity", info.Severity)
+	addValue("urgency", info.Urgency)
+	addValue("certainty", info.Certainty)
+	addValue("audience", info.Audience)
+	addValue("sender_name", info.SenderName)
+	for _, code := range alert.Code {
+		addValue("alert_code", code)
+	}
+	for _, code := range info.EventCodes {
+		addValue(code.Name, code.Value)
+		addValue("event_code", code.Value)
+	}
+	for _, parameter := range info.Parameters {
+		addValue(parameter.Name, parameter.Value)
+	}
+	for _, area := range info.Areas {
+		addValue("area_description", area.Description)
+		for _, geocode := range area.Geocodes {
+			addValue(geocode.Name, geocode.Value)
+			addValue("geocode", geocode.Value)
+			addLocation(geocode.Value)
+		}
+	}
+	addLocation(assignedLocations...)
+	addLocation(capAlertInfoLocationKeys(info)...)
+	context.Locations = sortedUniqueCAPLocations(context.Locations)
+	return context
 }
 
 type capRegistryUpdate struct {
@@ -486,6 +563,7 @@ type capRegistryUpdate struct {
 	AudioLanguage      string
 	AudioDescription   string
 	SAME               map[string]any
+	Lead               map[string]any
 	AlertPacket        alertmodel.Packet
 }
 
@@ -714,9 +792,6 @@ func (s *Service) recordCAPAlert(alert capmodel.Alert, now time.Time) ([]capRegi
 		audio := alertBroadcastAudio(alert, feedLanguage(feed))
 		broadcastImmediate := info != nil && isBroadcastImmediateInfo(*info)
 		broadcast := len(addedLocations) > 0 && capPriorityBroadcastEligible(alert, feed, s.cfg.BaseDir, now)
-		if broadcast && capMessageTypeIsUpdate(alert) && len(targetIDs) == 0 && feedUsesAlertCoverage(feed, alert) && !capUpdateAddsFeedLocations(alert, *info, feed, s.cfg.BaseDir) {
-			broadcast = false
-		}
 		if broadcast && !s.claimCAPPriorityBroadcast(feed.ID, alert.Identifier, addedLocations) {
 			broadcast = false
 		}
@@ -731,6 +806,10 @@ func (s *Service) recordCAPAlert(alert capmodel.Alert, now time.Time) ([]capRegi
 			if locations := sameLocationsForAssignments(*info, feed, s.cfg.BaseDir, addedLocations); len(locations) > 0 {
 				samePayload["same_locations"] = locations
 			}
+		}
+		leadPayload := map[string]any(nil)
+		if info != nil {
+			leadPayload = capLeadPayload(s.cfg.Leads, alert, *info, feed, currentLocations)
 		}
 		packet := capAlertPacket(alert, feed, headline, eventName, severity, urgency, certainty, description, instruction, backgroundColor, broadcastImmediate, alertText, audio, samePayload, canonicalLocations)
 		updates = append(updates, capRegistryUpdate{
@@ -758,6 +837,7 @@ func (s *Service) recordCAPAlert(alert capmodel.Alert, now time.Time) ([]capRegi
 			AudioLanguage:      audio.Language,
 			AudioDescription:   audio.Description,
 			SAME:               samePayload,
+			Lead:               leadPayload,
 			AlertPacket:        packet,
 		})
 	}
@@ -959,7 +1039,7 @@ func capLocationDeltaForBase(previous []string, current []string, baseDir string
 	for _, location := range sortedUniqueCAPLocations(current) {
 		matched := false
 		for _, prior := range sortedUniqueCAPLocations(previous) {
-			if capLocationKeysOverlap(db, location, prior) {
+			if capLocationScopeCovers(db, prior, location) {
 				matched = true
 				break
 			}
@@ -973,7 +1053,7 @@ func capLocationDeltaForBase(previous []string, current []string, baseDir string
 	for _, location := range sortedUniqueCAPLocations(previous) {
 		matched := false
 		for _, currentLocation := range sortedUniqueCAPLocations(current) {
-			if capLocationKeysOverlap(db, location, currentLocation) {
+			if capLocationScopeCovers(db, currentLocation, location) {
 				matched = true
 				break
 			}
@@ -983,6 +1063,20 @@ func capLocationDeltaForBase(previous []string, current []string, baseDir string
 		}
 	}
 	return added, retained, removed
+}
+
+// capLocationScopeCovers compares location assignments directionally. Exact
+// aliases cover each other, while a whole CLC grid parent covers each of its
+// partial children. The inverse is deliberately false: moving from one child
+// to its whole parent expands coverage and must remain a newly added scope.
+func capLocationScopeCovers(db alertGeoDB, covering string, covered string) bool {
+	if capLocationKeysOverlap(db, covering, covered) {
+		return true
+	}
+	coveringCode, coveringParent := capCLCGridCodeAndParent(db, covering)
+	coveredCode, coveredParent := capCLCGridCodeAndParent(db, covered)
+	return coveringCode != "" && coveredCode != "" &&
+		coveringParent == coveredParent && coveringCode == coveringParent
 }
 
 func capLocationSet(locations []string) map[string]struct{} {
@@ -1252,6 +1346,14 @@ func capFeedLocationAssignmentsForCodes(alert capmodel.Alert, feed feedXML, base
 		}
 		return sortedUniqueCAPLocations(locations)
 	}
+	// Scoped CAP cancellations carry code-based location deltas. New or updated
+	// alerts receive exact grid assignments, while cancellation scopes retain
+	// their provider codes and are matched against grid parents below.
+	if len(codes) == 0 {
+		if gridAssignments, usable := capPolygonFirstLocationAssignments(alert, feed, baseDir, db); usable {
+			return gridAssignments
+		}
+	}
 
 	assignments := []string{}
 	for _, location := range locations {
@@ -1347,14 +1449,20 @@ func capLocationIntersectionForAlert(baseDir string, left []string, right []stri
 }
 
 func capLocationScopeOverlaps(db alertGeoDB, source string, left string, right string) bool {
-	if capLocationKeysOverlap(db, left, right) {
+	matches := func(leftCode string, rightCode string) bool {
+		if capLocationKeysOverlap(db, leftCode, rightCode) {
+			return true
+		}
+		return strings.EqualFold(strings.TrimSpace(source), "eccc") && capCLCGridScopeOverlaps(db, leftCode, rightCode)
+	}
+	if matches(left, right) {
 		return true
 	}
 	leftScope := append([]string{left}, expandAlertRegion(db, left, source)...)
 	rightScope := append([]string{right}, expandAlertRegion(db, right, source)...)
 	for _, leftCode := range leftScope {
 		for _, rightCode := range rightScope {
-			if capLocationKeysOverlap(db, leftCode, rightCode) {
+			if matches(leftCode, rightCode) {
 				return true
 			}
 		}
@@ -1374,6 +1482,40 @@ func capLocationScopeOverlaps(db alertGeoDB, source string, left string, right s
 		}
 	}
 	return false
+}
+
+// capCLCGridScopeOverlaps adds only the parent-child relation needed for
+// ECCC cancellation and update scoping. Two different child partitions never
+// overlap each other, so a northwest to northeast update remains a real
+// location change.
+func capCLCGridScopeOverlaps(db alertGeoDB, left string, right string) bool {
+	leftCode, leftParent := capCLCGridCodeAndParent(db, left)
+	rightCode, rightParent := capCLCGridCodeAndParent(db, right)
+	if leftCode == "" || rightCode == "" || leftParent != rightParent {
+		return false
+	}
+	return leftCode == leftParent || rightCode == rightParent
+}
+
+func capCLCGridCodeAndParent(db alertGeoDB, raw string) (string, string) {
+	code := sameLocationCode(raw)
+	if len(code) != 6 {
+		return "", ""
+	}
+	if code[0] == '0' {
+		if _, ok := db.CLC[code]; ok {
+			return code, code
+		}
+		return "", ""
+	}
+	if code[0] < '1' || code[0] > '9' {
+		return "", ""
+	}
+	parent := "0" + code[1:]
+	if _, ok := db.CLC[parent]; !ok {
+		return "", ""
+	}
+	return code, parent
 }
 
 func capLocationDifference(left []string, right []string) []string {
@@ -1437,7 +1579,12 @@ func sameLocationsForAssignments(info capmodel.AlertInfo, feed feedXML, baseDir 
 	locations = uniqueStrings(locations)
 	sort.Strings(locations)
 	if len(locations) > 31 {
-		locations = locations[:31]
+		// A partial-grid header may exceed the SAME location limit. Do not
+		// silently discard selected cells. Revert this one message to the
+		// existing full-coverage calculation, which intentionally represents
+		// a broader but complete delivery scope.
+		log.Printf("CAP SAME grid overflow, falling back to full coverage locations=%d", len(locations))
+		return sameLocationsForCAP(info, feed, baseDir)
 	}
 	return locations
 }
@@ -1475,7 +1622,12 @@ func capPriorityBroadcastAllowed(alert capmodel.Alert, feed feedXML, baseDir str
 }
 
 func capPriorityBroadcastEligible(alert capmodel.Alert, feed feedXML, baseDir string, now time.Time) bool {
-	if isCAPEnded(alert, now) || !feedAllowsCAPAlert(feed, alert) || !alertMatchesFeed(alert, feed, baseDir) {
+	// recordCAPAlert calls this only after capFeedLocationAssignments has
+	// produced non-empty, newly added assignments for the feed. Re-running a
+	// separate coverage matcher here can disagree with those assignments and
+	// suppress an otherwise accepted alert, especially for ECCC partial-grid
+	// and free-form polygon CAP messages.
+	if isCAPEnded(alert, now) || !feedAllowsCAPAlert(feed, alert) {
 		return false
 	}
 	info := chooseAlertInfo(alert, feedLanguage(feed))
@@ -1504,11 +1656,6 @@ func capPriorityBroadcastAllowedWithPrior(alert capmodel.Alert, feed feedXML, ba
 	}
 	if isBroadcastImmediateInfo(*info) {
 		return true
-	}
-	if capMessageTypeIsUpdate(alert) && !capUpdateAddsFeedLocations(alert, *info, feed, baseDir) {
-		if feedUsesAlertCoverage(feed, alert) {
-			return false
-		}
 	}
 	return sameAlertFreshForTone(alert, *info, sameEventForCAP(alert, *info, baseDir), now)
 }
@@ -1628,6 +1775,44 @@ func capMessageTypeIsUpdate(alert capmodel.Alert) bool {
 }
 
 func capUpdateAddsFeedLocations(alert capmodel.Alert, info capmodel.AlertInfo, feed feedXML, baseDir string) bool {
+	// ECCC's August 2026 contract represents newly alerted true-threat
+	// geometry as an additional DLC area with status "issued". It does not
+	// require the legacy Newly_Active_Areas parameter below.
+	issuedAreas := make([]capmodel.AlertArea, 0, len(info.Areas))
+	for _, area := range info.Areas {
+		if capmodel.ECCCThreatAreaStatus(area) == "issued" {
+			issuedAreas = append(issuedAreas, area)
+		}
+	}
+	if len(issuedAreas) > 0 {
+		if !feedUsesAlertCoverage(feed, alert) {
+			return true
+		}
+		issuedInfo := info
+		issuedInfo.Areas = issuedAreas
+		issuedAlert := alert
+		issuedAlert.Infos = []capmodel.AlertInfo{issuedInfo}
+		db := loadAlertGeoDB(baseDir)
+		if assignments, usable := capPolygonFirstLocationAssignments(issuedAlert, feed, baseDir, db); usable {
+			return len(assignments) > 0
+		}
+
+		coverage := feedCoverageModel(baseDir, feed, nil)
+		if len(coverage.Codes) == 0 {
+			return true
+		}
+		for _, area := range issuedAreas {
+			for _, geocode := range area.Geocodes {
+				if capmodel.IsECCCThreatAreaGeocode(geocode) {
+					continue
+				}
+				if coverageMatchesAlertCode(db, coverage.Codes, geocode.Value) {
+					return true
+				}
+			}
+		}
+	}
+
 	newCodes := capNewlyActiveCodes(info)
 	if len(newCodes) == 0 {
 		return false
@@ -2673,13 +2858,14 @@ type coverageRegion struct {
 }
 
 type alertGeoDB struct {
-	CLC         map[string]clcBaseZone
-	CAPCP       map[string]capCPGeocode
-	CAPCPToCLC  map[string][]string
-	NWS         map[string]nwsZone
-	FIPS        map[string]nwsZone
-	Marine      map[string]nwsZone
-	NWSZoneSAME map[string][]string
+	CLC           map[string]clcBaseZone
+	CAPCP         map[string]capCPGeocode
+	CAPCPToCLC    map[string][]string
+	ForecastToCLC map[string][]string
+	NWS           map[string]nwsZone
+	FIPS          map[string]nwsZone
+	Marine        map[string]nwsZone
+	NWSZoneSAME   map[string][]string
 }
 
 type clcBaseZone struct {
@@ -2721,6 +2907,9 @@ func alertMatchesFeed(alert capmodel.Alert, feed feedXML, baseDir string) bool {
 		return true
 	}
 	db := loadAlertGeoDB(baseDir)
+	if assignments, usable := capPolygonFirstLocationAssignments(alert, feed, baseDir, db); usable {
+		return len(assignments) > 0
+	}
 	for _, code := range alertCoverageCodes(alert) {
 		if coverageMatchesAlertCode(db, coverage.Codes, code) {
 			return true
@@ -2747,6 +2936,13 @@ func feedCoverageModel(baseDir string, feed feedXML, forecastNames map[string]fo
 		}
 		addCoverageCode(model.Codes, regionID)
 		addCoverageCode(item.Subregions, regionID)
+		if source == "eccc" {
+			for _, linkedCLC := range db.ForecastToCLC[canonicalCAPLocation(regionID)] {
+				addCoverageCode(model.Codes, linkedCLC)
+				addCoverageCode(item.Subregions, linkedCLC)
+				addCoverageCode(item.RequiredSubregions, linkedCLC)
+			}
+		}
 		for _, subregion := range expandAlertRegion(db, regionID, source) {
 			addCoverageCode(model.Codes, subregion)
 			addCoverageCode(item.Subregions, subregion)
@@ -2815,13 +3011,14 @@ func loadAlertGeoDBFromSQLite(baseDir string) (alertGeoDB, bool) {
 		return alertGeoDB{}, false
 	}
 	db := alertGeoDB{
-		CLC:         map[string]clcBaseZone{},
-		CAPCP:       map[string]capCPGeocode{},
-		CAPCPToCLC:  map[string][]string{},
-		NWS:         map[string]nwsZone{},
-		FIPS:        map[string]nwsZone{},
-		Marine:      map[string]nwsZone{},
-		NWSZoneSAME: map[string][]string{},
+		CLC:           map[string]clcBaseZone{},
+		CAPCP:         map[string]capCPGeocode{},
+		CAPCPToCLC:    map[string][]string{},
+		ForecastToCLC: map[string][]string{},
+		NWS:           map[string]nwsZone{},
+		FIPS:          map[string]nwsZone{},
+		Marine:        map[string]nwsZone{},
+		NWSZoneSAME:   map[string][]string{},
 	}
 	for _, place := range snap.PlacesBySource("clc") {
 		db.CLC[place.Code] = clcBaseZone{Code: place.Code, En: place.Name, Fr: place.NameFR, Lat: place.Lat, Lon: place.Lon, Province: place.Region}
@@ -2859,6 +3056,15 @@ func loadAlertGeoDBFromSQLite(baseDir string) (alertGeoDB, bool) {
 			if strings.EqualFold(link.FromSource, "sgc") && strings.EqualFold(link.ToSource, "clc") {
 				db.CAPCPToCLC[from] = append(db.CAPCPToCLC[from], to)
 			}
+		case "forecast_to_clc":
+			from := canonicalCAPLocation(link.FromCode)
+			to := sameLocationCode(link.ToCode)
+			if from == "" || to == "" || !trustedForecastToCLCLink(link) {
+				continue
+			}
+			if strings.EqualFold(link.FromSource, "forecast") && strings.EqualFold(link.ToSource, "clc") {
+				db.ForecastToCLC[from] = append(db.ForecastToCLC[from], to)
+			}
 		case "nws_same_to_zone":
 			same := sameLocationCode(link.FromCode)
 			zone := normalizeNWSCode(link.ToCode)
@@ -2892,7 +3098,18 @@ func loadAlertGeoDBFromSQLite(baseDir string) (alertGeoDB, bool) {
 	for code, links := range db.CAPCPToCLC {
 		db.CAPCPToCLC[code] = uniqueStrings(links)
 	}
+	for code, links := range db.ForecastToCLC {
+		db.ForecastToCLC[code] = uniqueStrings(links)
+	}
 	return db, true
+}
+
+// trustedForecastToCLCLink permits only verified catalog links to turn a
+// forecast coverage code into geometry. A weak or review mapping must retain
+// the legacy code path, never cause a polygon-first exclusion.
+func trustedForecastToCLCLink(link locationdb.Link) bool {
+	confidence := strings.ToLower(strings.TrimSpace(link.Confidence))
+	return confidence == "exact" || (confidence == "high" && link.Score >= 0.90)
 }
 
 func loadCLCBaseZones(path string) map[string]clcBaseZone {
@@ -3401,6 +3618,9 @@ func alertAreas(info capmodel.AlertInfo, feed feedXML, lang string, baseDir stri
 		if desc == "" {
 			continue
 		}
+		if partial := capGridAreaPhrase(db, assignments, areaLocation, desc); partial != "" {
+			desc = partial
+		}
 		if _, ok := seen[desc]; ok {
 			continue
 		}
@@ -3458,8 +3678,78 @@ func capLocationAssignmentsMatch(db alertGeoDB, assignments []string, location s
 		if capLocationKeysOverlap(db, assignment, location) {
 			return true
 		}
+		if capCLCGridScopeOverlaps(db, assignment, location) {
+			return true
+		}
 	}
 	return false
+}
+
+func capGridAreaPhrase(db alertGeoDB, assignments []string, location string, name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" || strings.TrimSpace(location) == "" {
+		return ""
+	}
+	parents := map[string]struct{}{}
+	for _, code := range append([]string{location}, sameLocationCodesForAlertCode(db, location)...) {
+		if normalized, parent := capCLCGridCodeAndParent(db, code); normalized != "" && normalized == parent {
+			parents[parent] = struct{}{}
+		}
+	}
+	if len(parents) == 0 {
+		return ""
+	}
+	directions := map[byte]string{
+		'1': "northwest",
+		'2': "north",
+		'3': "northeast",
+		'4': "west",
+		'5': "central",
+		'6': "east",
+		'7': "southwest",
+		'8': "south",
+		'9': "southeast",
+	}
+	parts := []string{}
+	seen := map[byte]struct{}{}
+	for _, assignment := range assignments {
+		code, parent := capCLCGridCodeAndParent(db, assignment)
+		if code == "" || code == parent {
+			continue
+		}
+		if _, ok := parents[parent]; !ok {
+			continue
+		}
+		if _, ok := seen[code[0]]; ok {
+			continue
+		}
+		seen[code[0]] = struct{}{}
+		parts = append(parts, directions[code[0]])
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return capGridDirectionsPhrase(parts) + " portion" + pluralSuffix(len(parts)) + " of " + name
+}
+
+func capGridDirectionsPhrase(parts []string) string {
+	if len(parts) == 0 {
+		return ""
+	}
+	if len(parts) == 1 {
+		return parts[0]
+	}
+	if len(parts) == 2 {
+		return parts[0] + " and " + parts[1]
+	}
+	return strings.Join(parts[:len(parts)-1], ", ") + ", and " + parts[len(parts)-1]
+}
+
+func pluralSuffix(count int) string {
+	if count == 1 {
+		return ""
+	}
+	return "s"
 }
 
 func capAssignmentsCoverAllAlertLocations(db alertGeoDB, alertLocations []string, assignments []string) bool {
@@ -3574,18 +3864,31 @@ func coverageRegionAssignmentsComplete(region coverageRegion, assignments []stri
 	if len(assignments) == 0 {
 		return true
 	}
-	if capLocationAssignmentsMatch(db, assignments, region.ID) {
+	if capLocationAssignmentsCover(db, assignments, region.ID) {
 		return true
 	}
 	if len(region.RequiredSubregions) == 0 {
 		return false
 	}
 	for code := range region.RequiredSubregions {
-		if !capLocationAssignmentsMatch(db, assignments, code) {
+		if !capLocationAssignmentsCover(db, assignments, code) {
 			return false
 		}
 	}
 	return true
+}
+
+// capLocationAssignmentsCover deliberately does not let one partial grid cell
+// stand in for an entire forecast region. It is used for broad-area wording,
+// whereas capLocationAssignmentsMatch is intentionally parent-aware for an
+// individual feature's readback.
+func capLocationAssignmentsCover(db alertGeoDB, assignments []string, location string) bool {
+	for _, assignment := range assignments {
+		if capLocationKeysOverlap(db, assignment, location) {
+			return true
+		}
+	}
+	return false
 }
 
 func alertInfoCoverageCodes(info capmodel.AlertInfo) map[string]struct{} {

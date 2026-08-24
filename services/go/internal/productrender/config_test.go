@@ -124,6 +124,32 @@ func TestFeedRenderLanguageRequiresConfiguredBilingualFeed(t *testing.T) {
 	}
 }
 
+func TestLoadFeedsReadsSourceScopedPolygonFirstCoverageMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "feeds.xml")
+	raw := `<?xml version="1.0" encoding="UTF-8"?>
+<feeds>
+  <feed id="cwxr-test" enabled="true">
+    <alerts>
+      <cap_cp enabled="true"><filter use_feed_locations="true" coverage_mode="polygon_first"/></cap_cp>
+      <nws_cap enabled="true"><filter use_feed_locations="true"/></nws_cap>
+    </alerts>
+  </feed>
+</feeds>`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	feeds, err := loadFeeds(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(feeds) != 1 || feeds[0].Alerts.CapCP.Filter.CoverageMode != capCoverageModePolygonFirst {
+		t.Fatalf("CAP-CP coverage mode = %#v", feeds)
+	}
+	if feeds[0].Alerts.NWSCAP.Filter.CoverageMode != "" {
+		t.Fatalf("NWS CAP coverage mode = %q, want unset", feeds[0].Alerts.NWSCAP.Filter.CoverageMode)
+	}
+}
+
 func TestRendererUsesRequestedBilingualProductLanguage(t *testing.T) {
 	feed := feedXML{ID: "cwxr-test", EnabledRaw: "true"}
 	feed.Languages.Langs = []feedLangXML{{Code: "en-US"}, {Code: "fr-CA", Interval: "1"}}

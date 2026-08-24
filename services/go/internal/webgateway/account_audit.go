@@ -58,6 +58,7 @@ func auditedWebpanelMutation(command string, payload map[string]any) bool {
 		"feeds.save", "feeds.control", "bulletins.save", "bulletins.import", "bulletins.upload_audio",
 		"cgen.scenes.save", "cgen.scenes.delete", "cgen.save", "cgen.action",
 		"playlist.control", "playlist.insert", "alerts.archive.action", "automations.put", "same.templates.put",
+		"lead_statements.save",
 		"operator_breakin.upload_preroll", "operator_breakin.generate_tone", "operator_breakin.start",
 		"operator_breakin.chunk", "operator_breakin.finish", "operator_breakin.url", "operator_breakin.cancel":
 		return true

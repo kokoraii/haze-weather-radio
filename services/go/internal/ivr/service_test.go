@@ -320,6 +320,31 @@ func TestLocationNumberCombinesWithProvince(t *testing.T) {
 	}
 }
 
+func TestLocationCodeKeepsIncompleteHelloWeatherShortCodeOpen(t *testing.T) {
+	cfg := loadedConfig{
+		BaseDir: t.TempDir(),
+		IVR:     Config{DefaultLanguage: "en-CA"},
+		Feeds:   []feedXML{testFeedWithLanguages("qc-0001", "en-CA")},
+		Prompts: defaultPromptConfig(),
+	}
+	service := &Service{cfg: cfg}
+	service.cache = NewProductCache(cfg, nil)
+	service.broadcast = newBroadcastHub()
+	service.resolver = resolverWithHelloWeather(cfg,
+		locationRecord{Code: "03013", Source: "hello_weather", Name: "Saint-Jérôme", Province: "QC", Forecast: "qc-13"},
+		locationRecord{Code: "03133", Source: "hello_weather", Name: "Quebec", Province: "QC", Forecast: "qc-133"},
+	)
+
+	request := formRequest("http://ivr.test/ivr/v1/twiml?state=location_code&lang=en-CA", url.Values{"Digits": {"313"}})
+	response := httptest.NewRecorder()
+	service.handleLocationCodeTwiML(response, request)
+
+	body := response.Body.String()
+	if !strings.Contains(body, "state=location_code") || !strings.Contains(body, "prefix=313") || strings.Contains(body, "state=location_option") {
+		t.Fatalf("incomplete short code was resolved early: %s", body)
+	}
+}
+
 func TestProvinceLineAcceptsThreeDigitLocationNumber(t *testing.T) {
 	cfg := loadedConfig{
 		BaseDir: t.TempDir(),

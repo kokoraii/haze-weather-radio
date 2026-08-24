@@ -242,6 +242,7 @@ fn wait_for_shutdown(
             break;
         }
         while let Ok(event) = service_events.try_recv() {
+            daemon_services.handle_event(&event);
             if go_services.handle_control_event(&event) {
                 go_services.poll_children();
             }

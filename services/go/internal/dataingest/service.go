@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/meowraii/haze-weather-radio/services/go/internal/datastore"
+	"github.com/meowraii/haze-weather-radio/services/go/internal/ecccclimate"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/events"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/locationclient"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/locationdb"
@@ -31,6 +32,7 @@ const serviceID = "haze-data-ingest"
 const thunderstormOutlookCoverageToleranceKM = 0.5
 const maxDataIngestCycleTimeout = 10 * time.Minute
 const swobPartnerBaseURL = "https://dd.weather.gc.ca/today/observations/swob-ml/partners/"
+const dataIngestFetchAttempts = 3
 
 type Options struct {
 	ConfigPath string
@@ -2493,7 +2495,19 @@ func feedMarineForecastLocations(feed feedXML) []locationXML {
 }
 
 func fetchClimateSummary(ctx context.Context, client *http.Client, loc locationXML, timezone string, now time.Time) (map[string]any, error) {
-	daily, timestamp, err := fetchLatestClimateDaily(ctx, client, loc.ID, now)
+	requestedID := strings.TrimSpace(loc.ID)
+	dailyID := requestedID
+	virtual, virtualFound, virtualErr := ecccclimate.ResolveVirtualStation(ctx, client, requestedID)
+	if virtualErr != nil {
+		return nil, fmt.Errorf("resolve virtual climate station %s: %w", requestedID, virtualErr)
+	}
+	if ecccclimate.IsVirtualClimateID(requestedID) {
+		if !virtualFound || strings.TrimSpace(virtual.CurrentClimateID) == "" {
+			return nil, fmt.Errorf("virtual climate station %s has no current physical climate station", requestedID)
+		}
+		dailyID = virtual.CurrentClimateID
+	}
+	daily, timestamp, err := fetchLatestClimateDaily(ctx, client, dailyID, now)
 	if err != nil {
 		return nil, err
 	}
@@ -2513,7 +2527,7 @@ func fetchClimateSummary(ctx context.Context, client *http.Client, loc locationX
 			climateDate = parsed
 		}
 	}
-	normalID := firstNonBlank(loc.NormalID, textValue(props["CLIMATE_IDENTIFIER"]), loc.ID)
+	normalID := firstNonBlank(loc.NormalID, textValue(props["CLIMATE_IDENTIFIER"]), dailyID)
 	normals := map[string]any{}
 	if month > 0 {
 		if fetched, normalErr := fetchClimateNormals(ctx, client, normalID, month); normalErr == nil {
@@ -2522,7 +2536,7 @@ func fetchClimateSummary(ctx context.Context, client *http.Client, loc locationX
 			log.Printf("ECCC climate normals fetch failed for %s: %v", normalID, normalErr)
 		}
 	}
-	stationName := firstNonBlank(loc.NameOverride, titleText(textValue(props["STATION_NAME"])), loc.ID)
+	stationName := firstNonBlank(loc.NameOverride, virtual.Name, titleText(textValue(props["STATION_NAME"])), requestedID)
 	obs := map[string]any{
 		"station":             map[string]any{"en": stationName, "fr": stationName},
 		"date":                textValue(props["LOCAL_DATE"]),
@@ -2560,6 +2574,22 @@ func fetchClimateSummary(ctx context.Context, client *http.Client, loc locationX
 			astronomy = sun
 		}
 	}
+	metadata := map[string]any{
+		"collection":          "climate-daily",
+		"station_id":          textValue(props["STN_ID"]),
+		"climate_identifier":  firstNonBlank(textValue(props["CLIMATE_IDENTIFIER"]), dailyID),
+		"normal_identifier":   normalID,
+		"acceptable_fields":   climateAcceptableFieldList(),
+		"accepted_flag_notes": "Only blank-value flags and trace precipitation flags are rendered.",
+		"records_collection":  "ltce-temperature, ltce-precipitation, ltce-snowfall",
+		"astronomy_source":    "computed from the climate station coordinates",
+	}
+	if virtualFound {
+		metadata["virtual_climate_identifier"] = virtual.ID
+		metadata["virtual_station_name"] = virtual.Name
+		metadata["virtual_citypage_identifier"] = virtual.CitypageID
+		metadata["requested_climate_identifier"] = requestedID
+	}
 	return map[string]any{
 		"source":       "eccc",
 		"name":         map[string]any{"en": stationName, "fr": stationName},
@@ -2568,16 +2598,7 @@ func fetchClimateSummary(ctx context.Context, client *http.Client, loc locationX
 		"normals":      normals,
 		"records":      records,
 		"astronomy":    astronomy,
-		"metadata": map[string]any{
-			"collection":          "climate-daily",
-			"station_id":          textValue(props["STN_ID"]),
-			"climate_identifier":  firstNonBlank(textValue(props["CLIMATE_IDENTIFIER"]), loc.ID),
-			"normal_identifier":   normalID,
-			"acceptable_fields":   climateAcceptableFieldList(),
-			"accepted_flag_notes": "Only blank-value flags and trace precipitation flags are rendered.",
-			"records_collection":  "ltce-temperature, ltce-precipitation, ltce-snowfall",
-			"astronomy_source":    "computed from the climate station coordinates",
-		},
+		"metadata":     metadata,
 	}, nil
 }
 
@@ -3667,42 +3688,94 @@ func titleText(value string) string {
 }
 
 func fetchJSON(ctx context.Context, client *http.Client, url string, target any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("User-Agent", "HazeWeatherRadio/26.06 data-ingest")
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		_ = resp.Body.Close()
-	}()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("%s returned %s", url, resp.Status)
-	}
-	return json.NewDecoder(resp.Body).Decode(target)
+	return fetchWithRetry(ctx, client, url, func(body io.Reader) error {
+		return json.NewDecoder(body).Decode(target)
+	})
 }
 
 func fetchText(ctx context.Context, client *http.Client, url string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return "", err
+	var raw string
+	err := fetchWithRetry(ctx, client, url, func(body io.Reader) error {
+		data, err := io.ReadAll(body)
+		raw = string(data)
+		return err
+	})
+	return raw, err
+}
+
+type fetchStatusError struct {
+	url    string
+	status int
+	text   string
+}
+
+type fetchDecodeError struct {
+	err error
+}
+
+func (err fetchDecodeError) Error() string {
+	return err.err.Error()
+}
+
+func (err fetchDecodeError) Unwrap() error {
+	return err.err
+}
+
+func (err fetchStatusError) Error() string {
+	return fmt.Sprintf("%s returned %s", err.url, err.text)
+}
+
+func fetchWithRetry(ctx context.Context, client *http.Client, url string, decode func(io.Reader) error) error {
+	var lastErr error
+	for attempt := 0; attempt < dataIngestFetchAttempts; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(attempt) * time.Second
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("User-Agent", "HazeWeatherRadio/26.06 data-ingest")
+		resp, err := client.Do(req)
+		if err == nil {
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				if decodeErr := decode(resp.Body); decodeErr != nil {
+					err = fetchDecodeError{err: decodeErr}
+				}
+			} else {
+				err = fetchStatusError{url: url, status: resp.StatusCode, text: resp.Status}
+			}
+			_ = resp.Body.Close()
+		}
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !retryableFetchError(err) {
+			return err
+		}
 	}
-	req.Header.Set("User-Agent", "HazeWeatherRadio/26.06 data-ingest")
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
+	return lastErr
+}
+
+func retryableFetchError(err error) bool {
+	var decodeErr fetchDecodeError
+	if errors.As(err, &decodeErr) {
+		return false
 	}
-	defer func() {
-		_ = resp.Body.Close()
-	}()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("%s returned %s", url, resp.Status)
+	var statusErr fetchStatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.status == http.StatusRequestTimeout || statusErr.status == http.StatusTooManyRequests || statusErr.status >= 500
 	}
-	raw, err := io.ReadAll(resp.Body)
-	return string(raw), err
+	return true
 }
 
 func firstFeatureProperties(raw map[string]any) map[string]any {

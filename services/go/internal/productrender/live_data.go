@@ -380,6 +380,28 @@ func (r renderer) loadLiveAirQualitySnapshot(feed feedXML, lang string, snapshot
 }
 
 func (r renderer) loadLiveClimateSnapshot(feed feedXML, lang string, snapshot *climateSnapshot) (string, bool) {
+	if feed.OnDemand {
+		for _, loc := range feed.Locations.ClimateLocations.Locations {
+			input, raw, ok := fetchLiveClimateSnapshot(loc, feed.Timezone)
+			if !ok {
+				continue
+			}
+			location := fallbackText(loc.NameOverride, localizedString(raw.Name, lang))
+			if location == "" {
+				location = loc.ID
+			}
+			lines := climateLines(raw, lang, feed.Timezone)
+			if len(lines) == 0 {
+				continue
+			}
+			*snapshot = climateSnapshot{
+				ReportedAt: raw.LastUpdated,
+				Location:   titleText(location),
+				Summary:    lines,
+			}
+			return input, true
+		}
+	}
 	for _, loc := range feed.Locations.ClimateLocations.Locations {
 		var raw liveClimateFile
 		input, ok := r.loadStoreProductPayload("climate_summary", loc.Source, loc.ID, &raw)
