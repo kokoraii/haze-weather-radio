@@ -1572,6 +1572,19 @@ func normalizePriorityAlertRequest(data map[string]any) (map[string]any, string)
 func (p *feedPlanner) preparePriorityAlert(ctx context.Context, data map[string]any) (prepared priorityAlertPreparation, err error) {
 	data, alertID := normalizePriorityAlertRequest(data)
 	includeSame := includeSameAlert(data)
+	
+	isUpdate := strings.EqualFold(firstText(nil, data, "status"), "updated")
+	if isUpdate {
+		policy := strings.ToLower(p.cfg.Daemon.AlertUpdateTonePolicy)
+		switch policy {
+		case "none":
+			includeSame = false
+		case "all":
+			includeSame = includeSameAlert(data)
+		case "new_locations":
+			includeSame = includeSameAlert(data) && len(sameLocationsFromData(data)) > 0
+		}
+	}
 	includeAttentionTone := !includeSame && alertAttentionToneEnabled(data)
 	var sameRequest sameGenerateRequest
 	var sameHeader sameAudioPayload

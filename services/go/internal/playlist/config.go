@@ -33,7 +33,8 @@ type rootConfig struct {
 			Playlist playlistConfig `yaml:"playlist"`
 		} `yaml:"go"`
 	} `yaml:"services"`
-	Playout playoutConfig `yaml:"playout"`
+	Playout  playoutConfig        `yaml:"playout"`
+	Daemon   daemonConfig         `yaml:"daemon"`
 }
 
 type playlistConfig struct {
@@ -72,6 +73,10 @@ type minuteScheduleConfig struct {
 }
 
 type minuteList []int
+
+type daemonConfig struct {
+	AlertUpdateTonePolicy string `yaml:"alert_update_tone_policy"`
+}
 
 type feedsXML struct {
 	Feeds []feedXML `xml:"feed"`
@@ -136,6 +141,9 @@ type loadedConfig struct {
 	BaseDir   string
 	OutputDir string
 	Store     datastore.Store
+	Daemon    struct {
+		AlertUpdateTonePolicy string `yaml:"alert_update_tone_policy"`
+	}
 }
 
 func loadConfig(configPath string, outDir string) (loadedConfig, error) {
@@ -162,6 +170,9 @@ func loadConfig(configPath string, outDir string) (loadedConfig, error) {
 	}
 	if root.Services.Go.Playlist.RoutineEstimateS <= 0 {
 		root.Services.Go.Playlist.RoutineEstimateS = 35
+	}
+	if root.Daemon.AlertUpdateTonePolicy == "" {
+		root.Daemon.AlertUpdateTonePolicy = "new_locations"
 	}
 	if root.Playout.Pacing.PackageGapS <= 0 {
 		root.Playout.Pacing.PackageGapS = 1

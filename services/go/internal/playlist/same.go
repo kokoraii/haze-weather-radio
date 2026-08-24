@@ -177,6 +177,7 @@ func (p *feedPlanner) buildSAMERequest(data map[string]any, sequence string) sam
 }
 
 func (p *feedPlanner) sameLocationsForData(data map[string]any) []string {
+	event := strings.ToUpper(fallbackText(firstText(nil, data, "same_event", "event"), "ADR"))
 	locations := sameLocationsFromData(data)
 	if len(locations) == 0 {
 		for _, region := range p.feed.Locations.Coverage.Regions {
@@ -189,6 +190,9 @@ func (p *feedPlanner) sameLocationsForData(data map[string]any) []string {
 				}
 			}
 		}
+	}
+	if event != "SVR" && event != "TOR" {
+		return locations
 	}
 	return expandWildcardSAMELocations(p.cfg.BaseDir, locations)
 }

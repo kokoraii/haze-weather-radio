@@ -899,11 +899,19 @@
                                             <option value="PEP">Primary Entry Point (PEP)</option>
                                         </select>
                                     </label>
-                                    <label class="daemon-field">
-                                        <span>Attention tone override</span>
-                                        <input id="feedSameAttentionTone" type="text" placeholder="EAS, WXR, NPAS">
-                                    </label>
-                                    <label class="daemon-field">
+<label class="daemon-field">
+											<span>Attention tone override</span>
+											<input id="feedSameAttentionTone" type="text" placeholder="EAS, WXR, NPAS">
+										</label>
+										<label class="daemon-field">
+											<span>Tone Updates</span>
+											<select id="daemonAlertUpdateTonePolicy">
+												<option value="all">Tone all updates</option>
+												<option value="none">No updates at all</option>
+												<option value="new_locations" selected>Only tone for new locations</option>
+											</select>
+										</label>
+										<label class="daemon-field">
                                         <span>Site name</span>
                                         <input id="feedSiteName" type="text" placeholder="Saskatoon">
                                     </label>

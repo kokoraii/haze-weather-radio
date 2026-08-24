@@ -95,6 +95,7 @@ const SECTIONS = [
             ['services.daemon.enabled', 'Enable host service loop', 'Allow Haze to run scheduler and playlist services.'],
             ['services.daemon.scheduler.enabled', 'Host scheduler', 'Emit station ID and date/time schedule events over the host bridge.'],
             ['services.daemon.alert_queue.enabled', 'Alert queue worker', 'Claim and time queued SAME alert audio from managed queues.'],
+		['services.daemon.alert_update_tone_policy', 'Tone Updates', 'Control whether SAME tones are played for updated alerts: all, none, or only for new locations.'],
             ['services.daemon.playlist.enabled', 'Host playlist', 'Drive queue refill ticks over the host bridge.'],
         ],
         fields: [
