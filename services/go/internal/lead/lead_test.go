@@ -11,8 +11,9 @@ func TestParseScaffoldStatementMatchesCAPParameter(t *testing.T) {
   <lead enabled="true">
     <name>NPAS preroll</name>
     <conditions>
-      <if key="layer:SOREM:1.0:Broadcast_Immediately" equals="no" matchcase="false" matchwhole="false" useregex="true" />
-      <and />
+      <if key="layer:SOREM:1.0:Broadcast_Immediately" equals="yes" matchcase="false" matchwhole="false" useregex="true" />
+      <or />
+      <if key="layer:SOREM:1.0:Broadcast_Intrusive" equals="yes" matchcase="false" matchwhole="false" useregex="true" />
     </conditions>
     <audio><lead_in>./audio/NPAS_Preroll.wav</lead_in><lead_out></lead_out></audio>
   </lead>
@@ -29,14 +30,19 @@ func TestParseScaffoldStatementMatchesCAPParameter(t *testing.T) {
 		t.Fatalf("lead_in = %q", statement.LeadIn)
 	}
 	context := Context{Values: map[string][]string{
-		"layer:SOREM:1.0:Broadcast_Immediately": {"no"},
+		"layer:SOREM:1.0:Broadcast_Immediately": {"yes"},
 	}}
 	if selected, ok := document.Select(context); !ok || selected.Name != "NPAS preroll" {
 		t.Fatalf("selected = %#v, %v", selected, ok)
 	}
-	context.Values["layer:SOREM:1.0:Broadcast_Immediately"] = []string{"yes"}
+	context.Values["layer:SOREM:1.0:Broadcast_Immediately"] = []string{"no"}
+	context.Values["layer:SOREM:1.0:Broadcast_Intrusive"] = []string{"no"}
 	if _, ok := document.Select(context); ok {
-		t.Fatal("lead matched the opposite Broadcast_Immediately value")
+		t.Fatal("lead matched an alert without immediate or intrusive broadcast tags")
+	}
+	context.Values["layer:SOREM:1.0:Broadcast_Intrusive"] = []string{"yes"}
+	if selected, ok := document.Select(context); !ok || selected.Name != "NPAS preroll" {
+		t.Fatalf("intrusive alert did not select lead = %#v, %v", selected, ok)
 	}
 }
 

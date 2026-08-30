@@ -8,9 +8,10 @@
     <lead enabled="true">
         <name>NPAS preroll</name>
         <conditions> <!-- if, and, or -->
-            <if key="layer:SOREM:1.0:Broadcast_Immediately" equals="no" matchcase="false" matchwhole="false" useregex="true" />  <!-- available targets: key (CAP XML), location (any type including FIPS, SGC, CLC...)
+            <if key="layer:SOREM:1.0:Broadcast_Immediately" equals="yes" matchcase="false" matchwhole="false" useregex="true" />  <!-- available targets: key (CAP XML), location (any type including FIPS, SGC, CLC...)
             available operators: equals, includes, startswith, endswith -->
-            <and />
+            <or />
+            <if key="layer:SOREM:1.0:Broadcast_Intrusive" equals="yes" matchcase="false" matchwhole="false" useregex="true" />
         </conditions>
         <audio>
             <lead_in>./audio/NPAS_Preroll.wav</lead_in>
