@@ -36,6 +36,7 @@ const (
 	sipTrustedSourceRefreshEvery  = 5 * time.Minute
 	sipLocationAutoSubmitDelay    = 2 * time.Second
 	sipFullHelloAutoSubmitDelay   = time.Second
+	sipAnswerLeadInSilence        = 1 * time.Second
 )
 
 type sipAudioCodec int
@@ -846,12 +847,30 @@ func isPrivateIPv4(ip net.IP) bool {
 func (c *sipCall) run() {
 	defer c.close()
 	go c.readRTP()
+	c.playLeadInSilence()
 	if c.directFeedID != "" {
 		for c.ctx.Err() == nil && c.playLiveBroadcast(c.directFeedID) {
 		}
 		return
 	}
 	c.menuLoop()
+}
+
+func (c *sipCall) playLeadInSilence() {
+	if c.remoteRTP == nil {
+		return
+	}
+	deadline := time.Now().Add(sipAnswerLeadInSilence)
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for time.Now().Before(deadline) {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-ticker.C:
+			c.sendRTP(c.audioCodec.silenceFrame())
+		}
+	}
 }
 
 func (c *sipCall) close() {
@@ -917,81 +936,56 @@ func (c *sipCall) sendBYE() {
 func (c *sipCall) menuLoop() {
 	language := c.service.cfg.IVR.DefaultLanguage
 	directProvince := c.line.directProvince()
-	c.playPrompt("entry", "greeting", c.service.extensionGreetingValues(c.line))
+	chosen, ok := c.selectCallLanguage()
+	if !ok {
+		return
+	}
+	language = chosen
 	for c.ctx.Err() == nil {
 		entry, _ := c.service.cfg.Prompts.Menu("entry")
 		lineKey := c.service.menuMainLine("entry", "")
-		if configuredLanguage, single := c.service.singleConfiguredLanguage(); single {
-			language = configuredLanguage
-			var location ResolvedLocation
-			var ok bool
-			if directProvince != "" {
-				location, ok = c.collectLocationNumber(language, directProvince)
-			} else {
-				location, ok = c.collectLocationWithPrompt(language, "entry", lineKey, c.service.promptValues(nil), entry.Timeout)
-			}
-			if !ok {
-				return
-			}
-			c.locationMenu(location)
-			continue
+		values := c.service.promptValues(map[string]string{"lang": language})
+		var location ResolvedLocation
+		if directProvince != "" {
+			location, ok = c.collectLocationNumber(language, directProvince)
+		} else {
+			location, ok = c.collectLocationWithPrompt(language, "entry", lineKey, values, entry.Timeout)
 		}
-		digit, ok := c.promptAndWaitDigit("entry", lineKey, c.service.promptValues(nil), entry.Timeout)
+		if !ok {
+			return
+		}
+		c.locationMenu(location)
+	}
+}
+
+func (c *sipCall) selectCallLanguage() (string, bool) {
+	if !c.service.hasMultipleLanguageSelectOptions() {
+		return c.service.cfg.IVR.DefaultLanguage, true
+	}
+	segments := c.service.configuredLanguageSegments()
+	if len(segments) == 0 {
+		return c.service.cfg.IVR.DefaultLanguage, true
+	}
+	menu, _ := c.service.cfg.Prompts.Menu("language_select")
+	attempts := maxInt(1, menu.Retries+1)
+	for attempt := 0; attempt < attempts && c.ctx.Err() == nil; attempt++ {
+		for _, segment := range segments {
+			c.playPrompt("language_select", segment.LineKey, map[string]string{"lang": segment.Language})
+		}
+		digit, ok := c.waitDigit(menu.Timeout)
 		if !ok {
 			c.timeoutHangup()
-			return
+			return "", false
 		}
-		option, ok := c.service.cfg.Prompts.Option("entry", digit)
+		option, ok := c.service.cfg.Prompts.Option("language_select", digit)
 		if !ok {
 			c.playPrompt("error", "invalid_code", nil)
 			continue
 		}
-		switch option.Action {
-		case "language":
-			if !c.service.languageConfigured(option.Language) {
-				c.playPrompt("error", "invalid_code", nil)
-				continue
-			}
-			language = fallbackText(option.Language, language)
-			var location ResolvedLocation
-			if directProvince != "" {
-				location, ok = c.collectLocationNumber(language, directProvince)
-			} else {
-				location, ok = c.collectLocation(language)
-			}
-			if !ok {
-				return
-			}
-			c.locationMenu(location)
-		case "product":
-			location, err := c.service.defaultFeedLocation()
-			if err != nil {
-				c.playPrompt("weather_product", "unavailable", nil)
-				return
-			}
-			if option.Language != "" {
-				location.Language = option.Language
-			}
-			c.playMappedProduct(location, splitCSV(option.Packages), true)
-		case "broadcast":
-			location, err := c.service.defaultFeedLocation()
-			if err != nil || !c.service.broadcastAvailable(location.FeedID) {
-				c.playPrompt("error", "invalid_code", nil)
-				continue
-			}
-			location.Language = language
-			c.playPrompt("broadcast_menu", "main", nil)
-			if !c.playLiveBroadcast(location.FeedID) {
-				packages := c.service.broadcastPackages(option)
-				c.playProduct(c.service.mapProductLocation(location, packages, nil), packages)
-			}
-		case "operator":
-			c.playPrompt("operator", "main", nil)
-			return
-		default:
-			c.playPrompt("error", "invalid_code", nil)
-		}
+		return option.Language, true
 	}
+	c.timeoutHangup()
+	return "", false
 }
 
 func (c *sipCall) collectLocation(language string) (ResolvedLocation, bool) {
@@ -1007,18 +1001,24 @@ func (c *sipCall) collectLocationWithPrompt(language string, menuID string, line
 	for attempt := 0; attempt < attempts && c.ctx.Err() == nil; attempt++ {
 		firstDigit, interrupted := c.playPromptForDigit(menuID, lineKey, values)
 		var code string
-		var geophysical bool
+		var search bool
 		var ok bool
 		if interrupted {
-			code, geophysical, ok = c.collectLocationInput(timeout, firstDigit)
+			code, search, ok = c.collectLocationInput(timeout, firstDigit)
 		} else {
-			code, geophysical, ok = c.collectLocationInput(timeout, "")
+			code, search, ok = c.collectLocationInput(timeout, "")
 		}
 		if !ok {
 			c.timeoutHangup()
 			return ResolvedLocation{}, false
 		}
-		if geophysical {
+		if search {
+			if location, found := c.searchLocation(language, ""); found {
+				return location, true
+			}
+			continue
+		}
+		if code == "0" {
 			location, err := c.service.defaultFeedLocation()
 			if err != nil {
 				c.playPrompt("weather_product", "unavailable", nil)
@@ -1243,7 +1243,7 @@ func (c *sipCall) playPromptAudio(menuID string, lineKey string, values map[stri
 	audio, ok := c.service.staticPromptAudio(menuID, lineKey, promptValues)
 	if !ok {
 		var err error
-		audio, err = c.service.cache.GetPromptWithPolicy(c.ctx, menuID, lineKey, promptValues, c.service.staticPromptPolicy(), false)
+		audio, err = c.service.cache.GetPromptWithPolicy(c.ctx, menuID, lineKey, promptValues, c.service.defaultPlaybackPolicy(), false)
 		if err != nil {
 			log.Printf("IVR SIP prompt %s/%s failed: %v", menuID, lineKey, err)
 			return "", false

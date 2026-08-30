@@ -396,7 +396,7 @@ func (s *Service) handlePrompt(writer http.ResponseWriter, request *http.Request
 			return
 		}
 	}
-	audio, err := s.cache.GetPromptWithPolicy(request.Context(), menuID, lineKey, values, s.staticPromptPolicy(), force)
+	audio, err := s.cache.GetPromptWithPolicy(request.Context(), menuID, lineKey, values, s.defaultPlaybackPolicy(), force)
 	if err != nil {
 		http.Error(writer, err.Error(), http.StatusBadGateway)
 		return
@@ -473,12 +473,20 @@ func (s *Service) handleAlertAudio(writer http.ResponseWriter, request *http.Req
 func (s *Service) handleTwiML(writer http.ResponseWriter, request *http.Request) {
 	state := strings.ToLower(strings.TrimSpace(request.URL.Query().Get("state")))
 	switch state {
-	case "", "entry":
+	case "":
+		if s.hasMultipleLanguageSelectOptions() {
+			s.writeLanguageSelectTwiML(writer, request)
+			return
+		}
+		fallthrough
+	case "entry":
 		if state == "" || strings.TrimSpace(request.FormValue("Digits")) == "" {
 			s.writeEntryTwiML(writer, request)
 			return
 		}
 		s.handleEntryDigit(writer, request)
+	case "language_select":
+		s.handleLanguageSelectTwiML(writer, request)
 	case "location_code":
 		s.handleLocationCodeTwiML(writer, request)
 	case "location_number":
@@ -531,10 +539,12 @@ func (s *Service) writeEntryTwiML(writer http.ResponseWriter, request *http.Requ
 		writeTwiML(writer, twimlHangup())
 		return
 	}
+	requestLanguage := normalizePromptLanguage(request.URL.Query().Get("lang"))
 	directProvince := line.directProvince()
 	if directProvince != "" {
 		if language, single := s.singleConfiguredLanguage(); single {
 			s.writeLocationNumberPromptWithPlays(writer, request, language, directProvince, []string{
+				twimlPause(1),
 				promptURL(request, "entry", "greeting", s.extensionGreetingValues(line)),
 			})
 			return
@@ -542,23 +552,82 @@ func (s *Service) writeEntryTwiML(writer http.ResponseWriter, request *http.Requ
 	}
 	entry, _ := s.cfg.Prompts.Menu("entry")
 	lineKey := s.menuMainLine("entry", "")
-	numDigits := "1"
+	numDigits := ""
 	timeout := entry.Timeout
 	if _, single := s.singleConfiguredLanguage(); single {
-		numDigits = ""
 		timeout = locationCodeAutoSubmitTimeout()
 	}
+	entryValues := s.promptValues(map[string]string{"lang": requestLanguage})
 	params := map[string]string{"state": "entry"}
+	if requestLanguage != "" {
+		params["lang"] = requestLanguage
+	}
 	if directProvince != "" {
 		params["province"] = directProvince
 	}
 	body := twimlGather(twimlURL(request, "/ivr/v1/twiml", params), numDigits, "#", timeout, []string{
+		twimlPause(1),
 		promptURL(request, "entry", "greeting", s.extensionGreetingValues(line)),
-		promptURL(request, "entry", lineKey, s.promptValues(nil)),
+		promptURL(request, "entry", lineKey, entryValues),
 	}, []string{
 		twimlTimeoutHangup(request, s.promptValues(nil)),
 	})
 	writeTwiML(writer, body)
+}
+
+func (s *Service) writeLanguageSelectTwiML(writer http.ResponseWriter, request *http.Request) {
+	menu, _ := s.cfg.Prompts.Menu("language_select")
+	segments := s.configuredLanguageSegments()
+	plays := make([]string, 0, len(segments)+1)
+	plays = append(plays, twimlPause(1))
+	for _, segment := range segments {
+		plays = append(plays, promptURL(request, "language_select", segment.LineKey, map[string]string{"lang": segment.Language}))
+	}
+	if len(plays) == 0 {
+		s.writeEntryTwiML(writer, request)
+		return
+	}
+	body := twimlGather(twimlURL(request, "/ivr/v1/twiml", map[string]string{"state": "language_select"}), "1", "", menu.Timeout, plays, []string{
+		twimlTimeoutHangup(request, s.promptValues(nil)),
+	})
+	writeTwiML(writer, body)
+}
+
+func (s *Service) handleLanguageSelectTwiML(writer http.ResponseWriter, request *http.Request) {
+	digit := strings.TrimSpace(request.FormValue("Digits"))
+	if digit == "" {
+		s.writeLanguageSelectTwiML(writer, request)
+		return
+	}
+	option, ok := s.cfg.Prompts.Option("language_select", digit)
+	if !ok {
+		s.writeLanguageSelectTwiML(writer, request)
+		return
+	}
+	next := option.Next
+	if next == "" {
+		next = "entry"
+	}
+	if !strings.EqualFold(next, "entry") {
+		s.writeEntryTwiML(writer, request)
+		return
+	}
+	params := map[string]string{"state": "entry", "lang": option.Language}
+	if province := normalizeProvinceCode(request.URL.Query().Get("province")); validProvinceCode(province) && province != "CA" {
+		params["province"] = province
+	}
+	body := twimlGather(twimlURL(request, "/ivr/v1/twiml", params), "", "#", locationCodeAutoSubmitTimeout(), []string{
+		promptURL(request, "entry", "greeting", s.extensionGreetingValues(s.extensionLineFromRequest(request))),
+		promptURL(request, "entry", s.menuMainLine("entry", ""), s.promptValues(map[string]string{"lang": option.Language})),
+	}, []string{
+		twimlTimeoutHangup(request, s.promptValues(nil)),
+	})
+	writeTwiML(writer, body)
+}
+
+func (s *Service) extensionLineFromRequest(request *http.Request) extensionConfig {
+	line, _ := s.cfg.IVR.extensionLine(ivrExtensionFromRequest(request))
+	return line
 }
 
 func (s *Service) handleEntryDigit(writer http.ResponseWriter, request *http.Request) {
@@ -576,55 +645,65 @@ func (s *Service) handleEntryDigit(writer http.ResponseWriter, request *http.Req
 		return
 	}
 	option, ok := s.cfg.Prompts.Option("entry", digit)
-	if !ok {
-		s.writeEntryErrorTwiML(writer, request)
+	if ok {
+		switch option.Action {
+		case "language":
+			if !s.languageConfigured(option.Language) {
+				s.writeEntryErrorTwiML(writer, request)
+				return
+			}
+			locationMenu, _ := s.cfg.Prompts.Menu("location_code")
+			lang := fallbackText(option.Language, s.cfg.IVR.DefaultLanguage)
+			if directProvince != "" {
+				s.writeLocationNumberPrompt(writer, request, lang, directProvince)
+				return
+			}
+			body := twimlGather(twimlURL(request, "/ivr/v1/twiml", map[string]string{
+				"state": "location_code",
+				"lang":  lang,
+			}), "", "#", locationCodeAutoSubmitTimeoutForMenu(locationMenu.Timeout), []string{
+				promptURL(request, "location_code", "main", nil),
+			}, []string{
+				twimlTimeoutHangup(request, nil),
+			})
+			writeTwiML(writer, body)
+		case "product":
+			location, err := s.defaultFeedLocation()
+			if err != nil {
+				s.writeUnavailableTwiML(writer, request)
+				return
+			}
+			if option.Language != "" {
+				location.Language = option.Language
+			}
+			packages := splitCSV(option.Packages)
+			s.writeProductTwiML(writer, request, s.mapProductLocation(location, packages, nil), packages, "")
+		case "broadcast":
+			location, err := s.defaultFeedLocation()
+			if err != nil || !s.broadcastAvailable(location.FeedID) {
+				s.writeEntryErrorTwiML(writer, request)
+				return
+			}
+			packages := s.broadcastPackages(option)
+			s.writeProductTwiML(writer, request, s.mapProductLocation(location, packages, nil), packages, "")
+		case "operator":
+			s.writeOperatorTwiML(writer, request)
+		case "search":
+			s.writeLocationCodePrompt(writer, request, normalizePromptLanguage(request.URL.Query().Get("lang")))
+		default:
+			s.writeEntryErrorTwiML(writer, request)
+		}
 		return
 	}
-	switch option.Action {
-	case "language":
-		if !s.languageConfigured(option.Language) {
-			s.writeEntryErrorTwiML(writer, request)
-			return
-		}
-		locationMenu, _ := s.cfg.Prompts.Menu("location_code")
-		lang := fallbackText(option.Language, s.cfg.IVR.DefaultLanguage)
-		if directProvince != "" {
-			s.writeLocationNumberPrompt(writer, request, lang, directProvince)
-			return
-		}
-		body := twimlGather(twimlURL(request, "/ivr/v1/twiml", map[string]string{
-			"state": "location_code",
-			"lang":  lang,
-		}), "", "#", locationCodeAutoSubmitTimeoutForMenu(locationMenu.Timeout), []string{
-			promptURL(request, "location_code", "main", nil),
-		}, []string{
-			twimlTimeoutHangup(request, nil),
-		})
-		writeTwiML(writer, body)
-	case "product":
-		location, err := s.defaultFeedLocation()
-		if err != nil {
-			s.writeUnavailableTwiML(writer, request)
-			return
-		}
-		if option.Language != "" {
-			location.Language = option.Language
-		}
-		packages := splitCSV(option.Packages)
-		s.writeProductTwiML(writer, request, s.mapProductLocation(location, packages, nil), packages, "")
-	case "broadcast":
-		location, err := s.defaultFeedLocation()
-		if err != nil || !s.broadcastAvailable(location.FeedID) {
-			s.writeEntryErrorTwiML(writer, request)
-			return
-		}
-		packages := s.broadcastPackages(option)
-		s.writeProductTwiML(writer, request, s.mapProductLocation(location, packages, nil), packages, "")
-	case "operator":
-		s.writeOperatorTwiML(writer, request)
-	default:
-		s.writeEntryErrorTwiML(writer, request)
+	lang := normalizePromptLanguage(request.URL.Query().Get("lang"))
+	if lang == "" {
+		lang = s.cfg.IVR.DefaultLanguage
 	}
+	if directProvince != "" {
+		s.writeLocationNumberPrompt(writer, request, lang, directProvince)
+		return
+	}
+	s.handleLocationCodeWithLanguageTwiML(writer, request, lang, digit)
 }
 
 func (s *Service) handleLocationCodeTwiML(writer http.ResponseWriter, request *http.Request) {
@@ -1180,6 +1259,47 @@ func (s *Service) configuredEntryLanguageOptions() []menuOption {
 	return options
 }
 
+func (s *Service) configuredLanguageSelectOptions() []menuOption {
+	menu, ok := s.cfg.Prompts.Menu("language_select")
+	if !ok {
+		return nil
+	}
+	options := []menuOption{}
+	seen := map[string]struct{}{}
+	for _, option := range menu.Options {
+		if option.Action != "language" {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(option.Language))
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		options = append(options, option)
+	}
+	return options
+}
+
+func (s *Service) hasMultipleLanguageSelectOptions() bool {
+	return len(s.configuredLanguageSelectOptions()) > 1
+}
+
+type ivrLanguageSegment struct {
+	LineKey  string
+	Language string
+}
+
+func (s *Service) configuredLanguageSegments() []ivrLanguageSegment {
+	segments := make([]ivrLanguageSegment, 0, len(s.configuredLanguageSelectOptions()))
+	for _, option := range s.configuredLanguageSelectOptions() {
+		segments = append(segments, ivrLanguageSegment{
+			LineKey:  normalizePromptLanguage(option.Language),
+			Language: option.Language,
+		})
+	}
+	return segments
+}
+
 func (s *Service) languageOptionsPrompt() string {
 	options := s.configuredEntryLanguageOptions()
 	if len(options) == 0 {
@@ -1321,7 +1441,7 @@ func (s *Service) servePromptAudio(writer http.ResponseWriter, request *http.Req
 		s.serveCachedAudio(writer, request, audio, format, status)
 		return
 	}
-	audio, err := s.cache.GetPromptWithPolicy(request.Context(), menuID, lineKey, promptValues, s.staticPromptPolicy(), false)
+	audio, err := s.cache.GetPromptWithPolicy(request.Context(), menuID, lineKey, promptValues, s.defaultPlaybackPolicy(), false)
 	if err != nil {
 		http.Error(writer, err.Error(), status)
 		return
@@ -1668,6 +1788,12 @@ func (s *Service) staticPromptPolicy() TTSProfile {
 	return policy
 }
 
+func (s *Service) defaultPlaybackPolicy() TTSProfile {
+	policy := s.staticPromptPolicy()
+	policy.ReaderID = ""
+	return policy
+}
+
 func (s *Service) staticPromptFingerprint(lines []staticPromptLine, policy TTSProfile) (string, error) {
 	hash := sha256.New()
 	hash.Write([]byte(fmt.Sprintf("v%d\n", staticPromptManifestVersion)))
@@ -1930,7 +2056,11 @@ func twimlGather(action string, numDigits string, finishOnKey string, timeout ti
 	}
 	builder.WriteString(`>`)
 	for _, play := range plays {
-		builder.WriteString(twimlPlay(play))
+		if strings.HasPrefix(strings.TrimSpace(play), "<") {
+			builder.WriteString(play)
+		} else {
+			builder.WriteString(twimlPlay(play))
+		}
 	}
 	builder.WriteString(`</Gather>`)
 	for _, item := range fallback {
@@ -1944,6 +2074,13 @@ func twimlPlay(url string) string {
 		return ""
 	}
 	return "<Play>" + html.EscapeString(strings.TrimSpace(url)) + "</Play>"
+}
+
+func twimlPause(seconds int) string {
+	if seconds <= 0 {
+		seconds = 1
+	}
+	return fmt.Sprintf("<Pause length=\"%d\"/>", seconds)
 }
 
 func twimlRedirect(url string) string {

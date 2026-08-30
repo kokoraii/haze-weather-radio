@@ -105,7 +105,7 @@ func (c *ProductCache) productCacheKey(location ResolvedLocation, packages []str
 	if policy.ExplicitLanguage && strings.TrimSpace(policy.Language) != "" {
 		language = strings.TrimSpace(policy.Language)
 	}
-	readerID := firstNonBlank(policy.ReaderID, c.cfg.IVR.DefaultReaderID)
+	readerID := c.cfg.resolveIVRReaderID(policy.ReaderID, language)
 	policy.ReaderID = readerID
 	readerFingerprint := c.cfg.ttsReaderFingerprint(readerID, language, "")
 	return cacheKey(location, packages, language, policy, readerFingerprint), packages, language, readerID, policy
@@ -223,6 +223,7 @@ func (c *ProductCache) GetTextPromptWithPolicy(ctx context.Context, menuID strin
 }
 
 func (c *ProductCache) getPromptAudio(ctx context.Context, menuID string, lineKey string, text string, policy TTSProfile, force bool) (CachedAudio, error) {
+	policy.ReaderID = c.cfg.resolveIVRReaderID(policy.ReaderID, policy.Language)
 	key := promptCacheKey(menuID, lineKey, text, policy, c.cfg.ttsReaderFingerprint(policy.ReaderID, policy.Language, ""))
 	if !force {
 		if cached, ok := c.readFreshAudio(key); ok {

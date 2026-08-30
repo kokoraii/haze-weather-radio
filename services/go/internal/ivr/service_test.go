@@ -210,30 +210,123 @@ func TestDisabledProvinceExtensionHangsUp(t *testing.T) {
 	}
 }
 
-func TestEntryDigitRejectsUnconfiguredLanguage(t *testing.T) {
+func TestLanguageSelectRejectsUnknownDigit(t *testing.T) {
 	cfg := loadedConfig{
 		BaseDir: t.TempDir(),
 		IVR: Config{
 			DefaultLanguage: "en-CA",
 		},
-		Feeds:   []feedXML{testFeedWithLanguages("sk-0001", "en-CA", "fr-CA")},
+		Feeds:   []feedXML{testFeedWithLanguages("sk-0001", "en-CA")},
 		Prompts: defaultPromptConfig(),
 	}
 	service := &Service{cfg: cfg}
 	service.cache = NewProductCache(cfg, nil)
 	service.broadcast = newBroadcastHub()
 
-	request := formRequest("http://ivr.test/ivr/v1/twiml?state=entry", url.Values{"Digits": {"3"}})
+	request := formRequest("http://ivr.test/ivr/v1/twiml?state=language_select", url.Values{"Digits": {"9"}})
 	response := httptest.NewRecorder()
-	service.handleEntryDigit(response, request)
+	service.handleLanguageSelectTwiML(response, request)
 
 	body := response.Body.String()
-	if !strings.Contains(body, "line=invalid_code") {
-		t.Fatalf("Spanish should be rejected when only English/French are configured: %s", body)
+	if !strings.Contains(body, "state=language_select") {
+		t.Fatalf("an unknown language digit should replay language select: %s", body)
 	}
 }
 
-func TestEntryStarStartsGeophysicalAlert(t *testing.T) {
+func TestInitialRequestShowsLanguageSelectWhenMultipleLanguages(t *testing.T) {
+	cfg := loadedConfig{
+		BaseDir: t.TempDir(),
+		IVR:     Config{DefaultLanguage: "en-CA"},
+		Feeds:   []feedXML{testFeedWithLanguages("sk-0001", "en-CA", "fr-CA", "es")},
+		Prompts: defaultPromptConfig(),
+	}
+	service := &Service{cfg: cfg}
+	service.cache = NewProductCache(cfg, nil)
+	service.broadcast = newBroadcastHub()
+
+	request := httptest.NewRequest(http.MethodGet, "http://ivr.test/ivr/v1/twiml", nil)
+	response := httptest.NewRecorder()
+	service.handleTwiML(response, request)
+
+	body := response.Body.String()
+	if !strings.Contains(body, "state=language_select") {
+		t.Fatalf("initial request with multiple languages should start language select: %s", body)
+	}
+	if strings.Contains(body, "state=entry") {
+		t.Fatalf("language select should be presented before entry: %s", body)
+	}
+}
+
+func TestInitialRequestShowsLanguageSelectWhenConfigDefinesMultipleOptions(t *testing.T) {
+	cfg := loadedConfig{
+		BaseDir: t.TempDir(),
+		IVR:     Config{DefaultLanguage: "en-CA"},
+		Feeds:   []feedXML{testFeedWithLanguages("sk-0001", "en-CA")},
+		Prompts: defaultPromptConfig(),
+	}
+	service := &Service{cfg: cfg}
+	service.cache = NewProductCache(cfg, nil)
+	service.broadcast = newBroadcastHub()
+
+	request := httptest.NewRequest(http.MethodGet, "http://ivr.test/ivr/v1/twiml", nil)
+	response := httptest.NewRecorder()
+	service.handleTwiML(response, request)
+
+	body := response.Body.String()
+	if !strings.Contains(body, "state=language_select") {
+		t.Fatalf("language select should be offered when ivr.xml defines multiple language options: %s", body)
+	}
+	if strings.Contains(body, "state=entry") {
+		t.Fatalf("language select should be presented before entry: %s", body)
+	}
+}
+
+func TestInitialRequestSkipsLanguageSelectWhenSingleOption(t *testing.T) {
+	cfg := loadedConfig{
+		BaseDir: t.TempDir(),
+		IVR:     Config{DefaultLanguage: "en-CA"},
+		Feeds:   []feedXML{testFeedWithLanguages("sk-0001", "en-CA")},
+		Prompts: singleOptionLanguageSelectConfig(),
+	}
+	service := &Service{cfg: cfg}
+	service.cache = NewProductCache(cfg, nil)
+	service.broadcast = newBroadcastHub()
+
+	request := httptest.NewRequest(http.MethodGet, "http://ivr.test/ivr/v1/twiml", nil)
+	response := httptest.NewRecorder()
+	service.handleTwiML(response, request)
+
+	body := response.Body.String()
+	if strings.Contains(body, "state=language_select") {
+		t.Fatalf("single-option language select should be skipped: %s", body)
+	}
+	if !strings.Contains(body, "state=entry") {
+		t.Fatalf("request should go straight to entry: %s", body)
+	}
+}
+
+func TestLanguageSelectDigitAdvancesToEntryWithLang(t *testing.T) {
+	cfg := loadedConfig{
+		BaseDir: t.TempDir(),
+		IVR:     Config{DefaultLanguage: "en-CA"},
+		Feeds:   []feedXML{testFeedWithLanguages("sk-0001", "en-CA", "fr-CA", "es")},
+		Prompts: defaultPromptConfig(),
+	}
+	service := &Service{cfg: cfg}
+	service.cache = NewProductCache(cfg, nil)
+	service.broadcast = newBroadcastHub()
+
+	request := formRequest("http://ivr.test/ivr/v1/twiml?state=language_select", url.Values{"Digits": {"2"}})
+	response := httptest.NewRecorder()
+	service.handleLanguageSelectTwiML(response, request)
+
+	body := response.Body.String()
+	if !strings.Contains(body, "state=entry") || !strings.Contains(body, "lang=fr-CA") {
+		t.Fatalf("language select digit 2 should advance to entry with French: %s", body)
+	}
+}
+
+func TestEntryStarReturnsToLocationSearchEntry(t *testing.T) {
 	cfg := loadedConfig{
 		BaseDir: t.TempDir(),
 		IVR:     Config{DefaultLanguage: "en-CA"},
@@ -249,8 +342,8 @@ func TestEntryStarStartsGeophysicalAlert(t *testing.T) {
 	service.handleEntryDigit(response, request)
 
 	body := response.Body.String()
-	if !strings.Contains(body, "/ivr/v1/audio") || !strings.Contains(body, "packages=geophysical_alert") {
-		t.Fatalf("entry star did not start geophysical alert product: %s", body)
+	if !strings.Contains(body, "state=location_code") {
+		t.Fatalf("entry star did not return to location search entry: %s", body)
 	}
 }
 
@@ -388,7 +481,7 @@ func TestLocationNumberStarReturnsSearchPlaceholder(t *testing.T) {
 	}
 }
 
-func TestEntryDigitFourIsInvalid(t *testing.T) {
+func TestEntryUnresolvableCodeIsInvalid(t *testing.T) {
 	cfg := loadedConfig{
 		BaseDir: t.TempDir(),
 		IVR:     Config{DefaultLanguage: "en-CA"},
@@ -399,20 +492,20 @@ func TestEntryDigitFourIsInvalid(t *testing.T) {
 	service.cache = NewProductCache(cfg, nil)
 	service.broadcast = recentBroadcastHub("sk-0001")
 
-	request := formRequest("http://ivr.test/ivr/v1/twiml?state=entry", url.Values{"Digits": {"4"}})
+	request := formRequest("http://ivr.test/ivr/v1/twiml?state=entry&lang=en-CA", url.Values{"Digits": {"99999"}})
 	response := httptest.NewRecorder()
 	service.handleEntryDigit(response, request)
 
 	body := response.Body.String()
 	if !strings.Contains(body, "line=invalid_code") {
-		t.Fatalf("entry digit 4 should be invalid after removing main-menu broadcast: %s", body)
+		t.Fatalf("unresolvable entry code should be rejected: %s", body)
 	}
 	if strings.Contains(body, "packages=") {
-		t.Fatalf("entry digit 4 should not start a product or broadcast flow: %s", body)
+		t.Fatalf("unresolvable entry code should not start a product or broadcast flow: %s", body)
 	}
 }
 
-func TestEntryDigitFiveIsInvalid(t *testing.T) {
+func TestEntryDigitRoutesToLocationSelection(t *testing.T) {
 	cfg := loadedConfig{
 		BaseDir: t.TempDir(),
 		IVR:     Config{DefaultLanguage: "en-CA"},
@@ -423,16 +516,16 @@ func TestEntryDigitFiveIsInvalid(t *testing.T) {
 	service.cache = NewProductCache(cfg, nil)
 	service.broadcast = recentBroadcastHub("sk-0001")
 
-	request := formRequest("http://ivr.test/ivr/v1/twiml?state=entry", url.Values{"Digits": {"5"}})
+	request := formRequest("http://ivr.test/ivr/v1/twiml?state=entry&lang=en-CA", url.Values{"Digits": {"4"}})
 	response := httptest.NewRecorder()
 	service.handleEntryDigit(response, request)
 
 	body := response.Body.String()
-	if !strings.Contains(body, "line=invalid_code") {
-		t.Fatalf("entry digit 5 should be invalid after moving geophysical alert to 0: %s", body)
+	if !strings.Contains(body, "state=location_number") && !strings.Contains(body, "state=location_code") {
+		t.Fatalf("entry digit should route into location selection: %s", body)
 	}
 	if strings.Contains(body, "packages=") {
-		t.Fatalf("entry digit 5 should not start a product flow: %s", body)
+		t.Fatalf("entry digit should not start a product flow: %s", body)
 	}
 }
 
@@ -965,4 +1058,13 @@ func testFeedWithLanguages(id string, languages ...string) feedXML {
 		}{Code: language})
 	}
 	return feed
+}
+
+func singleOptionLanguageSelectConfig() PromptConfig {
+	cfg := defaultPromptConfig()
+	menu := cfg.Menus["language_select"]
+	menu.Options = []menuOption{{Digit: "1", Action: "language", Language: "en-US", Next: "entry"}}
+	menu.Lines = []promptLine{{Key: "en-us", Text: "1 for English."}}
+	cfg.Menus["language_select"] = menu
+	return cfg
 }

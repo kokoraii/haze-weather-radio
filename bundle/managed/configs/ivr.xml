@@ -7,35 +7,32 @@
             sentence_silence="0.15"
             cache_ttl="24h">
     <line key="one_moment">One moment.</line>
-    <line key="enter_code">Enter your province, or enter a former Hello Weather location code.</line>
+    <line key="enter_code">Please enter your location code, or press asterisk to search for your location.</line>
     <line key="no_entry">No entry was received. Goodbye.</line>
     <line key="goodbye">Goodbye.</line>
   </defaults>
 
   <menu id="language_select" timeout="8s" retries="2">
-    <option digit="1" action="language" language="en-US" next="entry">
-      <line key="main">1 for English.</line>
-    </option>
-    <option digit="1" action="language" language="en-US" next="entry">
-      <line key="main">deux pour le français.</line>
-    </option>
-    <option digit="1" action="language" language="en-US" next="entry">
-      <line key="main">tres para español.</line>
-    </option>
+    <line key="en-us">1 for English.</line>
+    <line key="fr-ca" language="fr-CA">deux pour le français.</line>
+    <line key="es" language="es">tres para español.</line>
+    <option digit="1" action="language" language="en-US" next="entry"/>
+    <option digit="2" action="language" language="fr-CA" next="entry"/>
+    <option digit="3" action="language" language="es" next="entry"/>
   </menu>
 
   <menu id="entry" timeout="8s" retries="2">
     <line key="greeting">You have reached {extension_telephone_service_name}.</line>
-    <line key="main">{language_options}, or press star for your NOAA Geophysical Alert Message.</line>
-    <line key="main_single_language">Enter your province, or enter a former Hello Weather location code.</line>
+    <line key="main">Enter your province, or enter a former Hello Weather location code, or press star to search for a location. For your NOAA Geophysical Alert Message, press 0.</line>
+    <line key="main_single_language">Enter your province, or enter a former Hello Weather location code, or press star to search for a location. For your NOAA Geophysical Alert Message, press 0.</line>
     <option digit="0" action="product" packages="geophysical_alert"/>
-    <option digit="*" action="product" packages="geophysical_alert"/>
+    <option digit="*" action="search"/>
   </menu>
 
 
 
   <menu id="location_code" timeout="10s" retries="2">
-    <line key="main">Enter your province, or enter a former Hello Weather location code.</line>
+    <line key="main">Enter your province, or enter a former Hello Weather location code, or press star to search for a location. For your NOAA Geophysical Alert Message, press 0.</line>
   </menu>
 
   <menu id="location_number" timeout="8s" retries="2">

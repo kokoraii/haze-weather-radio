@@ -24,9 +24,9 @@ func TestLoadPromptConfigParsesMenusAndOverrides(t *testing.T) {
 	if text != "You have reached Saskatoon." {
 		t.Fatalf("location prompt = %q", text)
 	}
-	entry, ok := cfg.Option("entry", "1")
-	if !ok || entry.Action != "language" || entry.Language != "en-US" {
-		t.Fatalf("entry option = %+v ok=%v", entry, ok)
+	entry, ok := cfg.Option("language_select", "1")
+	if !ok || entry.Action != "language" || entry.Language != "en-US" || entry.Next != "entry" {
+		t.Fatalf("language_select option = %+v ok=%v", entry, ok)
 	}
 	weather := cfg.TTSForMenu("weather_product")
 	if weather.Provider != "piper" || weather.CacheTTL != 5*time.Minute {
@@ -111,10 +111,14 @@ func validPromptXML() string {
   <menu id="entry">
     <line key="main">Entry.</line>
     <line key="main_single_language">Entry single language.</line>
-    <option digit="1" action="language" language="en-US" next="location_code"/>
+    <option digit="0" action="product" packages="geophysical_alert"/>
+    <option digit="*" action="product" packages="geophysical_alert"/>
   </menu>
   <menu id="language_select">
-    <line key="main">Language.</line>
+    <line key="en-us">1 for English.</line>
+    <line key="fr-ca" language="fr-CA">deux pour le français.</line>
+    <option digit="1" action="language" language="en-US" next="entry"/>
+    <option digit="2" action="language" language="fr-CA" next="entry"/>
   </menu>
   <menu id="location_code">
     <line key="main">Enter code.</line>

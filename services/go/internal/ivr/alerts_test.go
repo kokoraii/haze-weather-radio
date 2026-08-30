@@ -137,7 +137,7 @@ func TestIVRAlertMenuSortsMostCriticalAlertsFirst(t *testing.T) {
 	}
 }
 
-func TestIVRAlertReadoutCollapsesVeryLargeAreaLists(t *testing.T) {
+func TestIVRAlertReadoutDropsLargeAreaLists(t *testing.T) {
 	service := &Service{cfg: loadedConfig{Prompts: defaultPromptConfig()}}
 	info := capmodel.AlertInfo{
 		Language:    "en-CA",
@@ -167,11 +167,20 @@ func TestIVRAlertReadoutCollapsesVeryLargeAreaLists(t *testing.T) {
 		Info: info,
 	})
 
-	if !strings.Contains(text, "for Saskatoon area") {
-		t.Fatalf("large area list was not collapsed to location area:\n%s", text)
+	if strings.Contains(text, "for Saskatoon area") {
+		t.Fatalf("location area leaked into IVR readout:\n%s", text)
 	}
-	if strings.Count(text, "Very Long Broad Watch Area") > 1 {
-		t.Fatalf("large area list leaked into IVR readout:\n%s", text)
+	if strings.Contains(text, "Very Long Broad Watch Area") {
+		t.Fatalf("area list leaked into IVR readout:\n%s", text)
+	}
+	if !strings.Contains(text, "has issued a") {
+		t.Fatalf("missing issued phrasing:\n%s", text)
+	}
+	if !strings.Contains(text, "Conditions are favourable for severe thunderstorms.") {
+		t.Fatalf("missing description:\n%s", text)
+	}
+	if !strings.Contains(text, "Monitor alerts and forecasts.") {
+		t.Fatalf("missing instruction:\n%s", text)
 	}
 }
 
@@ -194,7 +203,7 @@ func TestIVRAlertReadoutKeepsIncompleteForecastRegions(t *testing.T) {
 	}
 }
 
-func TestIVRConvectiveWarningsBypassForecastRegionCollapse(t *testing.T) {
+func TestIVRAlertReadoutDropsRawAlertAreas(t *testing.T) {
 	service := ivrForecastCollapseTestService()
 	for _, event := range []string{"Severe Thunderstorm Warning", "Tornado Warning"} {
 		info := ivrForecastCollapseTestInfo(event)
@@ -207,9 +216,64 @@ func TestIVRConvectiveWarningsBypassForecastRegionCollapse(t *testing.T) {
 		if strings.Contains(text, "areas in and around Outlook") {
 			t.Fatalf("%s used forecast-region collapse:\n%s", event, text)
 		}
-		if !strings.Contains(text, "R.M. of Fertile Valley") || !strings.Contains(text, "R.M. of Rudy") {
-			t.Fatalf("%s did not preserve raw alert locations:\n%s", event, text)
+		if strings.Contains(text, "R.M. of Fertile Valley") || strings.Contains(text, "R.M. of Rudy") {
+			t.Fatalf("%s leaked raw alert areas:\n%s", event, text)
 		}
+		if !strings.Contains(text, "has issued a") {
+			t.Fatalf("%s missing issued phrasing:\n%s", event, text)
+		}
+		if !strings.Contains(text, "Hazardous weather is occurring.") {
+			t.Fatalf("%s missing description:\n%s", event, text)
+		}
+	}
+}
+
+func TestIVRAlertReadoutCompactFormat(t *testing.T) {
+	service := &Service{cfg: loadedConfig{Prompts: defaultPromptConfig()}}
+	info := capmodel.AlertInfo{
+		Language:    "en-CA",
+		Event:       "Air Quality Advisory",
+		Headline:    "Yellow Advisory - Air Quality - in effect",
+		Severity:    "Minor",
+		Urgency:     "Expected",
+		Certainty:   "Likely",
+		SenderName:  "Environment and Climate Change Canada",
+		Description: "High levels of air pollution have developed.",
+		Instruction: "Consider reducing outdoor exertion.",
+		Onset:       "2099-07-02T18:00:00-06:00",
+		Expires:     "2099-07-02T23:00:00-06:00",
+		Parameters: []capmodel.NameValue{
+			{Name: "layer:EC-MSC-SMC:1.1:MSC_Confidence", Value: "High"},
+			{Name: "layer:EC-MSC-SMC:1.1:MSC_Impact", Value: "Moderate"},
+		},
+	}
+	text := service.alertReadoutText(ivrTestLocation(), ivrActiveAlert{
+		ID:    "aqa",
+		Title: "Yellow Advisory - Air Quality",
+		Alert: capmodel.Alert{
+			Identifier:  "aqa",
+			Sender:      "ecweather@canada.ca",
+			Sent:        "2099-07-02T12:00:00-06:00",
+			MessageType: "Alert",
+			Infos:       []capmodel.AlertInfo{info},
+		},
+		Info: info,
+	})
+
+	if !strings.HasPrefix(text, "Environment and Climate Change Canada has issued a Yellow Advisory - Air Quality beginning at") {
+		t.Fatalf("unexpected intro:\n%s", text)
+	}
+	if !strings.Contains(text, "ending at ") {
+		t.Fatalf("missing expiry clause:\n%s", text)
+	}
+	if !strings.Contains(text, "with high forecast confidence and moderate impact.") {
+		t.Fatalf("missing confidence/impact clause:\n%s", text)
+	}
+	if !strings.Contains(text, "High levels of air pollution have developed.") {
+		t.Fatalf("missing description:\n%s", text)
+	}
+	if !strings.Contains(text, "Consider reducing outdoor exertion.") {
+		t.Fatalf("missing instruction:\n%s", text)
 	}
 }
 

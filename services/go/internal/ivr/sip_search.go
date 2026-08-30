@@ -197,7 +197,7 @@ func (c *sipCall) playSearchPrompt(menuID string, lineKey string, values map[str
 	audio, ok := c.service.staticPromptAudio(menuID, lineKey, promptValues)
 	if !ok {
 		var err error
-		audio, err = c.service.cache.GetPromptWithPolicy(c.ctx, menuID, lineKey, promptValues, c.service.staticPromptPolicy(), false)
+		audio, err = c.service.cache.GetPromptWithPolicy(c.ctx, menuID, lineKey, promptValues, c.service.defaultPlaybackPolicy(), false)
 		if err != nil {
 			log.Printf("IVR SIP search prompt unavailable: %v", err)
 			return sipSearchInput{}

@@ -209,17 +209,22 @@ func defaultPromptConfig() PromptConfig {
 		},
 		Menus: []promptMenu{
 			{ID: "entry", Lines: []promptLine{
-				{Key: "main", Text: "This is the {telephone_service_name}. {language_options}, or press star for your NOAA Geophysical Alert Message."},
-				{Key: "main_single_language", Text: "Enter your province, or enter a former Hello Weather location code."},
+				{Key: "main", Text: "Enter your province, or enter a former Hello Weather location code, or press star to search for a location. For your NOAA Geophysical Alert Message, press 0."},
+				{Key: "main_single_language", Text: "Enter your province, or enter a former Hello Weather location code, or press star to search for a location. For your NOAA Geophysical Alert Message, press 0."},
 			}, Options: []menuOption{
-				{Digit: "1", Action: "language", Language: "en-US", Next: "location_code"},
-				{Digit: "2", Action: "language", Language: "fr-CA", Next: "location_code"},
-				{Digit: "3", Action: "language", Language: "es", Next: "location_code"},
 				{Digit: "0", Action: "product", Packages: "geophysical_alert"},
-				{Digit: "*", Action: "product", Packages: "geophysical_alert"},
+				{Digit: "*", Action: "search"},
 			}},
-			{ID: "language_select", Lines: []promptLine{{Key: "main", Text: "1 for English. 2 for French. 3 for Spanish."}}},
-			{ID: "location_code", Lines: []promptLine{{Key: "main", Text: "Enter your province, or enter a former Hello Weather location code."}}},
+			{ID: "language_select", Lines: []promptLine{
+				{Key: "en-us", Text: "1 for English."},
+				{Key: "fr-ca", Language: "fr-CA", Text: "deux pour le français."},
+				{Key: "es", Language: "es", Text: "tres para español."},
+			}, Options: []menuOption{
+				{Digit: "1", Action: "language", Language: "en-US", Next: "entry"},
+				{Digit: "2", Action: "language", Language: "fr-CA", Next: "entry"},
+				{Digit: "3", Action: "language", Language: "es", Next: "entry"},
+			}},
+			{ID: "location_code", Lines: []promptLine{{Key: "main", Text: "Enter your province, or enter a former Hello Weather location code, or press star to search for a location. For your NOAA Geophysical Alert Message, press 0."}}},
 			{ID: "location_number", Lines: []promptLine{
 				{Key: "main", Text: "Enter your location number. Press star to search for a location."},
 				{Key: "search_unavailable", Text: "Location search is not available yet."},

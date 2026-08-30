@@ -225,25 +225,25 @@ services:
           - port: 5060
           - port: 5080
             domain: "sip.teleweather.ca"
-        public_host: "71.17.68.130"
+        public_host: "216.197.174.33"
         allowed_sources: []
         auth:
           enabled: false
           username: "haze"
           password_env: HAZE_IVR_SIP_PASSWORD
         registration:
-          enabled: false
-          server: ""
-          domain: ""
-          register_uri: ""
-          username: ""
-          auth_username: ""
+          enabled: true
+          server: "teleweather-canada-292bec977cbe.sip.signalwire.com"
+          domain: "teleweather-canada-292bec977cbe.sip.signalwire.com"
+          register_uri: "tollfreef@teleweather-canada-292bec977cbe.sip.signalwire.com"
+          username: "tollfreef"
+          auth_username: "tollfreef"
           password_env: HAZE_IVR_SIP_REGISTER_PASSWORD
-          from_user: ""
+          from_user: "tollfreef"
           contact_user: ""
           contact_host: ""
           via_host: ""
-          user_agent: ""
+          user_agent: "Haze Unified Alerting Platform"
           supported_path: false
           expires: 120
           retry_seconds: 30
@@ -328,7 +328,7 @@ services:
       ttl_seconds: 60
       records:
         - name: "internal.rai.blue"
-          address: "172.16.1.38"
+          address: "192.168.1.21"
 
 logging:
   level: INFO
@@ -383,8 +383,8 @@ playout:
 
 operator:
   on_air_name: [
-    text: "Canada RadioMET",
-    pronunciation: "all hazards, canada radio met"
+    text: "Canadian Weather Radio Service",
+    pronunciation: "Canadian Weather Radio Service"
   ]
   telephone_name: [
     text: "TeleWeather",
@@ -488,7 +488,7 @@ webpanel:
     trusted_proxy_cidrs:
       - 127.0.0.0/8
       - ::1/128
-      - 172.16.1.31/32 # Servinor Zoraxy reverse proxy.
+      - 192.168.1.21/32 # Servinor Zoraxy reverse proxy.
     login_cidr_allowlist: [] # Empty allows any source. Add operator networks when their public ranges are stable.
     secure_cookies: true # Account mode always enforces Secure cookies and HTTPS.
     max_audio_upload_bytes: 52428800

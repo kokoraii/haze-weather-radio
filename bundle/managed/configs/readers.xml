@@ -1,17 +1,64 @@
 <Readers>
-    <reader id="00" provider="piper">
+    <reader id="00" provider="speakyapi">
         <gender>male</gender>
         <language>en-US</language>
-        <voice_id>en_US-hfc_male-medium</voice_id>
+        <voice_id>Vocalizer Tom - Claro</voice_id>
     </reader>
-    <reader id="01" provider="piper">
+    <reader id="01" provider="speakyapi">
         <gender>female</gender>
         <language>en-US</language>
-        <voice_id>en_US-lessac-low</voice_id>
+        <voice_id>VE_American_English_Ava_22kHz</voice_id>
+    </reader>
+    <reader id="02" provider="speakyapi">
+        <gender>male</gender>
+        <language>fr-CA</language>
+        <voice_id>VE_Canadian_French_Nicolas_22kHz</voice_id>
+    </reader>
+    <reader id="03" provider="speakyapi">
+        <gender>female</gender>
+        <language>fr-CA</language>
+        <voice_id>VE_Canadian_French_Chantal_22kHz</voice_id>
+    </reader>
+    <reader id="04" provider="piper">
+        <gender>male</gender>
+        <language>es-MX</language>
+        <voice_id>es_MX-ald-medium</voice_id>
     </reader>
     <reader id="HAHAFUNNYTIKTOKVOICE" provider="kokoro">
         <gender>male</gender>
         <language>en-US</language>
         <voice_id>11</voice_id>
+    </reader>
+    <reader id="000" provider="piper">
+        <gender>male</gender>
+        <language>en-US</language>
+        <voice_id>en_US-hfc_male-medium</voice_id>
+        <backup>
+            <reader>00</reader>
+        </backup>
+    </reader>
+    <reader id="001" provider="piper">
+        <gender>female</gender>
+        <language>en-US</language>
+        <voice_id>en_US-lessac-low</voice_id>
+        <backup>
+            <reader>01</reader>
+        </backup>
+    </reader>
+    <reader id="002" provider="piper">
+        <gender>male</gender>
+        <language>fr-CA</language>
+        <voice_id>fr_FR-gilles-low</voice_id>
+        <backup>
+            <reader>02</reader>
+        </backup>
+    </reader>
+    <reader id="003" provider="piper">
+        <gender>female</gender>
+        <language>fr-CA</language>
+        <voice_id>fr_FR-siwis-medium</voice_id>
+        <backup>
+            <reader>03</reader>
+        </backup>
     </reader>
 </Readers>

@@ -1103,7 +1103,7 @@ func TestCollectLocationInputWaitsForLongerHelloWeatherShortCode(t *testing.T) {
 	}
 }
 
-func TestCollectLocationInputStarSelectsGeophysical(t *testing.T) {
+func TestCollectLocationInputStarSelectsSearch(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	call := &sipCall{
@@ -1111,9 +1111,9 @@ func TestCollectLocationInputStarSelectsGeophysical(t *testing.T) {
 		digits:  make(chan string, 1),
 		service: &Service{cfg: loadedConfig{IVR: Config{DigitTimeoutSeconds: 1}}},
 	}
-	code, geophysical, ok := call.collectLocationInput(time.Second, "*")
-	if !ok || !geophysical || code != "" {
-		t.Fatalf("code=%q geophysical=%v ok=%v", code, geophysical, ok)
+	code, search, ok := call.collectLocationInput(time.Second, "*")
+	if !ok || !search || code != "" {
+		t.Fatalf("code=%q search=%v ok=%v", code, search, ok)
 	}
 }
 

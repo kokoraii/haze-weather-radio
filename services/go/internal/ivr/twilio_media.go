@@ -477,7 +477,7 @@ func (connection *twilioMediaConnection) sendConfiguredPrompt(ctx context.Contex
 	audio, ok := connection.service.staticPromptAudio(menuID, lineKey, values)
 	if !ok {
 		var err error
-		audio, err = connection.service.cache.GetPromptWithPolicy(ctx, menuID, lineKey, values, connection.service.staticPromptPolicy(), false)
+		audio, err = connection.service.cache.GetPromptWithPolicy(ctx, menuID, lineKey, values, connection.service.defaultPlaybackPolicy(), false)
 		if err != nil {
 			return "", err
 		}

@@ -31,6 +31,14 @@
     <LogAdminAlerts>true</LogAdminAlerts>
     <WebhookURL>${HAZE_DISCORD_WEBHOOK_CWXR_AB}</WebhookURL>
   </Webhook>
+  <Webhook enabled="true" feed-id="cwxr-ab03">
+    <EmbedAudio enabled="true" codec="libopus" />
+    <Username>Edmonton WXR</Username>
+    <IconURL></IconURL>
+    <LogTestAlerts>true</LogTestAlerts>
+    <LogAdminAlerts>true</LogAdminAlerts>
+    <WebhookURL>${HAZE_DISCORD_WEBHOOK_CWXR_AB}</WebhookURL>
+  </Webhook>
   <Webhook enabled="true" feed-id="cwxr-mb01">
     <EmbedAudio enabled="true" codec="libopus" />
     <Username>Winnipeg WXR</Username>
@@ -46,5 +54,37 @@
     <LogTestAlerts>true</LogTestAlerts>
     <LogAdminAlerts>true</LogAdminAlerts>
     <WebhookURL>${HAZE_DISCORD_WEBHOOK_CWXR_QC}</WebhookURL>
+  </Webhook>
+  <Webhook enabled="true" feed-id="cwxr-qc02">
+    <EmbedAudio enabled="true" codec="libopus" />
+    <Username>Trois-Rivières WXR</Username>
+    <IconURL></IconURL>
+    <LogTestAlerts>true</LogTestAlerts>
+    <LogAdminAlerts>true</LogAdminAlerts>
+    <WebhookURL>${HAZE_DISCORD_WEBHOOK_CWXR_QC}</WebhookURL>
+  </Webhook>
+  <Webhook enabled="true" feed-id="cwxr-on01">
+    <EmbedAudio enabled="true" codec="libopus" />
+    <Username>Toronto WXR</Username>
+    <IconURL></IconURL>
+    <LogTestAlerts>true</LogTestAlerts>
+    <LogAdminAlerts>true</LogAdminAlerts>
+    <WebhookURL>${HAZE_DISCORD_WEBHOOK_CWXR_ON}</WebhookURL>
+  </Webhook>
+  <Webhook enabled="true" feed-id="cwxr-on02">
+    <EmbedAudio enabled="true" codec="libopus" />
+    <Username>Kitchener WXR</Username>
+    <IconURL></IconURL>
+    <LogTestAlerts>true</LogTestAlerts>
+    <LogAdminAlerts>true</LogAdminAlerts>
+    <WebhookURL>${HAZE_DISCORD_WEBHOOK_CWXR_ON}</WebhookURL>
+  </Webhook>
+  <Webhook enabled="true" feed-id="cwxr-nb01">
+    <EmbedAudio enabled="true" codec="libopus" />
+    <Username>Fredericton WXR</Username>
+    <IconURL></IconURL>
+    <LogTestAlerts>true</LogTestAlerts>
+    <LogAdminAlerts>true</LogAdminAlerts>
+    <WebhookURL>${HAZE_DISCORD_WEBHOOK_CWXR_ATLANTIC}</WebhookURL>
   </Webhook>
 </Webhooks>

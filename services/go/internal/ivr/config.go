@@ -877,6 +877,21 @@ func (cfg loadedConfig) ttsReaderFingerprint(readerID string, language string, g
 	}, "|")
 }
 
+func (cfg loadedConfig) resolveIVRReaderID(requested string, language string) string {
+	requested = strings.TrimSpace(requested)
+	if requested != "" {
+		return requested
+	}
+	readers, err := ttspkg.LoadReaders(cfg.ttsReadersPath())
+	if err != nil {
+		return strings.TrimSpace(cfg.IVR.DefaultReaderID)
+	}
+	if reader, ok := ttspkg.SelectReader(readers, "", language, ""); ok {
+		return reader.ID
+	}
+	return strings.TrimSpace(cfg.IVR.DefaultReaderID)
+}
+
 func (cfg loadedConfig) cacheTTL() time.Duration {
 	ttl, err := time.ParseDuration(cfg.IVR.Cache.TTL)
 	if err != nil || ttl <= 0 {

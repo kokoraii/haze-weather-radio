@@ -2877,7 +2877,15 @@ fn realtime_chunks_due(media_remainder: &mut Duration, elapsed: Duration) -> (us
     let chunk_interval = Duration::from_millis(u64::from(PCM_CHUNK_MS));
     let available = media_remainder.saturating_add(elapsed);
     *media_remainder = Duration::ZERO;
-    (1, available.saturating_sub(chunk_interval))
+    let late_by = available.saturating_sub(chunk_interval);
+    // Tokio replays short missed intervals immediately. Treating normal scheduler
+    // jitter as dropped audio made the playout source run permanently slow.
+    let dropped = if late_by >= realtime_lag_warn_backlog() {
+        late_by
+    } else {
+        Duration::ZERO
+    };
+    (1, dropped)
 }
 
 fn pcm_frame_count(bytes: usize, channels: u16) -> u64 {
@@ -2900,7 +2908,7 @@ fn sample_frames_to_ns(frames: u64, sample_rate: u32) -> u64 {
 }
 
 fn realtime_tick_missed_behavior() -> MissedTickBehavior {
-    MissedTickBehavior::Skip
+    MissedTickBehavior::Burst
 }
 
 fn pcm_publish_queue_capacity() -> usize {
@@ -6438,18 +6446,18 @@ mod tests {
     }
 
     #[test]
-    fn realtime_tick_drops_short_scheduler_stalls_without_bursting() {
+    fn realtime_tick_preserves_short_scheduler_stalls_for_burst_recovery() {
         let mut remainder = Duration::ZERO;
 
         let (chunks, dropped) = realtime_chunks_due(&mut remainder, Duration::from_millis(70));
 
         assert_eq!(chunks, 1);
-        assert_eq!(dropped, Duration::from_millis(50));
+        assert_eq!(dropped, Duration::ZERO);
         assert_eq!(remainder, Duration::ZERO);
     }
 
     #[test]
-    fn realtime_tick_drops_repeated_jitter_without_bursting_media() {
+    fn realtime_tick_preserves_short_scheduler_jitter_for_burst_recovery() {
         let mut remainder = Duration::ZERO;
 
         let (first_chunks, first_dropped) =
@@ -6458,9 +6466,9 @@ mod tests {
             realtime_chunks_due(&mut remainder, Duration::from_millis(30));
 
         assert_eq!(first_chunks, 1);
-        assert_eq!(first_dropped, Duration::from_millis(10));
+        assert_eq!(first_dropped, Duration::ZERO);
         assert_eq!(second_chunks, 1);
-        assert_eq!(second_dropped, Duration::from_millis(10));
+        assert_eq!(second_dropped, Duration::ZERO);
         assert_eq!(remainder, Duration::ZERO);
     }
 
@@ -6492,7 +6500,7 @@ mod tests {
     }
 
     #[test]
-    fn realtime_ticker_skips_missed_ticks() {
-        assert_eq!(realtime_tick_missed_behavior(), MissedTickBehavior::Skip);
+    fn realtime_ticker_replays_short_missed_ticks() {
+        assert_eq!(realtime_tick_missed_behavior(), MissedTickBehavior::Burst);
     }
 }

@@ -333,25 +333,65 @@ func ivrAlertMenuLabel(alert ivrActiveAlert) string {
 
 func (s *Service) alertReadoutText(location ResolvedLocation, alert ivrActiveAlert) string {
 	info := alert.Info
-	areas := ivrAlertAreaNames(info)
-	areaText := alerttext.JoinParts(areas)
-	if !alerttext.BypassForecastRegionCollapse(info) {
-		if collapsed := s.ivrForecastRegionAreaText(location, info); collapsed != "" {
-			areaText = collapsed
-		} else if len(areas) > 6 || len(areaText) > 360 {
-			areaText = spokenLocationName(location) + " area"
-		}
+	sender := firstNonBlank(info.SenderName, alert.Alert.Sender, "Environment and Climate Change Canada")
+	subject := firstNonBlank(alerttext.AlertSubject(info), info.Event, alert.Title, "Alert")
+	timezone := firstNonBlank(location.Timezone, "UTC")
+	now := time.Now().UTC()
+
+	verb := "issued"
+	switch {
+	case alerttext.IsCAPEnded(alert.Alert, now):
+		verb = "ended"
+	case strings.EqualFold(alert.Alert.MessageType, "Cancel"):
+		verb = "cancelled"
+	case strings.EqualFold(alert.Alert.MessageType, "Update"):
+		verb = "updated"
 	}
-	text := alerttext.BuildCAPAlertText(alerttext.CAPMessageRequest{
-		Alert:     alert.Alert,
-		Info:      info,
-		AreaText:  areaText,
-		Sender:    firstNonBlank(info.SenderName, alert.Alert.Sender),
-		EventName: firstNonBlank(alerttext.AlertSubject(info), info.Event, alert.Title),
-		Timezone:  firstNonBlank(location.Timezone, "UTC"),
-		Now:       time.Now().UTC(),
-		UpdatedAt: alert.UpdatedAt,
-	})
+
+	intro := fmt.Sprintf("%s has %s a %s", sender, verb, subject)
+
+	onset := alerttext.ParseCAPTime(firstNonBlank(info.Onset, info.Effective))
+	expires := alerttext.ParseCAPTime(info.Expires)
+	var times []string
+	if !onset.IsZero() {
+		times = append(times, "beginning at "+alerttext.ReportTime(onset.Format(time.RFC3339), timezone))
+	}
+	if !expires.IsZero() {
+		times = append(times, "ending at "+alerttext.ReportTime(expires.Format(time.RFC3339), timezone))
+	}
+	if len(times) > 0 {
+		intro += " " + strings.Join(times, " and ")
+	}
+
+	confidence := strings.ToLower(firstNonBlank(
+		alerttext.CAPParam(info, "layer:EC-MSC-SMC:1.1:MSC_Confidence"),
+		alerttext.CAPParam(info, "layer:EC-MSC-SMC:1.0:MSC_Confidence"),
+	))
+	impact := strings.ToLower(firstNonBlank(
+		alerttext.CAPParam(info, "layer:EC-MSC-SMC:1.1:MSC_Impact"),
+		alerttext.CAPParam(info, "layer:EC-MSC-SMC:1.0:MSC_Impact"),
+		alerttext.CAPParam(info, "impact"),
+	))
+	var confidenceParts []string
+	if confidence != "" {
+		confidenceParts = append(confidenceParts, confidence+" forecast confidence")
+	}
+	if impact != "" {
+		confidenceParts = append(confidenceParts, impact+" impact")
+	}
+	if len(confidenceParts) > 0 {
+		intro += " with " + strings.Join(confidenceParts, " and ")
+	}
+	intro += "."
+
+	parts := []string{intro}
+	if description := alerttext.CleanAlertText(info.Description); description != "" {
+		parts = append(parts, description)
+	}
+	if instruction := alerttext.CleanAlertText(info.Instruction); instruction != "" {
+		parts = append(parts, instruction)
+	}
+	text := strings.Join(parts, " ")
 	if strings.TrimSpace(text) == "" {
 		return firstNonBlank(info.Description, info.Headline, alert.Title, "Alert details are not available.")
 	}
