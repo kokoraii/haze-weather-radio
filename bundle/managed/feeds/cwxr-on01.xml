@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed enabled="true" timezone="America/Toronto">
+
+    <playout routine="true" same="true" same_originator="EAS"/>
+
+    <alerts>
+      <cap_cp enabled="true">
+        <filter use_feed_locations="true" coverage_mode="polygon_first">
+          <blocklist>
+            <severity>Minor</severity>
+            <severity>Unknown</severity>
+            <certainty>Unknown</certainty>
+            <certainty>Past</certainty>
+            <naads_event>fog</naads_event>
+            <other value_name="layer:EC-MSC-SMC:1.0:Alert_Type" value="advisory"/>
+          </blocklist>
+        </filter>
+      </cap_cp>
+      <nws_cap enabled="false"/>
+    </alerts>
+
+    <languages>
+      <lang code="en-US" interval="0"/>
+      <!-- <lang code="fr-CA" interval="0"/> -->
+    </languages>
+
+    <description>
+      <lang code="en-US"
+            text="This service is operated by a joint effort between Sherwood Weather, and the Haze Weather Radio open source project."
+            suffix="We do not imply any association with Environment Canada."/>
+    </description>
+
+    <locations>
+      <coverage>
+        <region id="043100" source="eccc" derive_forecast="on-143"/>
+        <region id="046600" source="eccc" derive_forecast="on-4"/>
+        <region id="043200" source="eccc" derive_forecast="on-85"/>
+        <region id="046100" source="eccc" derive_forecast="on-77"/>
+      </coverage>
+
+      <observationLocations>
+        <location id="on-143" source="eccc"/>
+        <location id="on-77" source="eccc"/>
+        <location id="on-24" source="eccc"/>
+        <location id="on-64" source="eccc"/>
+        <location id="on-59" source="eccc"/>
+        <location id="on-4" source="eccc"/>
+        <location id="on-54" source="eccc"/>
+        <location id="on-107" source="eccc"/>
+        <location id="on-109" source="eccc"/>
+        <location id="on-125" source="eccc"/>
+        <location id="on-47" source="eccc"/>
+      </observationLocations>
+
+      <airQualityLocations>
+        <location id="FCWYG" source="eccc"/>
+        <location id="FEAKO" source="eccc"/>
+        <location id="FDQBU" source="eccc"/>
+      </airQualityLocations>
+
+      <climateLocations>
+        <location id="VSON143V" source="eccc"/>
+      </climateLocations>
+
+      <marineForecastLocations>
+        <subregion id="m0000144" source="eccc"/>
+      </marineForecastLocations>
+
+      <marineConditions>
+        <location id="CXTO" source="eccc"/>
+        <location id="CYTZ" source="eccc"/>
+        <location id="CWWB" source="eccc"/>
+        <location id="CWWZ" source="eccc"/>
+        <location id="CXVN" source="eccc"/>
+        <location id="CXHM" source="eccc"/>
+        <location id="CYSM" source="eccc"/>
+      </marineConditions>
+
+    </locations>
+
+    <transmitter_metadata>
+      <transmitter>
+        <site_name>Toronto</site_name>
+        <callsign>XMJ225</callsign>
+        <relationship>primary</relationship>
+        <frequency_mhz>162.400</frequency_mhz>
+      </transmitter>
+    </transmitter_metadata>
+
+  </feed>

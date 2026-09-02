@@ -10,7 +10,7 @@ import (
 	"strings"
 )
 
-const defaultFeedsFile = "managed/configs/feeds.xml"
+const defaultFeedsFile = "managed/feeds"
 
 var feedIDCleaner = regexp.MustCompile(`[^a-zA-Z0-9_.:-]+`)
 
@@ -209,6 +209,20 @@ func feedsControlPath(configPath string) (string, string, error) {
 }
 
 func readAdminFeedsXML(path string) (adminFeedsXML, error) {
+	if info, err := os.Stat(filepath.Clean(path)); err == nil && info.IsDir() {
+		entries, err := os.ReadDir(filepath.Clean(path)); if err != nil { return adminFeedsXML{}, err }
+		parsed := adminFeedsXML{}
+		for _, entry := range entries {
+			if entry.IsDir() || strings.ToLower(filepath.Ext(entry.Name())) != ".xml" { continue }
+			raw, err := os.ReadFile(filepath.Join(path, entry.Name())); if err != nil { return adminFeedsXML{}, err }
+			var feed adminFeedXML; if err := xml.Unmarshal(raw, &feed); err != nil { return adminFeedsXML{}, err }
+			if strings.TrimSpace(feed.ID) == "" { feed.ID = strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name())) }
+			parsed.Feeds = append(parsed.Feeds, feed)
+		}
+		feeds, err := normalizeAdminFeeds(parsed.Feeds); if err != nil { return adminFeedsXML{}, err }
+		parsed.Feeds = feeds
+		return parsed, nil
+	}
 	raw, err := os.ReadFile(filepath.Clean(path))
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -234,6 +248,14 @@ func writeAdminFeedsXML(path string, config adminFeedsXML) error {
 		return err
 	}
 	config.Feeds = feeds
+	if info, err := os.Stat(filepath.Clean(path)); err == nil && info.IsDir() {
+		for _, feed := range feeds {
+			name := cleanFeedControlID(feed.ID) + ".xml"
+			raw, err := xml.MarshalIndent(feed, "", "  "); if err != nil { return err }
+			if err := os.WriteFile(filepath.Join(path, name), []byte(xml.Header+string(raw)+"\n"), 0o600); err != nil { return err }
+		}
+		return nil
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}

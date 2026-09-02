@@ -1,13 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<feeds>
-
-  <feed id="sk-0001" enabled="true" timezone="America/Regina">
+<feed enabled="true" timezone="America/Regina">
 
     <playout routine="true" same="true" same_originator="EAS"/>
 
     <alerts>
       <cap_cp enabled="true">
-        <filter use_feed_locations="true">
+        <filter use_feed_locations="true" coverage_mode="polygon_first">
           <blocklist>
             <severity>Minor</severity>
             <severity>Unknown</severity>
@@ -28,11 +26,8 @@
 
     <description>
       <lang code="en-US"
-            text="This is an automated broadcast, servicing the city of Saskatoon with the latest weather alerts and forecasts originating from Environment Canada."
-            suffix="This service is not affiliated with Environment Canada."/>
-      <lang code="fr-CA"
-            text="Ceci est une diffusion automatisée desservant la ville de Saskatoon avec les dernières alertes météorologiques et prévisions provenant d'Environnement Canada."
-            suffix="Ce service n'est pas affilié à Environnement Canada."/>
+            text="This service is operated by a joint effort between Sherwood Weather, and the Haze Weather Radio open source project."
+            suffix="We do not imply any association with Environment Canada."/>
     </description>
 
     <!--
@@ -63,7 +58,10 @@
       <coverage>
         <region id="065100" source="eccc" derive_forecast="sk-40"/>
         <region id="065400" source="eccc" derive_forecast="sk-1"/>
-        <region id="065500" source="eccc" derive_forecast="sk-37"/>
+        <region id="065500" source="eccc" derive_forecast="sk-37">
+          <subregion id="065522"/>
+          <subregion id="065521"/>
+        </region>
       </coverage>
 
       <observationLocations>
@@ -112,60 +110,5 @@
         <frequency_mhz>162.550</frequency_mhz>
       </transmitter>
     </transmitter_metadata>
+
   </feed>
-
-  <feed id="CFSP-CAP" enabled="true" timezone="America/Regina">
-
-    <playout routine="false" same="true" same_originator="EAS" same_attention_tone="EAS"/>
-
-    <alerts>
-      <cap_cp enabled="true">
-        <filter use_feed_locations="true">
-          <allowlist>
-			<severity>Moderate</severity>
-            <severity>Severe</severity>
-            <severity>Extreme</severity>
-            <urgency>Immediate</urgency>
-            <certainty>Observed</certainty>
-            <certainty>Likely</certainty>
-          </allowlist>
-        </filter>
-      </cap_cp>
-      <nws_cap enabled="false">
-        <filter use_feed_locations="true">
-          <allowlist>
-            <severity>Extreme</severity>
-            <urgency>Immediate</urgency>
-            <certainty>Observed</certainty>
-            <certainty>Likely</certainty>
-          </allowlist>
-        </filter>
-      </nws_cap>
-    </alerts>
-
-    <languages>
-      <lang code="en-US" interval="0"/>
-    </languages>
-
-    <description>
-      <lang code="en-US"
-            text="CFSP/CAP standby alert relay."
-            suffix=""/>
-    </description>
-
-    <locations>
-      <coverage>
-        <region id="06*" source="eccc"/>
-        <region id="07*" source="eccc"/>
-      </coverage>
-    </locations>
-
-    <transmitter_metadata>
-      <transmitter>
-        <site_name>CFSP/CAP</site_name>
-        <callsign>CFSPCAP</callsign>
-        <relationship>primary</relationship>
-      </transmitter>
-    </transmitter_metadata>
-  </feed>
-</feeds>

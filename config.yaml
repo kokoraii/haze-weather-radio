@@ -494,7 +494,7 @@ webpanel:
     max_audio_upload_bytes: 52428800
     # Required keys and the one-time bootstrap password are configured in the private service environment.
 
-feeds_file: ./managed/configs/feeds.xml
+feeds_file: ./managed/feeds
 outputs_file: ./managed/configs/output.xml
 
 cap:

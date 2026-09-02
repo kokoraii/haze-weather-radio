@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed enabled="true" timezone="America/Edmonton">
+
+    <playout routine="true" same="true" same_originator="EAS"/>
+
+    <alerts>
+      <cap_cp enabled="true">
+        <filter use_feed_locations="true" coverage_mode="polygon_first">
+          <blocklist>
+            <severity>Minor</severity>
+            <severity>Unknown</severity>
+            <certainty>Unknown</certainty>
+            <certainty>Past</certainty>
+            <naads_event>fog</naads_event>
+            <other value_name="layer:EC-MSC-SMC:1.0:Alert_Type" value="advisory"/>
+          </blocklist>
+        </filter>
+      </cap_cp>
+      <nws_cap enabled="false"/>
+    </alerts>
+
+    <languages>
+      <lang code="en-US" interval="0"/>
+      <!-- <lang code="fr-CA" interval="0"/> -->
+    </languages>
+
+    <description>
+      <lang code="en-US"
+            text="This service is operated by a joint effort between Sherwood Weather, and the Haze Weather Radio open source project."
+            suffix="We do not imply any association with Environment Canada."/>
+    </description>
+
+    <locations>
+      <coverage>
+        <region id="076200" source="eccc" derive_forecast="ab-50"/>
+        <region id="076300" source="eccc" derive_forecast="ab-63"/>
+        <region id="076400" source="eccc"/>
+        <region id="076500" source="eccc"/>
+        <region id="076600" source="eccc" derive_forecast="ab-71"/>
+      </coverage>
+
+      <observationLocations>
+        <location id="CYEG" source="eccc"/>
+        <location id="CXPS" source="eccc"/>
+        <location id="CXEC" source="eccc"/>
+        <location id="CWFE" source="eccc"/>
+        <location id="CWRV" source="eccc"/>
+        <location id="CWVI" source="eccc"/>
+        <location id="CYED" source="eccc"/>
+      </observationLocations>
+
+      <airQualityLocations>
+        <location id="IAFYX" source="eccc"/>
+        <location id="IABOA" source="eccc"/>
+        <location id="IAGHN" source="eccc"/>
+      </airQualityLocations>
+
+      <climateLocations>
+        <location id="VSAB50V" source="eccc"/>
+      </climateLocations>
+
+    </locations>
+
+    <transmitter_metadata>
+      <transmitter>
+        <site_name>Edmonton</site_name>
+        <callsign>XLM572</callsign>
+        <relationship>primary</relationship>
+        <frequency_mhz>162.400</frequency_mhz>
+      </transmitter>
+    </transmitter_metadata>
+
+  </feed>

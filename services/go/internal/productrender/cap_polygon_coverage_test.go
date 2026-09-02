@@ -26,7 +26,7 @@ func TestPolygonFirstCoverageUsesPositiveAreaOverlap(t *testing.T) {
 	if !alertMatchesFeed(overlap, feed, dir) {
 		t.Fatal("polygon overlap should route even when its CLC does not match")
 	}
-	if got, want := capFeedLocationAssignments(overlap, feed, dir), []string{"765400"}; !reflect.DeepEqual(got, want) {
+	if got, want := capFeedLocationAssignments(overlap, feed, dir), []string{"065400"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("polygon assignments = %#v, want %#v", got, want)
 	}
 
@@ -207,10 +207,10 @@ func TestPolygonFirstCoverageEmitsPartialAndWholeCLCGridCodes(t *testing.T) {
 
 	partial := polygonCoverageTestAlert("999999", capCoverageSquareText(2.2, 0.2, 2.8, 0.8), nil)
 	assignments := capFeedLocationAssignments(partial, feed, dir)
-	if want := []string{"165435"}; !reflect.DeepEqual(assignments, want) {
+	if want := []string{"065435"}; !reflect.DeepEqual(assignments, want) {
 		t.Fatalf("partial assignments = %#v, want %#v", assignments, want)
 	}
-	if got, want := sameLocationsForAssignments(partial.Infos[0], feed, dir, assignments), []string{"165435"}; !reflect.DeepEqual(got, want) {
+	if got, want := sameLocationsForAssignments(partial.Infos[0], feed, dir, assignments), []string{"065435"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("partial SAME locations = %#v, want %#v", got, want)
 	}
 
@@ -226,7 +226,7 @@ func TestPolygonFirstRegionalCoverageUsesLeafGridIdentity(t *testing.T) {
 		Source: "clc", Code: "065401", Rings: [][]capCoveragePoint{capCoverageSquare(0, 0, 2, 2)},
 	})
 	alert := polygonCoverageTestAlert("999999", capCoverageSquareText(0.1, 0.1, 0.4, 0.4), nil)
-	if got, want := capFeedLocationAssignments(alert, polygonFirstCoverageFeed("065400"), dir), []string{"765401"}; !reflect.DeepEqual(got, want) {
+	if got, want := capFeedLocationAssignments(alert, polygonFirstCoverageFeed("065400"), dir), []string{"065401"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("regional leaf assignments = %#v, want %#v", got, want)
 	}
 }

@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed enabled="true" timezone="America/Winnipeg">
+
+    <playout routine="true" same="true" same_originator="EAS"/>
+
+    <alerts>
+      <cap_cp enabled="true">
+        <filter use_feed_locations="true" coverage_mode="polygon_first">
+          <blocklist>
+            <severity>Minor</severity>
+            <severity>Unknown</severity>
+            <certainty>Unknown</certainty>
+            <certainty>Past</certainty>
+            <naads_event>fog</naads_event>
+            <other value_name="layer:EC-MSC-SMC:1.0:Alert_Type" value="advisory"/>
+          </blocklist>
+        </filter>
+      </cap_cp>
+      <nws_cap enabled="false"/>
+    </alerts>
+
+    <languages>
+      <lang code="en-US" interval="0"/>
+      <!-- <lang code="fr-CA" interval="0"/> -->
+    </languages>
+
+    <description>
+      <lang code="en-US"
+            text="This service is operated by a joint effort between Sherwood Weather, and the Haze Weather Radio open source project."
+            suffix="We do not imply any association with Environment Canada."/>
+    </description>
+
+    <locations>
+      <coverage>
+        <region id="052100" source="eccc" derive_forecast="mb-36"/>
+        <region id="052200" source="eccc" derive_forecast="mb-14"/>
+        <region id="052400" source="eccc" derive_forecast="mb-9"/>
+        <region id="052600" source="eccc" derive_forecast="mb-13">
+          <subregion id="052323"/>
+        </region>
+        <region id="052300" source="eccc" derive_forecast="mb-65">
+          <subregion id="052323"/>
+          <subregion id="052340"/>
+          <subregion id="052310"/>
+        </region>
+      </coverage>
+
+      <observationLocations>
+        <location id="mb-36" source="eccc"/>
+        <location id="mb-6" source="eccc"/>
+        <location id="mb-62" source="eccc"/>
+        <location id="mb-13" source="eccc"/>
+        <location id="mb-11" source="eccc"/>
+        <location id="mb-65" source="eccc"/>
+        <location id="mb-29" source="eccc"/>
+      </observationLocations>
+
+      <airQualityLocations>
+        <location id="GBEIN" source="eccc"/>
+      </airQualityLocations>
+
+      <climateLocations>
+        <location id="VSMB36V" source="eccc"/>
+      </climateLocations>
+
+      <marineForecastLocations>
+        <subregion id="m0000109" source="eccc"/>
+        <subregion id="m0000037" source="eccc"/>
+      </marineForecastLocations>
+
+      <marineConditions>
+        <location id="9401177" source="eccc"/>
+      </marineConditions>
+
+    </locations>
+
+    <transmitter_metadata>
+      <transmitter>
+        <site_name>Winnipeg</site_name>
+        <callsign>XLM538</callsign>
+        <relationship>primary</relationship>
+        <frequency_mhz>162.550</frequency_mhz>
+      </transmitter>
+    </transmitter_metadata>
+
+  </feed>

@@ -87,4 +87,132 @@
     <LogAdminAlerts>true</LogAdminAlerts>
     <WebhookURL>${HAZE_DISCORD_WEBHOOK_CWXR_ATLANTIC}</WebhookURL>
   </Webhook>
+  <Webhook enabled="true" feed-id="cwxr-bc01">
+    <EmbedAudio enabled="true" codec="libopus" />
+    <Username>Vancouver WXR</Username>
+    <IconURL></IconURL>
+    <LogTestAlerts>true</LogTestAlerts>
+    <LogAdminAlerts>true</LogAdminAlerts>
+    <WebhookURL>${HAZE_DISCORD_WEBHOOK_CWXR_BC}</WebhookURL>
+  </Webhook>
+  <Webhook enabled="true" feed-id="cwxr-bc02">
+    <EmbedAudio enabled="true" codec="libopus" />
+    <Username>Victoria WXR</Username>
+    <IconURL></IconURL>
+    <LogTestAlerts>true</LogTestAlerts>
+    <LogAdminAlerts>true</LogAdminAlerts>
+    <WebhookURL>${HAZE_DISCORD_WEBHOOK_CWXR_BC}</WebhookURL>
+  </Webhook>
+  <Webhook enabled="true" feed-id="cwxr-bc03">
+    <EmbedAudio enabled="true" codec="libopus" />
+    <Username>Kelowna WXR</Username>
+    <IconURL></IconURL>
+    <LogTestAlerts>true</LogTestAlerts>
+    <LogAdminAlerts>true</LogAdminAlerts>
+    <WebhookURL>${HAZE_DISCORD_WEBHOOK_CWXR_BC}</WebhookURL>
+  </Webhook>
+  <Webhook enabled="true" feed-id="cwxr-ab04">
+    <EmbedAudio enabled="true" codec="libopus" />
+    <Username>Calgary WXR</Username>
+    <IconURL></IconURL>
+    <LogTestAlerts>true</LogTestAlerts>
+    <LogAdminAlerts>true</LogAdminAlerts>
+    <WebhookURL>${HAZE_DISCORD_WEBHOOK_CWXR_AB}</WebhookURL>
+  </Webhook>
+  <Webhook enabled="true" feed-id="cwxr-on03">
+    <EmbedAudio enabled="true" codec="libopus" />
+    <Username>Ottawa-Gatineau WXR</Username>
+    <IconURL></IconURL>
+    <LogTestAlerts>true</LogTestAlerts>
+    <LogAdminAlerts>true</LogAdminAlerts>
+    <WebhookURL>${HAZE_DISCORD_WEBHOOK_CWXR_ON}</WebhookURL>
+  </Webhook>
+  <Webhook enabled="true" feed-id="cwxr-on04">
+    <EmbedAudio enabled="true" codec="libopus" />
+    <Username>London WXR</Username>
+    <IconURL></IconURL>
+    <LogTestAlerts>true</LogTestAlerts>
+    <LogAdminAlerts>true</LogAdminAlerts>
+    <WebhookURL>${HAZE_DISCORD_WEBHOOK_CWXR_ON}</WebhookURL>
+  </Webhook>
+  <Webhook enabled="true" feed-id="cwxr-on05">
+    <EmbedAudio enabled="true" codec="libopus" />
+    <Username>Windsor WXR</Username>
+    <IconURL></IconURL>
+    <LogTestAlerts>true</LogTestAlerts>
+    <LogAdminAlerts>true</LogAdminAlerts>
+    <WebhookURL>${HAZE_DISCORD_WEBHOOK_CWXR_ON}</WebhookURL>
+  </Webhook>
+  <Webhook enabled="true" feed-id="cwxr-on06">
+    <EmbedAudio enabled="true" codec="libopus" />
+    <Username>Greater Sudbury WXR</Username>
+    <IconURL></IconURL>
+    <LogTestAlerts>true</LogTestAlerts>
+    <LogAdminAlerts>true</LogAdminAlerts>
+    <WebhookURL>${HAZE_DISCORD_WEBHOOK_CWXR_ON}</WebhookURL>
+  </Webhook>
+  <Webhook enabled="true" feed-id="cwxr-on07">
+    <EmbedAudio enabled="true" codec="libopus" />
+    <Username>Thunder Bay WXR</Username>
+    <IconURL></IconURL>
+    <LogTestAlerts>true</LogTestAlerts>
+    <LogAdminAlerts>true</LogAdminAlerts>
+    <WebhookURL>${HAZE_DISCORD_WEBHOOK_CWXR_ON}</WebhookURL>
+  </Webhook>
+  <Webhook enabled="true" feed-id="cwxr-qc03">
+    <EmbedAudio enabled="true" codec="libopus" />
+    <Username>Montréal WXR</Username>
+    <IconURL></IconURL>
+    <LogTestAlerts>true</LogTestAlerts>
+    <LogAdminAlerts>true</LogAdminAlerts>
+    <WebhookURL>${HAZE_DISCORD_WEBHOOK_CWXR_QC}</WebhookURL>
+  </Webhook>
+  <Webhook enabled="true" feed-id="cwxr-qc04">
+    <EmbedAudio enabled="true" codec="libopus" />
+    <Username>Sherbrooke WXR</Username>
+    <IconURL></IconURL>
+    <LogTestAlerts>true</LogTestAlerts>
+    <LogAdminAlerts>true</LogAdminAlerts>
+    <WebhookURL>${HAZE_DISCORD_WEBHOOK_CWXR_QC}</WebhookURL>
+  </Webhook>
+  <Webhook enabled="true" feed-id="cwxr-nb02">
+    <EmbedAudio enabled="true" codec="libopus" />
+    <Username>Moncton WXR</Username>
+    <IconURL></IconURL>
+    <LogTestAlerts>true</LogTestAlerts>
+    <LogAdminAlerts>true</LogAdminAlerts>
+    <WebhookURL>${HAZE_DISCORD_WEBHOOK_CWXR_ATLANTIC}</WebhookURL>
+  </Webhook>
+  <Webhook enabled="true" feed-id="cwxr-nb03">
+    <EmbedAudio enabled="true" codec="libopus" />
+    <Username>Saint John WXR</Username>
+    <IconURL></IconURL>
+    <LogTestAlerts>true</LogTestAlerts>
+    <LogAdminAlerts>true</LogAdminAlerts>
+    <WebhookURL>${HAZE_DISCORD_WEBHOOK_CWXR_ATLANTIC}</WebhookURL>
+  </Webhook>
+  <Webhook enabled="true" feed-id="cwxr-ns01">
+    <EmbedAudio enabled="true" codec="libopus" />
+    <Username>Halifax WXR</Username>
+    <IconURL></IconURL>
+    <LogTestAlerts>true</LogTestAlerts>
+    <LogAdminAlerts>true</LogAdminAlerts>
+    <WebhookURL>${HAZE_DISCORD_WEBHOOK_CWXR_ATLANTIC}</WebhookURL>
+  </Webhook>
+  <Webhook enabled="true" feed-id="cwxr-pe01">
+    <EmbedAudio enabled="true" codec="libopus" />
+    <Username>Charlottetown WXR</Username>
+    <IconURL></IconURL>
+    <LogTestAlerts>true</LogTestAlerts>
+    <LogAdminAlerts>true</LogAdminAlerts>
+    <WebhookURL>${HAZE_DISCORD_WEBHOOK_CWXR_ATLANTIC}</WebhookURL>
+  </Webhook>
+  <Webhook enabled="true" feed-id="cwxr-nl01">
+    <EmbedAudio enabled="true" codec="libopus" />
+    <Username>St. John's WXR</Username>
+    <IconURL></IconURL>
+    <LogTestAlerts>true</LogTestAlerts>
+    <LogAdminAlerts>true</LogAdminAlerts>
+    <WebhookURL>${HAZE_DISCORD_WEBHOOK_CWXR_ATLANTIC}</WebhookURL>
+  </Webhook>
 </Webhooks>

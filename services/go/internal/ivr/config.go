@@ -357,7 +357,7 @@ func loadConfig(path string, overrides Options) (loadedConfig, error) {
 	if overrides.CacheDir != "" {
 		cfg.Cache.Dir = overrides.CacheDir
 	}
-	feeds, err := loadFeeds(resolvePath(baseDir, fallbackText(root.FeedsFile, "managed/configs/feeds.xml")))
+	feeds, err := loadFeeds(resolvePath(baseDir, fallbackText(root.FeedsFile, "managed/feeds")))
 	if err != nil {
 		return loadedConfig{}, err
 	}
@@ -901,6 +901,18 @@ func (cfg loadedConfig) cacheTTL() time.Duration {
 }
 
 func loadFeeds(path string) ([]feedXML, error) {
+	if info, err := os.Stat(filepath.Clean(path)); err == nil && info.IsDir() {
+		entries, err := os.ReadDir(filepath.Clean(path)); if err != nil { return nil, err }
+		feeds := []feedXML{}
+		for _, entry := range entries {
+			if entry.IsDir() || strings.ToLower(filepath.Ext(entry.Name())) != ".xml" { continue }
+			raw, err := os.ReadFile(filepath.Join(path, entry.Name())); if err != nil { return nil, err }
+			var feed feedXML; if err := xml.Unmarshal(raw, &feed); err != nil { return nil, fmt.Errorf("parse feed XML: %w", err) }
+			if strings.TrimSpace(feed.ID) == "" { feed.ID = strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name())) }
+			feeds = append(feeds, feed)
+		}
+		return feeds, nil
+	}
 	raw, err := os.ReadFile(filepath.Clean(path))
 	if err != nil {
 		return nil, err

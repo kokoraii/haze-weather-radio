@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed enabled="true" timezone="America/Toronto">
+  <playout routine="true" same="true" same_originator="EAS"/>
+  <alerts>
+    <cap_cp enabled="true">
+      <filter use_feed_locations="true" coverage_mode="polygon_first">
+        <blocklist>
+          <severity>Minor</severity><severity>Unknown</severity><certainty>Unknown</certainty><certainty>Past</certainty>
+          <naads_event>fog</naads_event>
+          <other value_name="layer:EC-MSC-SMC:1.0:Alert_Type" value="advisory"/>
+        </blocklist>
+      </filter>
+    </cap_cp>
+    <nws_cap enabled="false"/>
+  </alerts>
+  <languages><lang code="en-US" interval="0"/><lang code="fr-CA" interval="0"/></languages>
+  <description>
+    <lang code="en-US" text="This service is operated by a joint effort between Sherwood Weather, and the Haze Weather Radio open source project." suffix="We do not imply any association with Environment Canada."/>
+    <lang code="fr-CA" text="Ce service est exploité grâce à un effort conjoint de Sherwood Weather et du projet open source Haze Weather Radio." suffix="Nous n'impliquons aucune association avec Environnement Canada."/>
+  </description>
+  <locations>
+    <coverage><region id="037332" source="eccc" derive_forecast="qc-136"/></coverage>
+    <observationLocations><location id="qc-136" source="eccc"/></observationLocations>
+  </locations>
+  <transmitter_metadata><transmitter><site_name>Sherbrooke</site_name><callsign>XLR412</callsign><relationship>primary</relationship><frequency_mhz>162.475</frequency_mhz></transmitter></transmitter_metadata>
+</feed>

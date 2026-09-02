@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed enabled="true" timezone="America/Moncton">
+
+    <playout routine="true" same="true" same_originator="EAS" same_attention_tone="EAS"></playout>
+
+    <alerts>
+      <cap_cp enabled="true">
+        <filter use_feed_locations="true" coverage_mode="polygon_first">
+          <allowlist></allowlist>
+          <blocklist></blocklist>
+        </filter>
+      </cap_cp>
+      <nws_cap enabled="false">
+        <filter use_feed_locations="true">
+          <allowlist></allowlist>
+          <blocklist></blocklist>
+        </filter>
+      </nws_cap>
+    </alerts>
+
+    <languages>
+      <lang code="en-CA" interval="0"></lang>
+    </languages>
+
+    <description>
+      <lang code="en-CA"></lang>
+    </description>
+    <locations>
+
+      <coverage>
+        <region id="015100" source="eccc" derive_forecast="nb-29"/>
+        <region id="015200" source="eccc" derive_forecast="nb-11"/>
+      </coverage>
+
+      <observationLocations>
+        <location id="CYFC" source="eccc"/>
+        <location id="CYCX" source="eccc"/>
+        <location id="CEWD" source="eccc"/>
+        <location id="CASF" source="eccc"/>
+        <location id="CWSS" source="eccc"/>
+      </observationLocations>
+
+      <airQualityLocations>
+        <location id="DAFMJ" source="eccc"/>
+      </airQualityLocations>
+
+      <climateLocations>
+        <location id="VSNB29V" source="eccc"/>
+      </climateLocations>
+
+      <marineForecastLocations>
+        <subregion id="m0000030" source="eccc"/>
+      </marineForecastLocations>
+
+      <marineConditions>
+        <location id="CWPE" source="eccc"/>
+        <location id="CXGM" source="eccc"/>
+        <location id="CYSJ" source="eccc"/>
+      </marineConditions>
+
+    </locations>
+    <transmitter_metadata>
+
+      <transmitter>
+
+        <site_name>Fredericton</site_name>
+        <relationship>primary</relationship>
+        <frequency_mhz>162.475</frequency_mhz>
+
+        <network>
+          <name></name>
+          <pronounciation></pronounciation>
+          <pronunciation></pronunciation>
+        </network>
+
+      </transmitter>
+    </transmitter_metadata>
+  </feed>

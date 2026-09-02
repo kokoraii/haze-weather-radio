@@ -446,7 +446,27 @@ fn load_package_catalog(base_dir: &Path) -> Result<BTreeMap<String, PackageConfi
 }
 
 fn load_feeds(path: &Path) -> Result<Vec<FeedConfig>> {
-    let raw = fs::read_to_string(path)
+	if path.is_dir() {
+		let mut entries = fs::read_dir(path)
+			.with_context(|| format!("failed to read feeds directory {}", path.display()))?
+			.collect::<Result<Vec<_>, _>>()?;
+		entries.sort_by_key(|entry| entry.file_name());
+		let mut feeds = Vec::new();
+		for entry in entries {
+			let file = entry.path();
+			if file.extension().and_then(|ext| ext.to_str()) != Some("xml") { continue; }
+			let raw = expand_env_vars(&fs::read_to_string(&file)
+				.with_context(|| format!("failed to read feed XML {}", file.display()))?);
+			let mut feed: FeedConfig = quick_xml::de::from_str(&raw)
+				.with_context(|| format!("failed to parse feed XML {}", file.display()))?;
+			if feed.id.trim().is_empty() {
+				feed.id = file.file_stem().and_then(|stem| stem.to_str()).unwrap_or_default().to_string();
+			}
+			feeds.push(feed);
+		}
+		return Ok(feeds);
+	}
+	let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read feeds XML {}", path.display()))?;
     let raw = expand_env_vars(&raw);
     let parsed: FeedsXml = quick_xml::de::from_str(&raw)
@@ -931,7 +951,7 @@ pub(crate) fn fallback_text(value: &str, fallback: &str) -> String {
 }
 
 fn default_feeds_file() -> String {
-    "managed/configs/feeds.xml".to_string()
+    "managed/feeds".to_string()
 }
 
 fn default_outputs_file() -> String {

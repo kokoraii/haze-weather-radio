@@ -603,8 +603,22 @@ func publicTransmitters(value any) []map[string]any {
 }
 
 func loadFeedsXML(configPath string, root map[string]any) (feedsXML, error) {
-	path := textAt(root, []string{"feeds_file"}, "managed/configs/feeds.xml", 240)
-	raw, err := os.ReadFile(resolveConfigPath(configPath, path))
+	path := textAt(root, []string{"feeds_file"}, "managed/feeds", 240)
+	resolved := resolveConfigPath(configPath, path)
+	info, statErr := os.Stat(resolved)
+	if statErr == nil && info.IsDir() {
+		entries, err := os.ReadDir(resolved); if err != nil { return feedsXML{}, err }
+		parsed := feedsXML{}
+		for _, entry := range entries {
+			if entry.IsDir() || strings.ToLower(filepath.Ext(entry.Name())) != ".xml" { continue }
+			raw, err := os.ReadFile(filepath.Join(resolved, entry.Name())); if err != nil { return feedsXML{}, err }
+			var feed feedXML; if err := xml.Unmarshal(raw, &feed); err != nil { return feedsXML{}, err }
+			if strings.TrimSpace(feed.ID) == "" { feed.ID = strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name())) }
+			parsed.Feeds = append(parsed.Feeds, feed)
+		}
+		return parsed, nil
+	}
+	raw, err := os.ReadFile(resolved)
 	if err != nil {
 		return feedsXML{}, err
 	}

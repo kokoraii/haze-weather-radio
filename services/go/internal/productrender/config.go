@@ -303,7 +303,7 @@ func loadConfig(configPath string) (loadedConfig, error) {
 		return loadedConfig{}, err
 	}
 	baseDir := filepath.Dir(filepath.Clean(configPath))
-	feeds, err := loadFeeds(resolvePath(baseDir, fallbackText(root.FeedsFile, "managed/configs/feeds.xml")))
+	feeds, err := loadFeeds(resolvePath(baseDir, fallbackText(root.FeedsFile, "managed/feeds")))
 	if err != nil {
 		return loadedConfig{}, err
 	}
@@ -430,6 +430,19 @@ func maxInt(values ...int) int {
 }
 
 func loadFeeds(path string) ([]feedXML, error) {
+	if info, err := os.Stat(filepath.Clean(path)); err == nil && info.IsDir() {
+		entries, err := os.ReadDir(filepath.Clean(path))
+		if err != nil { return nil, err }
+		feeds := []feedXML{}
+		for _, entry := range entries {
+			if entry.IsDir() || strings.ToLower(filepath.Ext(entry.Name())) != ".xml" { continue }
+			feed, err := loadFeedFile(filepath.Join(path, entry.Name()))
+			if err != nil { return nil, err }
+			if strings.TrimSpace(feed.ID) == "" { feed.ID = strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name())) }
+			feeds = append(feeds, feed)
+		}
+		return feeds, nil
+	}
 	raw, err := os.ReadFile(filepath.Clean(path))
 	if err != nil {
 		return nil, err
@@ -440,6 +453,13 @@ func loadFeeds(path string) ([]feedXML, error) {
 		return nil, fmt.Errorf("parse feeds XML: %w", err)
 	}
 	return parsed.Feeds, nil
+}
+
+func loadFeedFile(path string) (feedXML, error) {
+	raw, err := os.ReadFile(filepath.Clean(path)); if err != nil { return feedXML{}, err }
+	var feed feedXML
+	if err := xml.Unmarshal(raw, &feed); err != nil { return feedXML{}, fmt.Errorf("parse feed XML: %w", err) }
+	return feed, nil
 }
 
 func loadPackages(path string) (map[string]packageProfile, error) {

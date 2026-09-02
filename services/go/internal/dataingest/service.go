@@ -428,22 +428,28 @@ func loadConfig(configPath string) (loadedConfig, error) {
 		return loadedConfig{}, err
 	}
 	baseDir := filepath.Dir(filepath.Clean(configPath))
-	feedsPath := resolvePath(baseDir, fallbackText(root.FeedsFile, "managed/configs/feeds.xml"))
-	feedsRaw, err := os.ReadFile(filepath.Clean(feedsPath))
-	if err != nil {
-		return loadedConfig{}, err
-	}
-	feedsRaw = []byte(os.ExpandEnv(string(feedsRaw)))
-	var feeds feedsXML
-	if err := xml.Unmarshal(feedsRaw, &feeds); err != nil {
-		return loadedConfig{}, err
-	}
+	feedsPath := resolvePath(baseDir, fallbackText(root.FeedsFile, "managed/feeds"))
+	feedItems, err := loadFeedFiles(feedsPath)
+	if err != nil { return loadedConfig{}, err }
 	return loadedConfig{
 		Root:          root,
-		Feeds:         feeds.Feeds,
+		Feeds:         feedItems,
 		ForecastNames: loadForecastRegionNamesForBase(baseDir),
 		BaseDir:       baseDir,
 	}, nil
+}
+
+func loadFeedFiles(path string) ([]feedXML, error) {
+	entries, err := os.ReadDir(filepath.Clean(path)); if err != nil { return nil, err }
+	feeds := []feedXML{}
+	for _, entry := range entries {
+		if entry.IsDir() || strings.ToLower(filepath.Ext(entry.Name())) != ".xml" { continue }
+		raw, err := os.ReadFile(filepath.Join(path, entry.Name())); if err != nil { return nil, err }
+		var feed feedXML; if err := xml.Unmarshal([]byte(os.ExpandEnv(string(raw))), &feed); err != nil { return nil, err }
+		if strings.TrimSpace(feed.ID) == "" { feed.ID = strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name())) }
+		feeds = append(feeds, feed)
+	}
+	return feeds, nil
 }
 
 func loadForecastRegionNamesForBase(baseDir string) map[string]forecastRegionName {

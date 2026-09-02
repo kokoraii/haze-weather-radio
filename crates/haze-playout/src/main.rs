@@ -10,6 +10,9 @@ use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[cfg(windows)]
 use windows_sys::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 

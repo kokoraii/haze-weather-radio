@@ -497,7 +497,7 @@ func TestReferencedDLCUpdateBroadcastUsesAuthoritativeLocationDelta(t *testing.T
 	if len(initialUpdates) != 1 || !initialUpdates[0].Broadcast {
 		t.Fatalf("initial DLC alert = %#v", initialUpdates)
 	}
-	assertCAPLocations(t, initialUpdates[0].AddedLocations, "165435")
+	assertCAPLocations(t, initialUpdates[0].AddedLocations, "065435")
 
 	shifted := parseTestAlert(t, testDLCGridCAP(
 		"urn:test:dlc:shifted",
@@ -513,11 +513,13 @@ func TestReferencedDLCUpdateBroadcastUsesAuthoritativeLocationDelta(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(shiftedUpdates) != 1 || !shiftedUpdates[0].Broadcast {
-		t.Fatalf("referenced DLC expansion must broadcast its new assignment: %#v", shiftedUpdates)
+	if len(shiftedUpdates) != 1 || shiftedUpdates[0].Broadcast {
+		t.Fatalf("referenced DLC expansion within one full county must not rebroadcast: %#v", shiftedUpdates)
 	}
-	assertCAPLocations(t, shiftedUpdates[0].AddedLocations, "365435")
-	assertCAPLocations(t, shiftedUpdates[0].RetainedLocations, "165435")
+	if len(shiftedUpdates[0].AddedLocations) != 0 {
+		t.Fatalf("same county update unexpectedly added locations: %#v", shiftedUpdates[0].AddedLocations)
+	}
+	assertCAPLocations(t, shiftedUpdates[0].RetainedLocations, "065435")
 
 	continued := parseTestAlert(t, testDLCGridCAP(
 		"urn:test:dlc:continued",
@@ -536,7 +538,7 @@ func TestReferencedDLCUpdateBroadcastUsesAuthoritativeLocationDelta(t *testing.T
 	if len(continuedUpdates) != 1 || continuedUpdates[0].Broadcast {
 		t.Fatalf("continued-only DLC update must not rebroadcast unchanged assignments: %#v", continuedUpdates)
 	}
-	assertCAPLocations(t, continuedUpdates[0].RetainedLocations, "165435", "365435")
+	assertCAPLocations(t, continuedUpdates[0].RetainedLocations, "065435")
 }
 
 func TestReferencedDLCUpdateContractionDoesNotBroadcast(t *testing.T) {
@@ -583,8 +585,7 @@ func TestReferencedDLCUpdateContractionDoesNotBroadcast(t *testing.T) {
 	if len(contractedUpdates) != 1 || contractedUpdates[0].Broadcast {
 		t.Fatalf("DLC contraction must not broadcast: %#v", contractedUpdates)
 	}
-	assertCAPLocations(t, contractedUpdates[0].RetainedLocations, "165435")
-	assertCAPLocations(t, contractedUpdates[0].RemovedLocations, "065435")
+	assertCAPLocations(t, contractedUpdates[0].RetainedLocations, "065435")
 }
 
 func TestDLCGridLocationDeltaIsDirectional(t *testing.T) {

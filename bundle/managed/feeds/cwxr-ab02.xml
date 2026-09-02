@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed enabled="true" timezone="America/Edmonton">
+
+    <playout routine="true" same="true" same_originator="EAS"/>
+
+    <alerts>
+      <cap_cp enabled="true">
+        <filter use_feed_locations="true" coverage_mode="polygon_first">
+          <blocklist>
+            <severity>Minor</severity>
+            <severity>Unknown</severity>
+            <certainty>Unknown</certainty>
+            <certainty>Past</certainty>
+            <naads_event>fog</naads_event>
+            <other value_name="layer:EC-MSC-SMC:1.0:Alert_Type" value="advisory"/>
+          </blocklist>
+        </filter>
+      </cap_cp>
+      <nws_cap enabled="false"/>
+    </alerts>
+
+    <languages>
+      <lang code="en-US" interval="0"/>
+      <lang code="fr-CA" interval="1"/>
+    </languages>
+
+    <description>
+      <lang code="en-US"
+            text="This service is operated by a joint effort between Sherwood Weather, and the Haze Weather Radio open source project."
+            suffix="We do not imply any association with Environment Canada."/>
+      <lang code="fr-CA"
+            text="Ce service est exploitÃ© grÃ¢ce Ã  un effort conjoint de Sherwood Weather et du projet open source Haze Weather Radio."
+            suffix="Nous n'impliquons aucune association avec Environnement Canada."/>
+    </description>
+
+    <locations>
+      <coverage>
+        <region id="072100" source="eccc" derive_forecast="ab-29"/>
+      </coverage>
+
+      <observationLocations>
+        <location id="ab-29" source="eccc"/>
+        <location id="ab-39" source="eccc"/>
+        <location id="ab-5" source="eccc"/>
+      </observationLocations>
+
+      <airQualityLocations>
+        <location id="IAEJS" source="eccc"/>
+      </airQualityLocations>
+
+      <climateLocations>
+        <location id="VSAB29V" source="eccc"/>
+      </climateLocations>
+
+    </locations>
+
+    <transmitter_metadata>
+      <transmitter>
+        <site_name>Red Deer</site_name>
+        <callsign>VBC336</callsign>
+        <relationship>primary</relationship>
+        <frequency_mhz>162.550</frequency_mhz>
+      </transmitter>
+    </transmitter_metadata>
+
+  </feed>

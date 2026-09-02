@@ -8,13 +8,11 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/meowraii/haze-weather-radio/services/go/internal/alertgeo"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/capmodel"
 	_ "modernc.org/sqlite"
 )
@@ -308,16 +306,14 @@ type capCoverageFeature struct {
 	Shape    capCoverageShape
 }
 
-// capPolygonFirstLocationAssignments returns synthesized, source-qualified CLC
-// SAME scopes for an opt-in polygon-first route. A true usable value with no
-// assignments is a valid negative overlap. A false usable value leaves the
-// caller on the existing code-routing path.
+// capPolygonFirstLocationAssignments resolves the full configured location
+// codes whose geometry has positive-area overlap with the CAP polygon. It does
+// not synthesize partial county/grid codes.
 func capPolygonFirstLocationAssignments(alert capmodel.Alert, feed feedXML, baseDir string, db alertGeoDB) (assignments []string, usable bool) {
 	if !feedUsesPolygonFirstCoverage(feed, alert) {
 		return nil, false
 	}
-	rawPolygons := capAlertCoveragePolygons(alert)
-	capPolygons, ok := capGridAlertPolygons(rawPolygons)
+	alertShape, ok := capAlertCoverageShape(alert)
 	if !ok {
 		return nil, false
 	}
@@ -326,108 +322,17 @@ func capPolygonFirstLocationAssignments(alert capmodel.Alert, feed feedXML, base
 		return nil, false
 	}
 	for _, feature := range features {
-		grid, err := capCoverageGrid(feature.Identity, feature.Shape)
-		if err != nil {
+		overlaps, valid := capCoverageShapesOverlap(feature.Shape, alertShape)
+		if !valid {
 			return nil, false
 		}
-		parts, err := grid.MatchPolygons(capPolygons)
-		if err != nil {
-			return nil, false
-		}
-		for _, part := range parts {
-			if code := sameLocationCode(part.Code); code != "" {
+		if overlaps {
+			if code := sameLocationCode(feature.Identity.Code); code != "" {
 				assignments = append(assignments, code)
 			}
 		}
 	}
-	return capCollapseGridAssignments(assignments), true
-}
-
-func capGridAlertPolygons(rawPolygons []string) ([]alertgeo.Polygon, bool) {
-	if len(rawPolygons) == 0 || len(rawPolygons) > 16 {
-		return nil, false
-	}
-	polygons := make([]alertgeo.Polygon, 0, len(rawPolygons))
-	seen := map[string]struct{}{}
-	for _, raw := range rawPolygons {
-		raw = strings.TrimSpace(raw)
-		if raw == "" {
-			return nil, false
-		}
-		if _, exists := seen[raw]; exists {
-			continue
-		}
-		seen[raw] = struct{}{}
-		polygon, err := alertgeo.ParseCAPPolygon(raw)
-		if err != nil {
-			return nil, false
-		}
-		polygons = append(polygons, polygon)
-	}
-	return polygons, len(polygons) > 0
-}
-
-func capCoverageGrid(identity capCoverageGeometryIdentity, shape capCoverageShape) (alertgeo.Grid, error) {
-	if identity.Source != "clc" || len(identity.Code) != 6 || identity.Code[0] != '0' {
-		return alertgeo.Grid{}, alertgeo.ErrInvalidBaseCode
-	}
-	geometry := alertgeo.Geometry{Polygons: make([]alertgeo.Polygon, 0, len(shape.Polygons))}
-	for _, polygon := range shape.Polygons {
-		converted := alertgeo.Polygon{
-			Exterior: capCoverageAlertGeoRing(polygon.Outer),
-			Holes:    make([]alertgeo.Ring, 0, len(polygon.Holes)),
-		}
-		for _, hole := range polygon.Holes {
-			converted.Holes = append(converted.Holes, capCoverageAlertGeoRing(hole))
-		}
-		geometry.Polygons = append(geometry.Polygons, converted)
-	}
-	return alertgeo.NewGrid(identity.Code, geometry)
-}
-
-func capCoverageAlertGeoRing(points []capCoveragePoint) alertgeo.Ring {
-	ring := make(alertgeo.Ring, 0, len(points))
-	for _, point := range points {
-		ring = append(ring, alertgeo.Point{Latitude: point.Latitude, Longitude: point.Longitude})
-	}
-	return ring
-}
-
-// capCollapseGridAssignments preserves selected cells, but represents a full
-// nine-cell feature by its P=0 parent. It never turns a partial group into a
-// whole parent merely to shorten a header.
-func capCollapseGridAssignments(values []string) []string {
-	set := map[string]struct{}{}
-	children := map[string]map[byte]struct{}{}
-	for _, value := range values {
-		code := sameLocationCode(value)
-		if code == "" {
-			continue
-		}
-		set[code] = struct{}{}
-		if code[0] >= '1' && code[0] <= '9' {
-			parent := "0" + code[1:]
-			if children[parent] == nil {
-				children[parent] = map[byte]struct{}{}
-			}
-			children[parent][code[0]] = struct{}{}
-		}
-	}
-	for parent, parts := range children {
-		if len(parts) != 9 {
-			continue
-		}
-		for part := byte('1'); part <= '9'; part++ {
-			delete(set, string(part)+parent[1:])
-		}
-		set[parent] = struct{}{}
-	}
-	result := make([]string, 0, len(set))
-	for code := range set {
-		result = append(result, code)
-	}
-	sort.Strings(result)
-	return result
+	return sortedUniqueCAPLocations(assignments), true
 }
 
 // capFeedCoverageFeatures resolves each configured feed scope to the exact

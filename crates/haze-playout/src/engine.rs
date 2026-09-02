@@ -26,10 +26,12 @@ use memmap2::{Mmap, MmapOptions};
 
 const SOURCE_ID: &str = "haze-playout";
 const ALERT_QUEUE_DIR: &str = "runtime/queues/alerts";
+// Keep playout's audio and alert timing at 20 ms. The bridge combines these into
+// larger messages, while downstream media outputs retain their 20 ms framing.
 const PCM_CHUNK_MS: u32 = 20;
-const MEDIA_PUBLISH_CHUNK_MS: u32 = 40;
+const MEDIA_PUBLISH_CHUNK_MS: u32 = 100;
 const LIVE_BREAKIN_MAX_BUFFER_MS: u32 = 750;
-const PCM_PUBLISH_QUEUE_CAPACITY: usize = 8;
+const PCM_PUBLISH_QUEUE_CAPACITY: usize = 3;
 const ROUTINE_AUDIO_QUEUE_CAPACITY: usize = 16;
 const PRIORITY_AUDIO_QUEUE_CAPACITY: usize = 16;
 const PRIORITY_PREPARE_QUEUE_CAPACITY: usize = 16;
@@ -338,7 +340,6 @@ impl PcmMediaKind {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct PcmMediaContext {
-    item_id: Option<String>,
     queue_id: Option<String>,
     media_kind: PcmMediaKind,
 }
@@ -347,7 +348,6 @@ impl PcmMediaContext {
     fn active(live_breakin: Option<&LiveBreakIn>, current: Option<&AudioItem>) -> Self {
         if let Some(live) = live_breakin {
             return Self {
-                item_id: Some(live.id.clone()),
                 queue_id: Some(live.id.clone()),
                 media_kind: PcmMediaKind::OperatorBreakIn,
             };
@@ -355,7 +355,6 @@ impl PcmMediaContext {
         if let Some(item) = current {
             let queue_id = item.is_alert().then(|| item.id.clone());
             return Self {
-                item_id: Some(item.id.clone()),
                 queue_id,
                 media_kind: if item.is_alert() {
                     PcmMediaKind::Alert
@@ -365,7 +364,6 @@ impl PcmMediaContext {
             };
         }
         Self {
-            item_id: None,
             queue_id: None,
             media_kind: PcmMediaKind::Silence,
         }
@@ -457,6 +455,34 @@ impl PcmDeliveryState {
 struct PcmPublisher {
     tx: mpsc::Sender<PcmPublish>,
     recycled: mpsc::Receiver<Vec<u8>>,
+}
+
+#[derive(Serialize)]
+struct PcmBridgeEvent<'a> {
+    #[serde(rename = "type")]
+    event_type: &'static str,
+    source: &'static str,
+    feed_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queue_id: Option<&'a str>,
+    timestamp: &'a str,
+    data: PcmBridgeData<'a>,
+}
+
+#[derive(Serialize)]
+struct PcmBridgeData<'a> {
+    feed_id: &'a str,
+    sample_rate: u32,
+    channels: u16,
+    channel_layout: &'a str,
+    duration_ms: u32,
+    sequence: u64,
+    pts_ns: u64,
+    discontinuity: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queue_id: Option<&'a str>,
+    media_kind: &'a str,
+    pcm: &'a str,
 }
 
 #[derive(Debug, Clone)]
@@ -1721,12 +1747,17 @@ struct FeedRunner {
 impl FeedRunner {
     async fn run(mut self, cancellation: CancellationToken) {
         self.sinks = sinks_for_feed(&self.cfg, &self.feed);
+        let publish_buffer_capacity = media_publish_buffer_capacity(
+            self.cfg.root.playout.sample_rate,
+            self.cfg.root.playout.channels,
+        );
         let pcm_publisher = spawn_pcm_publisher(
             &self.tasks,
             self.media_client.clone(),
             self.feed.id.clone(),
             self.cfg.root.playout.sample_rate,
             self.cfg.root.playout.channels,
+            publish_buffer_capacity,
         );
         let ready = tokio::select! {
             _ = cancellation.cancelled() => false,
@@ -1735,7 +1766,7 @@ impl FeedRunner {
         if ready {
             tokio::select! {
                 _ = cancellation.cancelled() => {}
-                _ = self.pump(pcm_publisher) => {}
+                _ = self.pump(pcm_publisher, publish_buffer_capacity) => {}
             }
         }
         for sink in &mut self.sinks {
@@ -1749,12 +1780,12 @@ impl FeedRunner {
         }
     }
 
-    async fn pump(&mut self, mut pcm_publisher: PcmPublisher) {
+    async fn pump(&mut self, mut pcm_publisher: PcmPublisher, publish_buffer_capacity: usize) {
         let sample_rate = self.cfg.root.playout.sample_rate;
         let channels = self.cfg.root.playout.channels;
         let chunk = silence_chunk(sample_rate, channels, PCM_CHUNK_MS);
         let publish_chunk_count = (MEDIA_PUBLISH_CHUNK_MS / PCM_CHUNK_MS).max(1) as usize;
-        let publish_buffer_capacity = chunk.len() * publish_chunk_count;
+        debug_assert_eq!(publish_buffer_capacity, chunk.len() * publish_chunk_count);
         let mut publish_builder = PcmPublishBuilder::new(publish_buffer_capacity);
         let mut last_publish_context: Option<PcmMediaContext> = None;
         let mut next_pts_frames = 0u64;
@@ -3046,17 +3077,32 @@ fn spawn_pcm_publisher(
     feed_id: String,
     sample_rate: u32,
     channels: u16,
+    buffer_capacity: usize,
 ) -> PcmPublisher {
     let (tx, mut rx) = mpsc::channel::<PcmPublish>(pcm_publish_queue_capacity());
-    let (recycle_tx, recycled) = mpsc::channel::<Vec<u8>>(pcm_publish_queue_capacity() + 2);
+    let recycle_capacity = pcm_publish_queue_capacity() + 2;
+    let (recycle_tx, recycled) = mpsc::channel::<Vec<u8>>(recycle_capacity);
+    for _ in 0..recycle_capacity {
+        recycle_tx
+            .try_send(Vec::with_capacity(buffer_capacity))
+            .expect("empty PCM recycler must accept its seeded buffers");
+    }
     tasks.spawn(async move {
         let mut delivery_state = PcmDeliveryState::default();
+        let mut encoded_pcm = String::with_capacity(buffer_capacity.saturating_mul(4).div_ceil(3));
+        let mut event = Vec::with_capacity(buffer_capacity.saturating_mul(4).div_ceil(3) + 512);
         while let Some(mut chunk) = rx.recv().await {
             delivery_state.prepare(&mut chunk);
-            let succeeded = client
-                .publish(pcm_publish_event(&feed_id, sample_rate, channels, &chunk))
-                .await
-                .is_ok();
+            serialize_pcm_publish_event_line(
+                &mut event,
+                &mut encoded_pcm,
+                &feed_id,
+                sample_rate,
+                channels,
+                &chunk,
+            )
+            .expect("PCM bridge event only contains serializable fields");
+            let succeeded = client.write_event_line(&event).await.is_ok();
             delivery_state.record_result(succeeded);
             chunk.data.clear();
             let _ = recycle_tx.try_send(chunk.data);
@@ -3107,33 +3153,65 @@ fn flush_pcm_publish(
     }
 }
 
+fn media_publish_buffer_capacity(sample_rate: u32, channels: u16) -> usize {
+    let chunk = silence_chunk(sample_rate, channels, PCM_CHUNK_MS);
+    let publish_chunk_count = (MEDIA_PUBLISH_CHUNK_MS / PCM_CHUNK_MS).max(1) as usize;
+    chunk.len().saturating_mul(publish_chunk_count)
+}
+
+fn serialize_pcm_publish_event_line(
+    event: &mut Vec<u8>,
+    encoded_pcm: &mut String,
+    feed_id: &str,
+    sample_rate: u32,
+    channels: u16,
+    chunk: &PcmPublish,
+) -> Result<()> {
+    encoded_pcm.clear();
+    base64::engine::general_purpose::STANDARD.encode_string(&chunk.data, encoded_pcm);
+    let timestamp = Utc::now().to_rfc3339();
+    let channel_layout = pcm_channel_layout(channels);
+    let queue_id = chunk.queue_id.as_deref();
+    let payload = PcmBridgeEvent {
+        event_type: "playout.pcm",
+        source: SOURCE_ID,
+        feed_id,
+        queue_id,
+        timestamp: &timestamp,
+        data: PcmBridgeData {
+            feed_id,
+            sample_rate,
+            channels,
+            channel_layout: &channel_layout,
+            duration_ms: chunk.duration_ms,
+            sequence: chunk.sequence,
+            pts_ns: chunk.pts_ns,
+            discontinuity: chunk.discontinuity,
+            queue_id,
+            media_kind: chunk.media_kind.as_str(),
+            pcm: encoded_pcm,
+        },
+    };
+    event.clear();
+    serde_json::to_writer(&mut *event, &payload)?;
+    event.push(b'\n');
+    Ok(())
+}
+
+#[cfg(test)]
 fn pcm_publish_event(feed_id: &str, sample_rate: u32, channels: u16, chunk: &PcmPublish) -> Value {
-    let pcm = base64::engine::general_purpose::STANDARD.encode(&chunk.data);
-    let mut data = json!({
-        "feed_id": feed_id,
-        "sample_rate": sample_rate,
-        "channels": channels,
-        "channel_layout": pcm_channel_layout(channels),
-        "duration_ms": chunk.duration_ms,
-        "sequence": chunk.sequence,
-        "pts_ns": chunk.pts_ns,
-        "discontinuity": chunk.discontinuity,
-        "media_kind": chunk.media_kind.as_str(),
-        "pcm": pcm,
-    });
-    if let (Some(queue_id), Some(object)) = (&chunk.queue_id, data.as_object_mut()) {
-        object.insert("queue_id".to_string(), json!(queue_id));
-    }
-    let mut event = json!({
-        "type": "playout.pcm",
-        "source": SOURCE_ID,
-        "feed_id": feed_id,
-        "data": data,
-    });
-    if let (Some(queue_id), Some(object)) = (&chunk.queue_id, event.as_object_mut()) {
-        object.insert("queue_id".to_string(), json!(queue_id));
-    }
-    event
+    let mut event = Vec::new();
+    let mut encoded_pcm = String::new();
+    serialize_pcm_publish_event_line(
+        &mut event,
+        &mut encoded_pcm,
+        feed_id,
+        sample_rate,
+        channels,
+        chunk,
+    )
+    .expect("PCM bridge event only contains serializable fields");
+    serde_json::from_slice(&event).expect("serialized PCM bridge event must be valid JSON")
 }
 
 fn pcm_channel_layout(channels: u16) -> String {
@@ -6267,9 +6345,9 @@ mod tests {
 
     #[test]
     fn realtime_pcm_publish_queue_stays_short_but_smooth() {
-        assert!(media_publish_chunk_duration() <= Duration::from_millis(40));
-        assert!(media_publish_queue_duration() <= Duration::from_millis(640));
-        assert!(pcm_publish_queue_capacity() >= 4);
+        assert!(media_publish_chunk_duration() <= Duration::from_millis(100));
+        assert!(media_publish_queue_duration() <= Duration::from_millis(300));
+        assert!(pcm_publish_queue_capacity() >= 3);
     }
 
     #[test]
@@ -6288,6 +6366,7 @@ mod tests {
 
         assert_eq!(event["type"], "playout.pcm");
         assert_eq!(event["feed_id"], "sk-0001");
+        assert!(event["timestamp"].as_str().is_some());
         assert_eq!(event["queue_id"], "alert-7");
         assert_eq!(event["data"]["feed_id"], "sk-0001");
         assert_eq!(event["data"]["sample_rate"], 48_000);
@@ -6329,7 +6408,6 @@ mod tests {
     #[test]
     fn pcm_builder_sequences_chunks_and_marks_explicit_discontinuities() {
         let context = PcmMediaContext {
-            item_id: Some("alert-1".to_string()),
             queue_id: Some("alert-1".to_string()),
             media_kind: PcmMediaKind::Alert,
         };
@@ -6406,7 +6484,6 @@ mod tests {
 
         let routine_context = PcmMediaContext::active(None, Some(&routine));
         assert_eq!(routine_context.media_kind, PcmMediaKind::Routine);
-        assert_eq!(routine_context.item_id.as_deref(), Some("routine-1"));
         assert_eq!(routine_context.queue_id, None);
 
         let alert_context = PcmMediaContext::active(None, Some(&alert));
@@ -6495,8 +6572,8 @@ mod tests {
     }
 
     #[test]
-    fn realtime_lag_warning_ignores_single_frame_jitter() {
-        assert!(realtime_lag_warn_backlog() > Duration::from_millis(u64::from(PCM_CHUNK_MS)));
+    fn realtime_lag_warning_ignores_ordinary_scheduler_jitter() {
+        assert!(realtime_lag_warn_backlog() > Duration::from_millis(20));
     }
 
     #[test]

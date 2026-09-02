@@ -379,7 +379,7 @@ func TestBundledLocationCatalogProperties(t *testing.T) {
 	if len(snapshot.Places) < 15000 {
 		t.Fatalf("bundled location records = %d, want at least 15000", len(snapshot.Places))
 	}
-	feeds, err := loadFeeds(filepath.Join(baseDir, "managed", "configs", "feeds.xml"))
+	feeds, err := loadFeeds(filepath.Join(baseDir, "managed", "feeds"))
 	if err != nil {
 		t.Fatal(err)
 	}
