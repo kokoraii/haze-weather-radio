@@ -9,10 +9,11 @@ use std::time::{Duration, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use base64::Engine;
 use chrono::{DateTime, Duration as ChronoDuration, Timelike, Utc};
+use haze_media_protocol::{encode_pcm_frame, PcmFrame, PcmMediaKind as WirePcmMediaKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
@@ -29,9 +30,13 @@ const ALERT_QUEUE_DIR: &str = "runtime/queues/alerts";
 // Keep playout's audio and alert timing at 20 ms. The bridge combines these into
 // larger messages, while downstream media outputs retain their 20 ms framing.
 const PCM_CHUNK_MS: u32 = 20;
-const MEDIA_PUBLISH_CHUNK_MS: u32 = 100;
+const MEDIA_PUBLISH_CHUNK_MS: u32 = 40;
+const ROUTINE_PREPARATION_CONCURRENCY: usize = 1;
+const PRIORITY_PREPARATION_CONCURRENCY: usize = 1;
 const LIVE_BREAKIN_MAX_BUFFER_MS: u32 = 750;
-const PCM_PUBLISH_QUEUE_CAPACITY: usize = 3;
+// Two 40 ms messages plus media's 120-140 ms jitter queue stay below the
+// 250 ms end-to-end server buffering budget.
+const PCM_PUBLISH_QUEUE_CAPACITY: usize = 2;
 const ROUTINE_AUDIO_QUEUE_CAPACITY: usize = 16;
 const PRIORITY_AUDIO_QUEUE_CAPACITY: usize = 16;
 const PRIORITY_PREPARE_QUEUE_CAPACITY: usize = 16;
@@ -328,12 +333,12 @@ enum PcmMediaKind {
 }
 
 impl PcmMediaKind {
-    fn as_str(self) -> &'static str {
+    fn as_wire_kind(self) -> WirePcmMediaKind {
         match self {
-            Self::Silence => "silence",
-            Self::Routine => "routine",
-            Self::Alert => "alert",
-            Self::OperatorBreakIn => "operator_breakin",
+            Self::Silence => WirePcmMediaKind::Silence,
+            Self::Routine => WirePcmMediaKind::Routine,
+            Self::Alert => WirePcmMediaKind::Alert,
+            Self::OperatorBreakIn => WirePcmMediaKind::OperatorBreakIn,
         }
     }
 }
@@ -457,34 +462,6 @@ struct PcmPublisher {
     recycled: mpsc::Receiver<Vec<u8>>,
 }
 
-#[derive(Serialize)]
-struct PcmBridgeEvent<'a> {
-    #[serde(rename = "type")]
-    event_type: &'static str,
-    source: &'static str,
-    feed_id: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    queue_id: Option<&'a str>,
-    timestamp: &'a str,
-    data: PcmBridgeData<'a>,
-}
-
-#[derive(Serialize)]
-struct PcmBridgeData<'a> {
-    feed_id: &'a str,
-    sample_rate: u32,
-    channels: u16,
-    channel_layout: &'a str,
-    duration_ms: u32,
-    sequence: u64,
-    pts_ns: u64,
-    discontinuity: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    queue_id: Option<&'a str>,
-    media_kind: &'a str,
-    pcm: &'a str,
-}
-
 #[derive(Debug, Clone)]
 enum BreakInCommand {
     Start {
@@ -531,6 +508,7 @@ struct FeedHandle {
     segment_group_mailbox: Arc<StdMutex<SegmentGroupMailbox>>,
     segment_group_tx: mpsc::Sender<String>,
     priority_prepare_tx: mpsc::Sender<Value>,
+    recovery_priority_tx: mpsc::Sender<AudioItem>,
     breakin_tx: mpsc::Sender<BreakInCommand>,
     request_tx: mpsc::Sender<PackageRequest>,
     control_tx: mpsc::Sender<PlayoutControl>,
@@ -598,6 +576,23 @@ struct AlertCandidate {
     item: AlertQueueItem,
     id: String,
     sort_key: AlertSortKey,
+}
+
+#[derive(Debug, Clone)]
+struct AlertRecoveryTarget {
+    feed: FeedConfig,
+    audio_tx: mpsc::Sender<AudioItem>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct ManifestFingerprint {
+    len: u64,
+    modified_ns: u128,
+}
+
+#[derive(Debug, Clone)]
+struct CachedAlertManifest {
+    fingerprint: ManifestFingerprint,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
@@ -703,6 +698,8 @@ async fn run_connected(
     let mut handles = HashMap::<String, FeedHandle>::new();
     let audio_cache = Arc::new(AudioCache::default());
     let session_tasks = SessionTasks::new();
+    let routine_preparation = Arc::new(Semaphore::new(ROUTINE_PREPARATION_CONCURRENCY));
+    let priority_preparation = Arc::new(Semaphore::new(PRIORITY_PREPARATION_CONCURRENCY));
     session_tasks.track_abortable(reader_task);
     spawn_audio_cache_maintenance(&session_tasks, &audio_cache);
     for feed in cfg.enabled_feeds().cloned() {
@@ -722,11 +719,28 @@ async fn run_connected(
             client.clone(),
             media_client.clone(),
             feed,
-            options.alert_poll,
             Arc::clone(&audio_cache),
+            Arc::clone(&routine_preparation),
+            Arc::clone(&priority_preparation),
             &session_tasks,
         );
         handles.insert(handle.feed.id.clone(), handle);
+    }
+    let alert_recovery_targets = handles
+        .values()
+        .filter(|handle| handle.feed.same_enabled())
+        .map(|handle| AlertRecoveryTarget {
+            feed: handle.feed.clone(),
+            audio_tx: handle.recovery_priority_tx.clone(),
+        })
+        .collect::<Vec<_>>();
+    if !alert_recovery_targets.is_empty() {
+        session_tasks.spawn(alert_recovery_coordinator(
+            Arc::clone(&cfg),
+            Arc::clone(&audio_cache),
+            alert_recovery_targets,
+            options.alert_poll,
+        ));
     }
     client.service_ready(handles.len()).await;
 
@@ -1635,8 +1649,9 @@ impl FeedHandle {
         client: BridgeClient,
         media_client: BridgeClient,
         feed: FeedConfig,
-        alert_poll: Duration,
         audio_cache: Arc<AudioCache>,
+        routine_preparation: Arc<Semaphore>,
+        priority_preparation: Arc<Semaphore>,
         tasks: &SessionTasks,
     ) -> Self {
         let (audio_tx, audio_rx) = mpsc::channel(ROUTINE_AUDIO_QUEUE_CAPACITY);
@@ -1658,6 +1673,7 @@ impl FeedHandle {
             Arc::clone(&audio_cache),
             request_rx,
             audio_tx.clone(),
+            routine_preparation,
         ));
         tasks.spawn(priority_builder(
             Arc::clone(&cfg),
@@ -1665,6 +1681,7 @@ impl FeedHandle {
             Arc::clone(&audio_cache),
             priority_prepare_rx,
             priority_tx.clone(),
+            priority_preparation,
         ));
         tasks.spawn(segment_group_builder(
             Arc::clone(&cfg),
@@ -1673,17 +1690,6 @@ impl FeedHandle {
             segment_group_rx,
             segment_group_revision_tx,
         ));
-
-        if feed.same_enabled() {
-            tasks.spawn(alert_scanner(
-                Arc::clone(&cfg),
-                client.clone(),
-                feed.clone(),
-                Arc::clone(&audio_cache),
-                priority_tx.clone(),
-                alert_poll,
-            ));
-        }
 
         if feed.routine_enabled() && !cfg.root.services.go.playlist.enabled {
             if let Some(package_id) = cfg.routine_playlist_order().first() {
@@ -1720,6 +1726,7 @@ impl FeedHandle {
             segment_group_mailbox,
             segment_group_tx,
             priority_prepare_tx,
+            recovery_priority_tx: priority_tx,
             breakin_tx,
             request_tx,
             control_tx,
@@ -2909,8 +2916,9 @@ fn realtime_chunks_due(media_remainder: &mut Duration, elapsed: Duration) -> (us
     let available = media_remainder.saturating_add(elapsed);
     *media_remainder = Duration::ZERO;
     let late_by = available.saturating_sub(chunk_interval);
-    // Tokio replays short missed intervals immediately. Treating normal scheduler
-    // jitter as dropped audio made the playout source run permanently slow.
+    // Long scheduler stalls are stale media, not a reason to replay audio in a
+    // burst. The media service keeps a short paced queue and inserts silence
+    // when necessary, which is safer than time-compressing a live feed.
     let dropped = if late_by >= realtime_lag_warn_backlog() {
         late_by
     } else {
@@ -2939,7 +2947,7 @@ fn sample_frames_to_ns(frames: u64, sample_rate: u32) -> u64 {
 }
 
 fn realtime_tick_missed_behavior() -> MissedTickBehavior {
-    MissedTickBehavior::Burst
+    MissedTickBehavior::Skip
 }
 
 fn pcm_publish_queue_capacity() -> usize {
@@ -3089,20 +3097,12 @@ fn spawn_pcm_publisher(
     }
     tasks.spawn(async move {
         let mut delivery_state = PcmDeliveryState::default();
-        let mut encoded_pcm = String::with_capacity(buffer_capacity.saturating_mul(4).div_ceil(3));
-        let mut event = Vec::with_capacity(buffer_capacity.saturating_mul(4).div_ceil(3) + 512);
+        let mut frame = Vec::with_capacity(buffer_capacity.saturating_add(feed_id.len() + 64));
         while let Some(mut chunk) = rx.recv().await {
             delivery_state.prepare(&mut chunk);
-            serialize_pcm_publish_event_line(
-                &mut event,
-                &mut encoded_pcm,
-                &feed_id,
-                sample_rate,
-                channels,
-                &chunk,
-            )
-            .expect("PCM bridge event only contains serializable fields");
-            let succeeded = client.write_event_line(&event).await.is_ok();
+            serialize_pcm_publish_frame(&mut frame, &feed_id, sample_rate, channels, &chunk)
+                .expect("PCM bridge frame only contains bounded serializable fields");
+            let succeeded = client.write_raw(&frame).await.is_ok();
             delivery_state.record_result(succeeded);
             chunk.data.clear();
             let _ = recycle_tx.try_send(chunk.data);
@@ -3159,68 +3159,42 @@ fn media_publish_buffer_capacity(sample_rate: u32, channels: u16) -> usize {
     chunk.len().saturating_mul(publish_chunk_count)
 }
 
-fn serialize_pcm_publish_event_line(
-    event: &mut Vec<u8>,
-    encoded_pcm: &mut String,
+fn serialize_pcm_publish_frame(
+    frame: &mut Vec<u8>,
     feed_id: &str,
     sample_rate: u32,
     channels: u16,
     chunk: &PcmPublish,
 ) -> Result<()> {
-    encoded_pcm.clear();
-    base64::engine::general_purpose::STANDARD.encode_string(&chunk.data, encoded_pcm);
-    let timestamp = Utc::now().to_rfc3339();
-    let channel_layout = pcm_channel_layout(channels);
-    let queue_id = chunk.queue_id.as_deref();
-    let payload = PcmBridgeEvent {
-        event_type: "playout.pcm",
-        source: SOURCE_ID,
-        feed_id,
-        queue_id,
-        timestamp: &timestamp,
-        data: PcmBridgeData {
+    encode_pcm_frame(
+        frame,
+        PcmFrame {
             feed_id,
+            queue_id: chunk.queue_id.as_deref(),
             sample_rate,
             channels,
-            channel_layout: &channel_layout,
             duration_ms: chunk.duration_ms,
             sequence: chunk.sequence,
             pts_ns: chunk.pts_ns,
             discontinuity: chunk.discontinuity,
-            queue_id,
-            media_kind: chunk.media_kind.as_str(),
-            pcm: encoded_pcm,
+            media_kind: chunk.media_kind.as_wire_kind(),
+            pcm: &chunk.data,
         },
-    };
-    event.clear();
-    serde_json::to_writer(&mut *event, &payload)?;
-    event.push(b'\n');
+    )?;
     Ok(())
 }
 
 #[cfg(test)]
-fn pcm_publish_event(feed_id: &str, sample_rate: u32, channels: u16, chunk: &PcmPublish) -> Value {
-    let mut event = Vec::new();
-    let mut encoded_pcm = String::new();
-    serialize_pcm_publish_event_line(
-        &mut event,
-        &mut encoded_pcm,
-        feed_id,
-        sample_rate,
-        channels,
-        chunk,
-    )
-    .expect("PCM bridge event only contains serializable fields");
-    serde_json::from_slice(&event).expect("serialized PCM bridge event must be valid JSON")
-}
-
-fn pcm_channel_layout(channels: u16) -> String {
-    match channels.max(1) {
-        1 => "mono".to_string(),
-        2 => "stereo".to_string(),
-        6 => "5.1".to_string(),
-        count => format!("{count}ch"),
-    }
+fn pcm_publish_frame(
+    feed_id: &str,
+    sample_rate: u32,
+    channels: u16,
+    chunk: &PcmPublish,
+) -> Vec<u8> {
+    let mut frame = Vec::new();
+    serialize_pcm_publish_frame(&mut frame, feed_id, sample_rate, channels, chunk)
+        .expect("PCM bridge frame only contains bounded serializable fields");
+    frame
 }
 
 impl AudioCache {
@@ -3631,6 +3605,7 @@ async fn package_builder(
     audio_cache: Arc<AudioCache>,
     mut requests: mpsc::Receiver<PackageRequest>,
     audio_tx: mpsc::Sender<AudioItem>,
+    preparation: Arc<Semaphore>,
 ) {
     let mut recent = HashMap::<String, Instant>::new();
     while let Some(request) = requests.recv().await {
@@ -3647,6 +3622,9 @@ async fn package_builder(
                 break;
             }
             continue;
+        };
+        let Ok(_permit) = preparation.acquire().await else {
+            break;
         };
         match build_package(&cfg, &client, &audio_cache, &feed, &request.package_id).await {
             Ok(item) => {
@@ -3694,8 +3672,12 @@ async fn priority_builder(
     audio_cache: Arc<AudioCache>,
     mut requests: mpsc::Receiver<Value>,
     priority_tx: mpsc::Sender<AudioItem>,
+    preparation: Arc<Semaphore>,
 ) {
     while let Some(data) = requests.recv().await {
+        let Ok(_permit) = preparation.acquire().await else {
+            break;
+        };
         match audio_item_from_priority_ready(&cfg, &audio_cache, &feed, data).await {
             Ok(item) => {
                 if priority_tx.send(item).await.is_err() {
@@ -4336,35 +4318,55 @@ fn priority_request_is_cancelled(data: &Value) -> bool {
         .any(|marker| header.contains(marker))
 }
 
-async fn alert_scanner(
+async fn alert_recovery_coordinator(
     cfg: Arc<LoadedConfig>,
-    _client: BridgeClient,
-    feed: FeedConfig,
     audio_cache: Arc<AudioCache>,
-    audio_tx: mpsc::Sender<AudioItem>,
+    targets: Vec<AlertRecoveryTarget>,
     poll: Duration,
 ) {
-    let mut seen = HashSet::<String>::new();
+    let mut seen = HashSet::<(String, String)>::new();
+    let mut cache = HashMap::<PathBuf, CachedAlertManifest>::new();
     let mut ticker = interval(poll.max(Duration::from_millis(25)));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
-        if let Err(err) = scan_alerts_once(&cfg, &audio_cache, &feed, &audio_tx, &mut seen).await {
-            tracing::warn!(feed_id = feed.id, "alert queue scan failed: {err}");
+        let queue_dir = cfg.base_dir.join(ALERT_QUEUE_DIR);
+        let previous_cache = std::mem::take(&mut cache);
+        let scan = tokio::task::spawn_blocking(move || {
+            load_changed_alert_manifests(&queue_dir, previous_cache)
+        })
+        .await;
+        let changed = match scan {
+            Ok(Ok((next_cache, changed))) => {
+                cache = next_cache;
+                changed
+            }
+            Ok(Err(err)) => {
+                tracing::warn!("shared alert queue scan failed: {err}");
+                continue;
+            }
+            Err(err) => {
+                tracing::warn!("shared alert queue scan task failed: {err}");
+                continue;
+            }
+        };
+        if let Err(err) =
+            reconcile_changed_alerts(&cfg, &audio_cache, &targets, &mut seen, changed).await
+        {
+            tracing::warn!("shared alert queue reconciliation failed: {err}");
         }
     }
 }
 
-async fn scan_alerts_once(
-    cfg: &LoadedConfig,
-    audio_cache: &AudioCache,
-    feed: &FeedConfig,
-    audio_tx: &mpsc::Sender<AudioItem>,
-    seen: &mut HashSet<String>,
-) -> Result<()> {
-    let queue_dir = cfg.base_dir.join(ALERT_QUEUE_DIR);
-    let Ok(entries) = fs::read_dir(&queue_dir) else {
-        return Ok(());
+fn load_changed_alert_manifests(
+    queue_dir: &Path,
+    mut cache: HashMap<PathBuf, CachedAlertManifest>,
+) -> Result<(
+    HashMap<PathBuf, CachedAlertManifest>,
+    Vec<(PathBuf, AlertQueueItem)>,
+)> {
+    let Ok(entries) = fs::read_dir(queue_dir) else {
+        return Ok((cache, Vec::new()));
     };
     let mut manifests: Vec<PathBuf> = entries
         .flatten()
@@ -4375,87 +4377,134 @@ async fn scan_alerts_once(
         })
         .collect();
     manifests.sort();
-    let mut candidates = Vec::<AlertCandidate>::new();
+    cache.retain(|path, _| manifests.binary_search(path).is_ok());
+    let mut changed = Vec::new();
     for manifest in manifests {
+        let Ok(fingerprint) = manifest_fingerprint(&manifest) else {
+            continue;
+        };
+        if cache
+            .get(&manifest)
+            .is_some_and(|entry| entry.fingerprint == fingerprint)
+        {
+            continue;
+        }
         let Ok(item) = read_alert_item(&manifest) else {
             continue;
         };
-        if split_same_part(&item) || legacy_split_alert_item(&item) {
-            let mut item = item;
-            item.status = "superseded".to_string();
-            item.last_error = Some(
-                "split legacy alert item is superseded by combined SAME alert audio".to_string(),
-            );
-            let _ = write_alert_item(&manifest, &item);
-            continue;
-        }
-        if !alert_targets_feed(&item, feed) || !alert_pending(&item.status) {
-            continue;
-        }
-        if alert_item_stale_for_priority(&item, Utc::now()) {
-            let mut item = item;
-            item.status = "superseded".to_string();
-            item.last_error = Some("alert queue item is stale or cancelled".to_string());
-            let _ = write_alert_item(&manifest, &item);
-            continue;
-        }
-        let id = fallback_text(
-            &item.id,
-            &safe_id(
-                manifest
-                    .file_stem()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or("alert"),
-            ),
-        );
-        if seen.contains(&id) {
-            continue;
-        }
-        let sort_key = alert_sort_key(&item, &id, &feed.id);
-        candidates.push(AlertCandidate {
-            manifest,
-            item,
-            id,
-            sort_key,
-        });
+        cache.insert(manifest.clone(), CachedAlertManifest { fingerprint });
+        changed.push((manifest, item));
     }
-    candidates.sort_by(|left, right| left.sort_key.cmp(&right.sort_key));
 
-    for candidate in candidates {
-        let AlertCandidate {
-            manifest,
-            mut item,
-            id,
-            ..
-        } = candidate;
-        match audio_item_from_alert(cfg, audio_cache, feed, &manifest, &mut item, &id).await {
-            Ok(audio) => {
-                item.status = "queued".to_string();
-                item.claimed_at = Some(Utc::now().to_rfc3339());
-                item.failed_at = None;
-                item.last_error = None;
-                if let Err(err) = write_alert_item(&manifest, &item) {
-                    tracing::warn!(
-                        feed_id = feed.id,
-                        alert_id = id,
-                        "failed to claim alert queue item: {err}"
-                    );
-                    continue;
-                }
-                seen.insert(id);
-                if audio_tx.send(audio).await.is_err() {
-                    break;
-                }
-            }
-            Err(err) => {
-                item.status = "failed".to_string();
-                item.failed_at = Some(Utc::now().to_rfc3339());
-                item.last_error = Some(err.to_string());
+    Ok((cache, changed))
+}
+
+async fn reconcile_changed_alerts(
+    cfg: &LoadedConfig,
+    audio_cache: &AudioCache,
+    targets: &[AlertRecoveryTarget],
+    seen: &mut HashSet<(String, String)>,
+    changed: Vec<(PathBuf, AlertQueueItem)>,
+) -> Result<()> {
+    for target in targets {
+        let mut candidates = Vec::<AlertCandidate>::new();
+        for (manifest, item) in &changed {
+            let item = item.clone();
+            if split_same_part(&item) || legacy_split_alert_item(&item) {
+                let mut item = item;
+                item.status = "superseded".to_string();
+                item.last_error = Some(
+                    "split legacy alert item is superseded by combined SAME alert audio"
+                        .to_string(),
+                );
                 let _ = write_alert_item(&manifest, &item);
+                continue;
+            }
+            if !alert_targets_feed(&item, &target.feed) || !alert_pending(&item.status) {
+                continue;
+            }
+            if alert_item_stale_for_priority(&item, Utc::now()) {
+                let mut item = item;
+                item.status = "superseded".to_string();
+                item.last_error = Some("alert queue item is stale or cancelled".to_string());
+                let _ = write_alert_item(&manifest, &item);
+                continue;
+            }
+            let id = fallback_text(
+                &item.id,
+                &safe_id(
+                    manifest
+                        .file_stem()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("alert"),
+                ),
+            );
+            let seen_key = (target.feed.id.clone(), id.clone());
+            if seen.contains(&seen_key) {
+                continue;
+            }
+            let sort_key = alert_sort_key(&item, &id, &target.feed.id);
+            candidates.push(AlertCandidate {
+                manifest: manifest.clone(),
+                item,
+                id,
+                sort_key,
+            });
+        }
+        candidates.sort_by(|left, right| left.sort_key.cmp(&right.sort_key));
+
+        for candidate in candidates {
+            let AlertCandidate {
+                manifest,
+                mut item,
+                id,
+                ..
+            } = candidate;
+            match audio_item_from_alert(cfg, audio_cache, &target.feed, &manifest, &mut item, &id)
+                .await
+            {
+                Ok(audio) => {
+                    item.status = "queued".to_string();
+                    item.claimed_at = Some(Utc::now().to_rfc3339());
+                    item.failed_at = None;
+                    item.last_error = None;
+                    if let Err(err) = write_alert_item(&manifest, &item) {
+                        tracing::warn!(
+                            feed_id = target.feed.id,
+                            alert_id = id,
+                            "failed to claim alert queue item: {err}"
+                        );
+                        continue;
+                    }
+                    seen.insert((target.feed.id.clone(), id));
+                    if target.audio_tx.send(audio).await.is_err() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    item.status = "failed".to_string();
+                    item.failed_at = Some(Utc::now().to_rfc3339());
+                    item.last_error = Some(err.to_string());
+                    let _ = write_alert_item(&manifest, &item);
+                }
             }
         }
     }
     Ok(())
+}
+
+fn manifest_fingerprint(path: &Path) -> Result<ManifestFingerprint> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("failed to stat alert manifest {}", path.display()))?;
+    let modified_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |duration| duration.as_nanos());
+    Ok(ManifestFingerprint {
+        len: metadata.len(),
+        modified_ns,
+    })
 }
 
 fn alert_sort_key(item: &AlertQueueItem, id: &str, feed_id: &str) -> AlertSortKey {
@@ -6345,13 +6394,13 @@ mod tests {
 
     #[test]
     fn realtime_pcm_publish_queue_stays_short_but_smooth() {
-        assert!(media_publish_chunk_duration() <= Duration::from_millis(100));
-        assert!(media_publish_queue_duration() <= Duration::from_millis(300));
-        assert!(pcm_publish_queue_capacity() >= 3);
+        assert_eq!(media_publish_chunk_duration(), Duration::from_millis(40));
+        assert_eq!(media_publish_queue_duration(), Duration::from_millis(80));
+        assert_eq!(pcm_publish_queue_capacity(), 2);
     }
 
     #[test]
-    fn alert_pcm_event_includes_queue_and_timing_contract() {
+    fn alert_pcm_frame_includes_queue_and_timing_contract() {
         let chunk = PcmPublish {
             data: vec![1, 0, 2, 0],
             duration_ms: 20,
@@ -6362,27 +6411,23 @@ mod tests {
             media_kind: PcmMediaKind::Alert,
         };
 
-        let event = pcm_publish_event("sk-0001", 48_000, 1, &chunk);
+        let frame = pcm_publish_frame("sk-0001", 48_000, 1, &chunk);
+        let decoded = haze_media_protocol::decode_pcm_frame(&frame).expect("decode PCM frame");
 
-        assert_eq!(event["type"], "playout.pcm");
-        assert_eq!(event["feed_id"], "sk-0001");
-        assert!(event["timestamp"].as_str().is_some());
-        assert_eq!(event["queue_id"], "alert-7");
-        assert_eq!(event["data"]["feed_id"], "sk-0001");
-        assert_eq!(event["data"]["sample_rate"], 48_000);
-        assert_eq!(event["data"]["channels"], 1);
-        assert_eq!(event["data"]["channel_layout"], "mono");
-        assert_eq!(event["data"]["duration_ms"], 20);
-        assert_eq!(event["data"]["sequence"], 7);
-        assert_eq!(event["data"]["pts_ns"], 140_000_000u64);
-        assert_eq!(event["data"]["discontinuity"], true);
-        assert_eq!(event["data"]["queue_id"], "alert-7");
-        assert_eq!(event["data"]["media_kind"], "alert");
-        assert_eq!(event["data"]["pcm"], "AQACAA==");
+        assert_eq!(decoded.feed_id, "sk-0001");
+        assert_eq!(decoded.queue_id, Some("alert-7"));
+        assert_eq!(decoded.sample_rate, 48_000);
+        assert_eq!(decoded.channels, 1);
+        assert_eq!(decoded.duration_ms, 20);
+        assert_eq!(decoded.sequence, 7);
+        assert_eq!(decoded.pts_ns, 140_000_000);
+        assert!(decoded.discontinuity);
+        assert_eq!(decoded.media_kind, WirePcmMediaKind::Alert);
+        assert_eq!(decoded.pcm, [1, 0, 2, 0]);
     }
 
     #[test]
-    fn routine_pcm_event_preserves_audio_fields_without_queue_id() {
+    fn routine_pcm_frame_preserves_audio_fields_without_queue_id() {
         let chunk = PcmPublish {
             data: vec![1, 2],
             duration_ms: 40,
@@ -6393,16 +6438,15 @@ mod tests {
             media_kind: PcmMediaKind::Routine,
         };
 
-        let event = pcm_publish_event("sk-0001", 48_000, 2, &chunk);
+        let frame = pcm_publish_frame("sk-0001", 48_000, 2, &chunk);
+        let decoded = haze_media_protocol::decode_pcm_frame(&frame).expect("decode PCM frame");
 
-        assert!(event.get("queue_id").is_none());
-        assert!(event["data"].get("queue_id").is_none());
-        assert_eq!(event["data"]["sample_rate"], 48_000);
-        assert_eq!(event["data"]["channels"], 2);
-        assert_eq!(event["data"]["duration_ms"], 40);
-        assert_eq!(event["data"]["channel_layout"], "stereo");
-        assert_eq!(event["data"]["media_kind"], "routine");
-        assert_eq!(event["data"]["pcm"], "AQI=");
+        assert_eq!(decoded.queue_id, None);
+        assert_eq!(decoded.sample_rate, 48_000);
+        assert_eq!(decoded.channels, 2);
+        assert_eq!(decoded.duration_ms, 40);
+        assert_eq!(decoded.media_kind, WirePcmMediaKind::Routine);
+        assert_eq!(decoded.pcm, [1, 2]);
     }
 
     #[test]
@@ -6514,16 +6558,7 @@ mod tests {
     }
 
     #[test]
-    fn pcm_channel_layout_names_are_stable() {
-        assert_eq!(pcm_channel_layout(0), "mono");
-        assert_eq!(pcm_channel_layout(1), "mono");
-        assert_eq!(pcm_channel_layout(2), "stereo");
-        assert_eq!(pcm_channel_layout(6), "5.1");
-        assert_eq!(pcm_channel_layout(8), "8ch");
-    }
-
-    #[test]
-    fn realtime_tick_preserves_short_scheduler_stalls_for_burst_recovery() {
+    fn realtime_tick_preserves_short_scheduler_stalls_without_replaying_audio() {
         let mut remainder = Duration::ZERO;
 
         let (chunks, dropped) = realtime_chunks_due(&mut remainder, Duration::from_millis(70));
@@ -6534,7 +6569,7 @@ mod tests {
     }
 
     #[test]
-    fn realtime_tick_preserves_short_scheduler_jitter_for_burst_recovery() {
+    fn realtime_tick_preserves_short_scheduler_jitter_without_replaying_audio() {
         let mut remainder = Duration::ZERO;
 
         let (first_chunks, first_dropped) =
@@ -6577,7 +6612,7 @@ mod tests {
     }
 
     #[test]
-    fn realtime_ticker_replays_short_missed_ticks() {
-        assert_eq!(realtime_tick_missed_behavior(), MissedTickBehavior::Burst);
+    fn realtime_ticker_skips_missed_ticks() {
+        assert_eq!(realtime_tick_missed_behavior(), MissedTickBehavior::Skip);
     }
 }

@@ -1,12 +1,17 @@
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use serde_json::Value;
+use base64::Engine as _;
+use haze_media_protocol::{
+    decode_pcm_frame, pcm_frame_len_from_prefix, PcmMediaKind, PCM_FRAME_MAGIC,
+    PCM_FRAME_PREFIX_LEN,
+};
+use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
 
 const CAP_REPLAY_WINDOW: Duration = Duration::from_secs(15 * 60);
@@ -17,7 +22,12 @@ const CLIENT_HANDSHAKE_GRACE: Duration = Duration::from_millis(500);
 
 struct BridgeEnvelope {
     origin: Option<usize>,
-    value: Value,
+    payload: BridgePayload,
+}
+
+enum BridgePayload {
+    Json(Value),
+    BinaryPcm(Vec<u8>),
 }
 
 struct BridgeClientHandle {
@@ -26,6 +36,7 @@ struct BridgeClientHandle {
     receive_events: bool,
     client_id: Option<String>,
     subscriptions: Vec<String>,
+    binary_pcm: bool,
     legacy_activation_at: Option<Instant>,
 }
 
@@ -35,6 +46,7 @@ enum ClientMessage {
         receive_events: bool,
         client_id: Option<String>,
         subscriptions: Vec<String>,
+        binary_pcm: bool,
     },
     Consumed,
 }
@@ -65,7 +77,7 @@ impl HostBridge {
                     if envelope_sender
                         .send(BridgeEnvelope {
                             origin: None,
-                            value,
+                            payload: BridgePayload::Json(value),
                         })
                         .is_err()
                     {
@@ -89,41 +101,49 @@ impl HostBridge {
                 };
                 drain_new_clients(&client_receiver, &mut clients);
                 activate_due_legacy_clients(&mut clients, &mut cap_replay);
-                match handle_client_message(envelope.value.clone()) {
-                    ClientMessage::Event(message) => {
-                        activate_origin_as_legacy(&mut clients, envelope.origin, &mut cap_replay);
-                        let _ = event_sender.send(message.clone());
-                        let Ok(mut raw) = serde_json::to_vec(&message) else {
-                            continue;
-                        };
-                        raw.push(b'\n');
-                        if replayable_event(&message) {
-                            cap_replay.push_back((Instant::now(), raw.clone()));
-                            prune_replay(&mut cap_replay);
-                            while cap_replay.len() > CAP_REPLAY_LIMIT {
-                                cap_replay.pop_front();
+                let origin = envelope.origin;
+                match envelope.payload {
+                    BridgePayload::Json(value) => match handle_client_message(value) {
+                        ClientMessage::Event(message) => {
+                            activate_origin_as_legacy(&mut clients, origin, &mut cap_replay);
+                            let _ = event_sender.send(message.clone());
+                            let Ok(mut raw) = serde_json::to_vec(&message) else {
+                                continue;
+                            };
+                            raw.push(b'\n');
+                            if replayable_event(&message) {
+                                cap_replay.push_back((Instant::now(), raw.clone()));
+                                prune_replay(&mut cap_replay);
+                                while cap_replay.len() > CAP_REPLAY_LIMIT {
+                                    cap_replay.pop_front();
+                                }
+                            }
+                            deliver_event(&mut clients, origin, &message, &raw);
+                        }
+                        ClientMessage::Configure {
+                            receive_events,
+                            client_id,
+                            subscriptions,
+                            binary_pcm,
+                        } => {
+                            if let Some(origin) = origin {
+                                configure_client(
+                                    &mut clients,
+                                    origin,
+                                    receive_events,
+                                    client_id,
+                                    subscriptions,
+                                    binary_pcm,
+                                    &mut cap_replay,
+                                );
                             }
                         }
-                        deliver_event(&mut clients, &envelope, &message, &raw);
-                    }
-                    ClientMessage::Configure {
-                        receive_events,
-                        client_id,
-                        subscriptions,
-                    } => {
-                        if let Some(origin) = envelope.origin {
-                            configure_client(
-                                &mut clients,
-                                origin,
-                                receive_events,
-                                client_id,
-                                subscriptions,
-                                &mut cap_replay,
-                            );
+                        ClientMessage::Consumed => {
+                            activate_origin_as_legacy(&mut clients, origin, &mut cap_replay)
                         }
-                    }
-                    ClientMessage::Consumed => {
-                        activate_origin_as_legacy(&mut clients, envelope.origin, &mut cap_replay)
+                    },
+                    BridgePayload::BinaryPcm(raw) => {
+                        deliver_binary_pcm(&mut clients, origin, raw);
                     }
                 }
             }
@@ -155,6 +175,7 @@ impl HostBridge {
                                             receive_events: false,
                                             client_id: None,
                                             subscriptions: Vec::new(),
+                                            binary_pcm: false,
                                             legacy_activation_at: Some(
                                                 Instant::now() + CLIENT_HANDSHAKE_GRACE,
                                             ),
@@ -215,6 +236,7 @@ fn configure_client(
     receive_events: bool,
     client_id: Option<String>,
     subscriptions: Vec<String>,
+    binary_pcm: bool,
     cap_replay: &mut VecDeque<(Instant, Vec<u8>)>,
 ) {
     let Some(client) = clients.iter_mut().find(|client| client.id == origin) else {
@@ -223,6 +245,7 @@ fn configure_client(
     client.receive_events = receive_events;
     client.client_id = client_id;
     client.subscriptions = subscriptions;
+    client.binary_pcm = binary_pcm;
     client.legacy_activation_at = None;
     replay_cap_events(client, cap_replay);
 }
@@ -289,22 +312,65 @@ where
     R: Read + Send + 'static,
 {
     thread::spawn(move || {
-        let reader = BufReader::new(reader);
-        for line in reader.lines().map_while(std::result::Result::ok) {
-            if line.trim().is_empty() {
-                continue;
-            }
-            match serde_json::from_str::<Value>(&line) {
-                Ok(value) => {
-                    let _ = publisher.send(BridgeEnvelope {
-                        origin: Some(client_id),
-                        value,
-                    });
+        let mut reader = BufReader::new(reader);
+        let mut payload = Vec::with_capacity(16 * 1024);
+        loop {
+            match read_client_payload(&mut reader, &mut payload) {
+                Ok(Some(payload)) => {
+                    if publisher
+                        .send(BridgeEnvelope {
+                            origin: Some(client_id),
+                            payload,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
-                Err(err) => warn!("host bridge received invalid JSON: {err}"),
+                Ok(None) => return,
+                Err(err) => {
+                    warn!("host bridge client reader stopped: {err}");
+                    return;
+                }
             }
         }
     });
+}
+
+/// Reads a normal bridge line or a bounded compact PCM frame from one client.
+fn read_client_payload<R>(
+    reader: &mut BufReader<R>,
+    payload: &mut Vec<u8>,
+) -> io::Result<Option<BridgePayload>>
+where
+    R: Read,
+{
+    payload.clear();
+    let mut first = [0u8; 1];
+    loop {
+        match reader.read(&mut first)? {
+            0 => return Ok(None),
+            _ if first[0].is_ascii_whitespace() => continue,
+            _ => break,
+        }
+    }
+    payload.push(first[0]);
+    if first[0] == PCM_FRAME_MAGIC[0] {
+        let mut prefix_tail = [0u8; PCM_FRAME_PREFIX_LEN - 1];
+        reader.read_exact(&mut prefix_tail)?;
+        payload.extend_from_slice(&prefix_tail);
+        let frame_len = pcm_frame_len_from_prefix(payload)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        payload.resize(frame_len, 0);
+        reader.read_exact(&mut payload[PCM_FRAME_PREFIX_LEN..])?;
+        decode_pcm_frame(payload).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        return Ok(Some(BridgePayload::BinaryPcm(payload.clone())));
+    }
+
+    reader.read_until(b'\n', payload)?;
+    let value = serde_json::from_slice(payload)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    Ok(Some(BridgePayload::Json(value)))
 }
 
 fn spawn_client_writer(mut writer: TcpStream, receiver: Receiver<Vec<u8>>) {
@@ -348,10 +414,17 @@ fn handle_client_message(value: Value) -> ClientMessage {
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
             .collect();
+        let binary_pcm = value
+            .get("data")
+            .and_then(|data| data.get("binary_pcm"))
+            .and_then(Value::as_bool)
+            .or_else(|| value.get("binary_pcm").and_then(Value::as_bool))
+            .unwrap_or(false);
         return ClientMessage::Configure {
             receive_events,
             client_id,
             subscriptions,
+            binary_pcm,
         };
     }
     if msg_type == "log_record" {
@@ -378,7 +451,7 @@ fn handle_client_message(value: Value) -> ClientMessage {
 
 fn deliver_event(
     clients: &mut Vec<BridgeClientHandle>,
-    envelope: &BridgeEnvelope,
+    origin: Option<usize>,
     message: &Value,
     raw: &[u8],
 ) {
@@ -393,10 +466,7 @@ fn deliver_event(
         .filter(|value| !value.is_empty());
     let mut delivered = false;
     clients.retain(|client| {
-        if envelope.origin.is_some_and(|id| id == client.id)
-            || !client.receive_events
-            || client.legacy_activation_at.is_some()
-        {
+        if !is_active_event_receiver(client, origin) {
             return true;
         }
         if target.is_some_and(|target| client.client_id.as_deref() != Some(target)) {
@@ -420,6 +490,101 @@ fn deliver_event(
     if let Some(target) = target.filter(|_| !delivered) {
         warn!(target, event_type, "host bridge target is unavailable");
     }
+}
+
+fn deliver_binary_pcm(clients: &mut Vec<BridgeClientHandle>, origin: Option<usize>, raw: Vec<u8>) {
+    const EVENT_TYPE: &str = "playout.pcm";
+    let binary_recipient_count = clients
+        .iter()
+        .filter(|client| client.binary_pcm && receives_event(client, origin, EVENT_TYPE))
+        .count();
+    let legacy_recipient_count = clients
+        .iter()
+        .filter(|client| !client.binary_pcm && receives_event(client, origin, EVENT_TYPE))
+        .count();
+    let legacy_event = (legacy_recipient_count > 0)
+        .then(|| binary_pcm_as_legacy_event(&raw))
+        .flatten();
+    let mut raw = Some(raw);
+    let mut remaining_binary = binary_recipient_count;
+
+    clients.retain(|client| {
+        if !receives_event(client, origin, EVENT_TYPE) {
+            return true;
+        }
+        let payload = if client.binary_pcm {
+            remaining_binary = remaining_binary.saturating_sub(1);
+            if remaining_binary == 0 {
+                raw.take()
+                    .expect("last binary PCM recipient must have a frame")
+            } else {
+                raw.as_ref()
+                    .expect("binary PCM frame must remain available")
+                    .clone()
+            }
+        } else {
+            let Some(event) = legacy_event.as_ref() else {
+                return true;
+            };
+            event.clone()
+        };
+        match client.sender.try_send(payload) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                warn!(client_id = ?client.client_id, "dropped slow host media bridge client");
+                false
+            }
+            Err(TrySendError::Disconnected(_)) => false,
+        }
+    });
+}
+
+fn receives_event(client: &BridgeClientHandle, origin: Option<usize>, event_type: &str) -> bool {
+    is_active_event_receiver(client, origin)
+        && subscription_matches(&client.subscriptions, event_type)
+}
+
+fn is_active_event_receiver(client: &BridgeClientHandle, origin: Option<usize>) -> bool {
+    !origin.is_some_and(|id| id == client.id)
+        && client.receive_events
+        && client.legacy_activation_at.is_none()
+}
+
+fn binary_pcm_as_legacy_event(raw: &[u8]) -> Option<Vec<u8>> {
+    let frame = decode_pcm_frame(raw).ok()?;
+    let media_kind = match frame.media_kind {
+        PcmMediaKind::Silence => "silence",
+        PcmMediaKind::Routine => "routine",
+        PcmMediaKind::Alert => "alert",
+        PcmMediaKind::OperatorBreakIn => "operator_breakin",
+    };
+    let mut data = json!({
+        "feed_id": frame.feed_id,
+        "sample_rate": frame.sample_rate,
+        "channels": frame.channels,
+        "duration_ms": frame.duration_ms,
+        "sequence": frame.sequence,
+        "pts_ns": frame.pts_ns,
+        "discontinuity": frame.discontinuity,
+        "media_kind": media_kind,
+        "pcm": base64::engine::general_purpose::STANDARD.encode(frame.pcm),
+    });
+    if let Some(queue_id) = frame.queue_id {
+        data["queue_id"] = json!(queue_id);
+    }
+    let mut event = json!({
+        "type": "playout.pcm",
+        "source": "haze-playout",
+        "feed_id": frame.feed_id,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "data": data,
+    });
+    if let Some(queue_id) = frame.queue_id {
+        event["queue_id"] = json!(queue_id);
+    }
+    let mut encoded = serde_json::to_vec(&event).ok()?;
+    encoded.push(b'\n');
+    Some(encoded)
 }
 
 fn subscription_matches(subscriptions: &[String], event_type: &str) -> bool {
@@ -530,6 +695,22 @@ mod tests {
     }
 
     #[test]
+    fn binary_pcm_capability_is_parsed() {
+        let result = handle_client_message(json!({
+            "type": "bridge.client",
+            "data": { "binary_pcm": true },
+        }));
+
+        assert!(matches!(
+            result,
+            ClientMessage::Configure {
+                binary_pcm: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn subscriptions_support_exact_and_prefix_matches() {
         assert!(subscription_matches(&[], "anything"));
         assert!(subscription_matches(
@@ -557,6 +738,7 @@ mod tests {
                 receive_events: true,
                 client_id: Some("haze-location".to_string()),
                 subscriptions: vec!["location.*".to_string()],
+                binary_pcm: false,
                 legacy_activation_at: None,
             },
             BridgeClientHandle {
@@ -565,6 +747,7 @@ mod tests {
                 receive_events: true,
                 client_id: Some("haze-ivr-1".to_string()),
                 subscriptions: vec!["location.query.completed".to_string()],
+                binary_pcm: false,
                 legacy_activation_at: None,
             },
         ];
@@ -572,18 +755,99 @@ mod tests {
             "type": "location.query.completed",
             "target": "haze-ivr-1",
         });
-        let envelope = BridgeEnvelope {
-            origin: Some(3),
-            value: message.clone(),
-        };
-
-        deliver_event(&mut clients, &envelope, &message, b"response\n");
+        deliver_event(&mut clients, Some(3), &message, b"response\n");
 
         assert!(location_receiver.try_recv().is_err());
         assert_eq!(
             requester_receiver.try_recv().expect("targeted response"),
             b"response\n"
         );
+    }
+
+    #[test]
+    fn binary_pcm_reaches_capable_clients_without_legacy_encoding() {
+        let (binary_sender, binary_receiver) = mpsc::sync_channel(1);
+        let (legacy_sender, legacy_receiver) = mpsc::sync_channel(1);
+        let mut clients = vec![
+            BridgeClientHandle {
+                id: 1,
+                sender: binary_sender,
+                receive_events: true,
+                client_id: Some("haze-media".to_string()),
+                subscriptions: vec!["playout.pcm".to_string()],
+                binary_pcm: true,
+                legacy_activation_at: None,
+            },
+            BridgeClientHandle {
+                id: 2,
+                sender: legacy_sender,
+                receive_events: true,
+                client_id: Some("legacy-media".to_string()),
+                subscriptions: vec!["playout.pcm".to_string()],
+                binary_pcm: false,
+                legacy_activation_at: None,
+            },
+        ];
+        let mut frame = Vec::new();
+        haze_media_protocol::encode_pcm_frame(
+            &mut frame,
+            haze_media_protocol::PcmFrame {
+                feed_id: "sk-0001",
+                queue_id: Some("alert-1"),
+                sample_rate: 48_000,
+                channels: 1,
+                duration_ms: 20,
+                sequence: 4,
+                pts_ns: 80_000_000,
+                discontinuity: false,
+                media_kind: haze_media_protocol::PcmMediaKind::Alert,
+                pcm: &[1, 0, 2, 0],
+            },
+        )
+        .expect("encode PCM frame");
+
+        deliver_binary_pcm(&mut clients, Some(3), frame.clone());
+
+        assert_eq!(
+            binary_receiver.try_recv().expect("binary media frame"),
+            frame
+        );
+        let legacy = legacy_receiver.try_recv().expect("legacy media event");
+        let legacy: Value = serde_json::from_slice(&legacy).expect("legacy JSON event");
+        assert_eq!(legacy["type"], "playout.pcm");
+        assert_eq!(legacy["data"]["pcm"], "AQACAA==");
+    }
+
+    #[test]
+    fn reader_distinguishes_compact_pcm_frames_from_json_lines() {
+        let mut frame = Vec::new();
+        haze_media_protocol::encode_pcm_frame(
+            &mut frame,
+            haze_media_protocol::PcmFrame {
+                feed_id: "sk-0001",
+                queue_id: None,
+                sample_rate: 48_000,
+                channels: 1,
+                duration_ms: 20,
+                sequence: 0,
+                pts_ns: 0,
+                discontinuity: false,
+                media_kind: haze_media_protocol::PcmMediaKind::Routine,
+                pcm: &[0, 0],
+            },
+        )
+        .expect("encode PCM frame");
+        let mut reader = BufReader::new(std::io::Cursor::new(frame.clone()));
+        let mut payload = Vec::new();
+
+        let message = read_client_payload(&mut reader, &mut payload)
+            .expect("read PCM frame")
+            .expect("PCM frame payload");
+
+        match message {
+            BridgePayload::BinaryPcm(actual) => assert_eq!(actual, frame),
+            BridgePayload::Json(_) => panic!("compact PCM frame was treated as JSON"),
+        }
     }
 
     #[test]
@@ -595,6 +859,7 @@ mod tests {
             receive_events: true,
             client_id: None,
             subscriptions: Vec::new(),
+            binary_pcm: false,
             legacy_activation_at: Some(Instant::now() + CLIENT_HANDSHAKE_GRACE),
         }];
         let mut replay = VecDeque::from([(
@@ -604,11 +869,7 @@ mod tests {
 
         replay_cap_events(&clients[0], &mut replay);
         let message = json!({"type": "cap.alert.received"});
-        let envelope = BridgeEnvelope {
-            origin: None,
-            value: message.clone(),
-        };
-        deliver_event(&mut clients, &envelope, &message, b"broadcast\n");
+        deliver_event(&mut clients, None, &message, b"broadcast\n");
 
         assert!(receiver.try_recv().is_err());
     }
@@ -622,6 +883,7 @@ mod tests {
             receive_events: true,
             client_id: None,
             subscriptions: Vec::new(),
+            binary_pcm: false,
             legacy_activation_at: Some(Instant::now() + CLIENT_HANDSHAKE_GRACE),
         }];
         let mut replay = VecDeque::from([(
@@ -635,16 +897,13 @@ mod tests {
             true,
             Some("haze-location".to_string()),
             vec!["location.*".to_string()],
+            false,
             &mut replay,
         );
 
         assert!(receiver.try_recv().is_err());
         let message = json!({"type": "location.query.request"});
-        let envelope = BridgeEnvelope {
-            origin: None,
-            value: message.clone(),
-        };
-        deliver_event(&mut clients, &envelope, &message, b"location\n");
+        deliver_event(&mut clients, None, &message, b"location\n");
         assert_eq!(receiver.try_recv().expect("location event"), b"location\n");
     }
 
@@ -657,6 +916,7 @@ mod tests {
             receive_events: true,
             client_id: None,
             subscriptions: Vec::new(),
+            binary_pcm: false,
             legacy_activation_at: Some(Instant::now() + CLIENT_HANDSHAKE_GRACE),
         }];
         let mut replay = VecDeque::from([(
@@ -670,14 +930,11 @@ mod tests {
             false,
             Some("publisher".to_string()),
             Vec::new(),
+            false,
             &mut replay,
         );
         let message = json!({"type": "cap.alert.received"});
-        let envelope = BridgeEnvelope {
-            origin: None,
-            value: message.clone(),
-        };
-        deliver_event(&mut clients, &envelope, &message, b"broadcast\n");
+        deliver_event(&mut clients, None, &message, b"broadcast\n");
 
         assert!(receiver.try_recv().is_err());
     }
@@ -691,6 +948,7 @@ mod tests {
             receive_events: true,
             client_id: None,
             subscriptions: Vec::new(),
+            binary_pcm: false,
             legacy_activation_at: Some(Instant::now() - Duration::from_millis(1)),
         }];
         let mut replay = VecDeque::from([(
@@ -706,11 +964,7 @@ mod tests {
             b"{\"type\":\"cap.alert.received\"}\n"
         );
         let message = json!({"type": "product.rendered"});
-        let envelope = BridgeEnvelope {
-            origin: None,
-            value: message.clone(),
-        };
-        deliver_event(&mut clients, &envelope, &message, b"routine\n");
+        deliver_event(&mut clients, None, &message, b"routine\n");
         assert_eq!(receiver.try_recv().expect("legacy broadcast"), b"routine\n");
     }
 }

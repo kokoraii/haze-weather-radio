@@ -41,6 +41,7 @@ type rootConfig struct {
 
 type productRenderConfig struct {
 	Enabled bool          `yaml:"enabled"`
+	Workers int           `yaml:"workers"`
 	Cleanup cleanupConfig `yaml:"cleanup"`
 }
 

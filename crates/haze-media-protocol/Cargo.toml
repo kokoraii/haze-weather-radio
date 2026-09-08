@@ -1,0 +1,9 @@
+[package]
+name = "haze-media-protocol"
+description = "Compact internal PCM frames for Haze media brokers"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[dependencies]

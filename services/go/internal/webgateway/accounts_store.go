@@ -108,6 +108,20 @@ CREATE TABLE IF NOT EXISTS users (
     updated_at TEXT NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_ci ON users(lower(username));
+CREATE TABLE IF NOT EXISTS api_secrets (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    secret_hash TEXT NOT NULL UNIQUE,
+    secret_prefix TEXT NOT NULL,
+    scopes TEXT NOT NULL,
+    created_by_user_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    last_used_at TEXT,
+    expires_at TEXT,
+    revoked_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_api_secrets_hash ON api_secrets(secret_hash);
 `
 
 const postgresAccountsSchema = `
@@ -144,6 +158,20 @@ CREATE TABLE IF NOT EXISTS users (
     updated_at text NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_ci ON users(lower(username));
+CREATE TABLE IF NOT EXISTS api_secrets (
+    id text PRIMARY KEY,
+    name varchar(100) NOT NULL,
+    secret_hash text NOT NULL UNIQUE,
+    secret_prefix varchar(32) NOT NULL,
+    scopes jsonb NOT NULL DEFAULT '[]'::jsonb,
+    created_by_user_id uuid NOT NULL,
+    created_at text NOT NULL,
+    updated_at text NOT NULL,
+    last_used_at text,
+    expires_at text,
+    revoked_at text
+);
+CREATE INDEX IF NOT EXISTS idx_api_secrets_hash ON api_secrets(secret_hash);
 `
 
 func openAccountStore(ctx context.Context, config Config, configPath string) (*accountStore, error) {

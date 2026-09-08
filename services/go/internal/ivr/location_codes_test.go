@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/meowraii/haze-weather-radio/services/go/internal/locationdb"
@@ -226,6 +228,56 @@ func TestLocationCodesExposeCensusPopulationOnlyWhenAvailable(t *testing.T) {
 	}
 	if _, exists := populationPayload.Locations[0]["census_year"]; exists {
 		t.Fatalf("missing census year was serialized: %#v", populationPayload.Locations[0])
+	}
+}
+
+func TestLocationCodesExposeProductsSupportedNearEachLocation(t *testing.T) {
+	service := locationCodeTestService()
+	dir := t.TempDir()
+	service.cfg.BaseDir = dir
+	service.capabilities = locationdb.NewCapabilityCatalog([]locationdb.CapabilityLocation{
+		{Kind: locationdb.CapabilityObservation, ID: "CYXE", Region: "SK", Latitude: 52.1332, Longitude: -106.67},
+		{Kind: locationdb.CapabilityAirQuality, ID: "SASKATOON", Region: "SK", Latitude: 52.1332, Longitude: -106.67},
+		{Kind: locationdb.CapabilityClimate, ID: "4017095", Region: "SK", Latitude: 52.1332, Longitude: -106.67},
+	})
+	productsPath := filepath.Join(dir, "managed", "configs", "products.xml")
+	if err := os.MkdirAll(filepath.Dir(productsPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(productsPath, []byte(`<?xml version="1.0" encoding="UTF-8"?>
+<ProductText>
+  <product id="current_conditions" enabled="true"/>
+  <product id="forecast" enabled="true"/>
+  <product id="alerts" enabled="true"/>
+  <product id="air_quality" enabled="true"/>
+  <product id="climate_summary" enabled="true"/>
+  <product id="thunderstorm_outlook" enabled="true"/>
+  <product id="hydrometric" enabled="true"/>
+  <product id="station_id" enabled="true"/>
+</ProductText>`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	page := locationCodePageForTest(t, service, "/ivr/v1/location-codes?q=saskatoon")
+	if len(page.Locations) != 1 {
+		t.Fatalf("locations = %#v", page.Locations)
+	}
+	want := []string{
+		"current_conditions",
+		"forecast",
+		"alerts",
+		"air_quality",
+		"climate_summary",
+		"thunderstorm_outlook",
+	}
+	if got := page.Locations[0].AvailableProducts; len(got) != len(want) {
+		t.Fatalf("available products = %#v, want %#v", got, want)
+	} else {
+		for index := range want {
+			if got[index] != want[index] {
+				t.Fatalf("available products = %#v, want %#v", got, want)
+			}
+		}
 	}
 }
 

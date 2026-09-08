@@ -2,8 +2,6 @@ package datastore
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,7 +12,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/klauspost/compress/zstd"
 )
 
 var ErrNotConfigured = errors.New("datastore is not configured")
@@ -743,33 +740,6 @@ SET bucket = 'expired',
 WHERE bucket = 'accepted'
   AND upper(coalesce(event, '')) NOT IN ('TOR', 'SVR')`)
 	return err
-}
-
-func EncodeCAPXMLArchive(raw []byte) (CAPXMLArchive, error) {
-	if len(raw) == 0 {
-		return CAPXMLArchive{}, nil
-	}
-	hash := sha256.Sum256(raw)
-	encoder, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedBetterCompression))
-	if err != nil {
-		return CAPXMLArchive{}, fmt.Errorf("create zstd encoder: %w", err)
-	}
-	compressed := encoder.EncodeAll(raw, nil)
-	return CAPXMLArchive{
-		Compressed: compressed,
-		SHA256Hex:  hex.EncodeToString(hash[:]),
-		RawBytes:   len(raw),
-		ZstdBytes:  len(compressed),
-	}, nil
-}
-
-func DecodeCAPXMLArchive(compressed []byte) ([]byte, error) {
-	decoder, err := zstd.NewReader(nil)
-	if err != nil {
-		return nil, fmt.Errorf("create zstd decoder: %w", err)
-	}
-	defer decoder.Close()
-	return decoder.DecodeAll(compressed, nil)
 }
 
 func pgTime(value pgtype.Timestamptz) time.Time {

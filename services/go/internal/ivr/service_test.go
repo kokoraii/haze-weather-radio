@@ -27,6 +27,20 @@ func TestMediaServiceURLForBroadcastPrefersPacedMediaService(t *testing.T) {
 	}
 }
 
+func TestMediaBridgeConnectionUsesPacedMediaServiceWhenConfigured(t *testing.T) {
+	cfg := loadedConfig{}
+	cfg.Root.Services.Rust.Media.Enabled = true
+	cfg.Root.Services.Rust.Media.Addr = "127.0.0.1:8097"
+	if shouldConnectMediaBridge(cfg, "127.0.0.1:9001", "127.0.0.1:9000") {
+		t.Fatal("IVR should not open a redundant media bridge when haze-media is configured")
+	}
+
+	cfg.Root.Services.Rust.Media.Enabled = false
+	if !shouldConnectMediaBridge(cfg, "127.0.0.1:9001", "127.0.0.1:9000") {
+		t.Fatal("IVR should retain the media bridge fallback without haze-media")
+	}
+}
+
 func TestWriteProductTwiMLDoesNotPreRenderOnCacheMiss(t *testing.T) {
 	cfg := loadedConfig{
 		BaseDir: t.TempDir(),

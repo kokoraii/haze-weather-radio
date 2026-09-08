@@ -84,6 +84,16 @@ type Service struct {
 
 func (s *Service) runConnected(ctx context.Context) error {
 	s.runScheduledCleanup(time.Now().UTC())
+	workCtx, cancel := context.WithCancel(ctx)
+	workers := s.startWorkers(workCtx)
+	defer func() {
+		cancel()
+		// Unblock publishers before joining workers on disconnect or shutdown.
+		if err := s.bridge.Close(); err != nil {
+			log.Printf("product render bridge close failed: %v", err)
+		}
+		workers.wait()
+	}()
 
 	_ = s.bridge.Publish(map[string]any{
 		"type":   "service.ready",
@@ -102,7 +112,12 @@ func (s *Service) runConnected(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case now := <-timerChannel(cleanupTimer):
-			s.runScheduledCleanup(now)
+			s.refreshConfigIfNeeded()
+			select {
+			case workers.alerts.jobs <- renderWork{cfg: s.cfg, cleanup: now}:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 			cleanupTimer = s.resetCleanupTimer(cleanupTimer, time.Now())
 		case event, ok := <-s.bridge.Events():
 			if !ok {
@@ -111,7 +126,7 @@ func (s *Service) runConnected(ctx context.Context) error {
 			if stringAt(event, "type") == "system.shutdown" {
 				return errSystemShutdown
 			}
-			s.handleEvent(event)
+			s.dispatchWork(workCtx, workers, event)
 		}
 	}
 }
@@ -131,14 +146,7 @@ func (s *Service) handleEvent(event map[string]any) {
 	default:
 		return
 	}
-	data := mapAt(event, "data")
-	request := renderRequest{
-		RequestID: firstText(event, data, "request_id", "subject", "id"),
-		FeedID:    firstText(event, data, "feed_id"),
-		PackageID: firstText(event, data, "pkg_id", "package_id"),
-		Language:  firstText(event, data, "language"),
-		Force:     boolAt(data, "force", boolAt(event, "force", false)),
-	}
+	request := renderRequestFromEvent(event)
 	if request.RequestID == "" {
 		request.RequestID = fmt.Sprintf("product-%d", time.Now().UnixNano())
 	}
@@ -164,6 +172,17 @@ func (s *Service) handleEvent(event map[string]any) {
 			"product":    product,
 		},
 	})
+}
+
+func renderRequestFromEvent(event map[string]any) renderRequest {
+	data := mapAt(event, "data")
+	return renderRequest{
+		RequestID: firstText(event, data, "request_id", "subject", "id"),
+		FeedID:    firstText(event, data, "feed_id"),
+		PackageID: firstText(event, data, "pkg_id", "package_id"),
+		Language:  firstText(event, data, "language"),
+		Force:     boolAt(data, "force", boolAt(event, "force", false)),
+	}
 }
 
 func (s *Service) handleWxOnDemand(event map[string]any) {

@@ -19,10 +19,7 @@ type bridgeClient struct {
 	closeOnce sync.Once
 }
 
-const (
-	bridgeEventBufferSize = 128
-	bridgeCriticalReserve = 16
-)
+const bridgeEventBufferSize = 128
 
 func connectBridge(ctx context.Context, addr string) (*bridgeClient, error) {
 	if strings.TrimSpace(addr) == "" {
@@ -84,24 +81,17 @@ func (c *bridgeClient) readLoop() {
 		if err := json.Unmarshal([]byte(line), &message); err != nil {
 			continue
 		}
-		if stringAt(message, "type") == "cap.alert.received" {
-			if c.done == nil {
-				c.events <- message
-				continue
-			}
-			select {
-			case c.events <- message:
-			case <-c.done:
-				return
-			}
+		switch stringAt(message, "type") {
+		case "cap.alert.received", "product.render.request", "wx.on_demand.request", "lead.config.updated", "system.shutdown":
+		default:
 			continue
 		}
-		if cap(c.events) > 0 && len(c.events) >= cap(c.events)-bridgeCriticalReserve {
-			continue
-		}
+		// Discard unrelated bus traffic, not requests that callers are awaiting.
+		// The dispatcher applies bounded admission and explicit busy responses.
 		select {
 		case c.events <- message:
-		default:
+		case <-c.done:
+			return
 		}
 	}
 }

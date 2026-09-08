@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -52,21 +53,23 @@ type staticPromptFile struct {
 }
 
 type Service struct {
-	ctx            context.Context
-	cfg            loadedConfig
-	resolver       *Resolver
-	searchIndex    *locationSearchIndex
-	capabilities   *locationdb.CapabilityCatalog
-	pointQuery     pointQueryFunc
-	pointSlots     chan struct{}
-	cache          *ProductCache
-	bridge         *bridgeClient
-	mediaBridge    *bridgeClient
-	broadcast      *broadcastHub
-	store          datastore.Store
-	metrics        metrics
-	twilio         *twilioRuntime
-	twilioRequired bool
+	ctx               context.Context
+	cfg               loadedConfig
+	resolver          *Resolver
+	searchIndex       *locationSearchIndex
+	capabilities      *locationdb.CapabilityCatalog
+	locationCodesOnce sync.Once
+	locationCodes     []telephoneLocationCode
+	pointQuery        pointQueryFunc
+	pointSlots        chan struct{}
+	cache             *ProductCache
+	bridge            *bridgeClient
+	mediaBridge       *bridgeClient
+	broadcast         *broadcastHub
+	store             datastore.Store
+	metrics           metrics
+	twilio            *twilioRuntime
+	twilioRequired    bool
 }
 
 type metrics struct {
@@ -125,7 +128,7 @@ func Run(ctx context.Context, options Options) error {
 		}
 		mediaBridgeAddr := firstNonBlank(options.MediaBridgeAddr, options.BridgeAddr)
 		var mediaBridge *bridgeClient
-		if strings.TrimSpace(mediaBridgeAddr) != "" && strings.TrimSpace(mediaBridgeAddr) != strings.TrimSpace(options.BridgeAddr) {
+		if shouldConnectMediaBridge(cfg, mediaBridgeAddr, options.BridgeAddr) {
 			mediaBridge, err = connectBridge(ctx, mediaBridgeAddr)
 			if err != nil {
 				log.Printf("IVR media bridge unavailable; live broadcast monitoring disabled until reconnect: %v", err)
@@ -177,6 +180,14 @@ func Run(ctx context.Context, options Options) error {
 		sleepOrDone(ctx, time.Second)
 	}
 	return nil
+}
+
+// shouldConnectMediaBridge keeps the legacy PCM reader off when haze-media is
+// configured. The IVR then reads its paced broadcast source over HTTP instead.
+func shouldConnectMediaBridge(cfg loadedConfig, mediaBridgeAddr string, eventBridgeAddr string) bool {
+	return cfg.mediaServiceBaseURL() == "" &&
+		strings.TrimSpace(mediaBridgeAddr) != "" &&
+		strings.TrimSpace(mediaBridgeAddr) != strings.TrimSpace(eventBridgeAddr)
 }
 
 func loadDotEnv(path string) {

@@ -135,13 +135,13 @@ func (s *Server) wxOnDemandGenerate(writer http.ResponseWriter, request *http.Re
 		http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if _, ok := s.requireAdminRequest(writer, request); !ok {
-		return
-	}
 	defer request.Body.Close()
 	var payload map[string]any
 	if err := json.NewDecoder(io.LimitReader(request.Body, 256*1024)).Decode(&payload); err != nil {
 		http.Error(writer, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if !s.requireWxOnDemandAccess(writer, request, payload) {
 		return
 	}
 	result, err := generateWxOnDemand(s.configPath, payload)
@@ -150,6 +150,47 @@ func (s *Server) wxOnDemandGenerate(writer http.ResponseWriter, request *http.Re
 		return
 	}
 	writeWxHTTPResult(writer, result)
+}
+
+// requireWxOnDemandAccess accepts an administrator session or a scoped API secret.
+// API secrets are deliberately accepted only by the on-demand generator.
+func (s *Server) requireWxOnDemandAccess(writer http.ResponseWriter, request *http.Request, payload map[string]any) bool {
+	identity, identityErr := s.auth.Identity(request)
+	if identityErr == nil {
+		if !s.auth.AccountMode() || identity.Account.IsAdmin {
+			return true
+		}
+		identityErr = &AuthError{Code: "administrator_required", Detail: "Administrator permission is required.", HTTPStatus: http.StatusForbidden}
+	}
+	if s.auth == nil || s.auth.accounts == nil {
+		status, response := commandErrorResponse(identityErr)
+		response["type"] = "auth_error"
+		writeJSONStatus(writer, status, response)
+		return false
+	}
+	ctx, cancel := context.WithTimeout(request.Context(), 3*time.Second)
+	defer cancel()
+	secret, err := s.auth.accounts.AuthenticateAPISecret(ctx, request)
+	if err != nil {
+		status, response := commandErrorResponse(identityErr)
+		if authErr, ok := err.(*AuthError); ok {
+			status, response = commandErrorResponse(authErr)
+		}
+		response["type"] = "auth_error"
+		writeJSONStatus(writer, status, response)
+		return false
+	}
+	neededScope := apiSecretWeatherScope
+	if !wxTextFormat(strings.TrimSpace(fmt.Sprint(payload["format"]))) {
+		neededScope = apiSecretAudioScope
+	}
+	for _, scope := range secret.Scopes {
+		if scope == neededScope {
+			return true
+		}
+	}
+	writeJSONStatus(writer, http.StatusForbidden, map[string]any{"type": "auth_error", "code": "scope_forbidden", "detail": "This API secret does not permit the requested output type."})
+	return false
 }
 
 func writeWxHTTPResult(writer http.ResponseWriter, result any) {
@@ -276,6 +317,7 @@ func (request *wxGeneratePayload) applyLocationHints(configPath string) {
 		request.Province = province
 		request.Source = firstNonBlank(request.Source, "hello_weather")
 		request.LocationName = firstNonBlank(request.LocationName, code)
+		request.applyConfiguredLocation(configPath, forecastID)
 		return
 	}
 	if wxLooksLikeProviderID(code) {
@@ -307,12 +349,12 @@ func (request *wxGeneratePayload) applyConfiguredLocation(configPath string, cod
 		if request.FeedID != "" && !strings.EqualFold(feed.ID, request.FeedID) {
 			continue
 		}
-		if request.Timezone == "" {
-			request.Timezone = strings.TrimSpace(feed.Timezone)
-		}
 		for _, loc := range feed.Locations.ObservationLocations.Locations {
 			if !wxSameCode(loc.ID, code) {
 				continue
+			}
+			if request.Timezone == "" {
+				request.Timezone = strings.TrimSpace(feed.Timezone)
 			}
 			request.StationID = loc.ID
 			request.ForecastID = firstNonBlank(request.ForecastID, loc.ID)
@@ -322,6 +364,9 @@ func (request *wxGeneratePayload) applyConfiguredLocation(configPath string, cod
 		}
 		for _, region := range feed.Locations.Coverage.Regions {
 			if wxSameCode(region.ID, code) || wxSameCode(region.DeriveForecast, code) {
+				if request.Timezone == "" {
+					request.Timezone = strings.TrimSpace(feed.Timezone)
+				}
 				request.ForecastID = firstNonBlank(region.DeriveForecast, region.ID)
 				request.StationID = firstNonBlank(request.StationID, request.ForecastID)
 				request.Source = firstNonBlank(request.Source, region.Source, wxProviderSource(request.ForecastID))
@@ -331,6 +376,9 @@ func (request *wxGeneratePayload) applyConfiguredLocation(configPath string, cod
 			for _, subregion := range region.Subregions {
 				if !wxSameCode(subregion.ID, code) {
 					continue
+				}
+				if request.Timezone == "" {
+					request.Timezone = strings.TrimSpace(feed.Timezone)
 				}
 				request.ForecastID = firstNonBlank(region.DeriveForecast, region.ID)
 				request.StationID = firstNonBlank(request.StationID, request.ForecastID)
@@ -613,6 +661,9 @@ func applyWxCanonicalLocation(ctx context.Context, configPath string, bridgeAddr
 		if entity.Geometry.Longitude != nil {
 			request.Longitude = fmt.Sprintf("%.7f", *entity.Geometry.Longitude)
 		}
+	}
+	if request.Timezone == "" {
+		request.applyConfiguredLocation(configPath, firstNonBlank(request.ForecastID, request.StationID))
 	}
 	return nil
 }

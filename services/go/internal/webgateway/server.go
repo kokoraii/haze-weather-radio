@@ -65,8 +65,8 @@ func NewServerWithConfigPath(config Config, configPath string, webroot string) *
 // NewServerWithSurface creates a gateway server constrained to one HTTP surface.
 func NewServerWithSurface(config Config, configPath string, webroot string, surface string) *Server {
 	hostBridgeAddr := os.Getenv("HAZE_HOST_BRIDGE_ADDR")
-	mediaBridgeAddr := firstNonBlank(os.Getenv("HAZE_MEDIA_BRIDGE_ADDR"), hostBridgeAddr)
 	mediaServiceURL := mediaServiceBaseURL(config)
+	mediaBridgeAddr := mediaHubBridgeAddr(config, os.Getenv("HAZE_MEDIA_BRIDGE_ADDR"), hostBridgeAddr)
 	mediaHub := NewMediaHub(mediaBridgeAddr)
 	mediaHub.SetHTTPSource(mediaServiceURL)
 	bannerHub := NewBannerHub(configPath, hostBridgeAddr)
@@ -88,6 +88,15 @@ func NewServerWithSurface(config Config, configPath string, webroot string, surf
 		server.startBannerStatePublisher(hostBridgeAddr)
 	}
 	return server
+}
+
+// mediaHubBridgeAddr retains the bridge only when the paced Rust media service
+// is unavailable. Reading both paths would duplicate every PCM event.
+func mediaHubBridgeAddr(config Config, configuredAddr string, hostBridgeAddr string) string {
+	if mediaServiceBaseURL(config) != "" {
+		return ""
+	}
+	return firstNonBlank(configuredAddr, hostBridgeAddr)
 }
 
 // Handler builds the HTTP route tree.
@@ -1445,6 +1454,20 @@ func (s *wsSession) executeCommand(command string, payload map[string]any) (any,
 			return nil, err
 		}
 		return map[string]any{"readers": readers}, nil
+	case "wx.secrets.list":
+		return s.wxAPISecretsList(payload)
+	case "wx.secrets.create":
+		return s.wxAPISecretsCreate(payload)
+	case "wx.secrets.update":
+		return s.wxAPISecretsUpdate(payload)
+	case "wx.secrets.revoke":
+		return s.wxAPISecretsRevoke(payload)
+	case "wx.secrets.export":
+		return s.wxAPISecretsExport(payload)
+	case "wx.secrets.import.preview":
+		return s.wxAPISecretsImportPreview(payload)
+	case "wx.secrets.import":
+		return s.wxAPISecretsImport(payload)
 	case "playlist.state":
 		return playlistStatePayload(s.configPath)
 	case "playlist.control":

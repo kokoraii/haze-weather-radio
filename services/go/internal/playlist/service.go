@@ -80,15 +80,16 @@ func Run(ctx context.Context, options Options) error {
 }
 
 type Service struct {
-	cfg                  loadedConfig
-	bridge               *bridgeClient
-	options              Options
-	feeds                map[string]*feedPlanner
-	preparations         *preparationCoordinator
-	preparationStates    map[string]*feedPreparationState
-	priorityPending      []priorityPreparationJob
-	nextPreparationToken uint64
-	maxPriorityPending   int
+	cfg                   loadedConfig
+	bridge                *bridgeClient
+	options               Options
+	feeds                 map[string]*feedPlanner
+	preparations          *preparationCoordinator
+	preparationStates     map[string]*feedPreparationState
+	priorityPending       []priorityPreparationJob
+	nextPreparationToken  uint64
+	maxPriorityPending    int
+	lastAlertAudioCleanup time.Time
 }
 
 func newService(cfg loadedConfig, bridge *bridgeClient, options Options) *Service {
@@ -268,6 +269,7 @@ func (s *Service) handleEvent(ctx context.Context, event map[string]any) {
 			planner.markPriorityStarted()
 		}
 	case "alert.playout.completed":
+		s.pruneCompletedAlertAudio(time.Now())
 		for _, planner := range s.matchFeedsFromEvent(event) {
 			planner.markPriorityCompleted()
 		}
@@ -359,6 +361,7 @@ type feedPlanner struct {
 	routineAltLangIndex  int
 	nextRoutineRetryAt   time.Time
 	lastPendingReplayAt  time.Time
+	lastAudioCleanup     time.Time
 	queue                []playlistItem
 	current              *playlistItem
 	lastFixed            map[string]time.Time
@@ -1572,7 +1575,7 @@ func normalizePriorityAlertRequest(data map[string]any) (map[string]any, string)
 func (p *feedPlanner) preparePriorityAlert(ctx context.Context, data map[string]any) (prepared priorityAlertPreparation, err error) {
 	data, alertID := normalizePriorityAlertRequest(data)
 	includeSame := includeSameAlert(data)
-	
+
 	isUpdate := strings.EqualFold(firstText(nil, data, "status"), "updated")
 	if isUpdate {
 		policy := strings.ToLower(p.cfg.Daemon.AlertUpdateTonePolicy)
@@ -2879,6 +2882,7 @@ func (p *feedPlanner) markCompleted(queueID string) {
 		p.queue = nil
 	}
 	p.pendingAfterCurrent = ""
+	p.prunePlaylistAudio(time.Now())
 	p.writeState()
 }
 
@@ -3020,6 +3024,8 @@ func (p *feedPlanner) writeState() {
 		return
 	}
 	tmp := fmt.Sprintf("%s.%d.tmp", path, time.Now().UnixNano())
+	// Failed writes (including a full disk) must not leave a new temp file each tick.
+	defer func() { _ = os.Remove(tmp) }()
 	if os.WriteFile(tmp, append(raw, '\n'), 0o644) == nil {
 		if err := os.Rename(tmp, path); err != nil {
 			_ = os.Remove(path)

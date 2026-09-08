@@ -188,11 +188,11 @@ impl BridgeClient {
             .context("failed to write host event bridge event")
     }
 
-    /// Writes a complete newline-delimited bridge event prepared by a hot-path producer.
-    pub(crate) async fn write_event_line(&self, event: &[u8]) -> Result<()> {
+    /// Writes a complete pre-framed payload prepared by a hot-path producer.
+    pub(crate) async fn write_raw(&self, payload: &[u8]) -> Result<()> {
         let mut writer = self.writer.lock().await;
         writer
-            .write_all(event)
+            .write_all(payload)
             .await
             .context("failed to write host event bridge event")
     }

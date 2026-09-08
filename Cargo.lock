@@ -2180,11 +2180,13 @@ name = "haze"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "chrono-tz",
  "clap",
  "ctrlc",
  "dunce",
+ "haze-media-protocol",
  "ksni",
  "png",
  "quick-xml",
@@ -2308,6 +2310,7 @@ dependencies = [
  "gstreamer",
  "gstreamer-app",
  "gstreamer-audio",
+ "haze-media-protocol",
  "hound",
  "libloading",
  "quick-xml",
@@ -2323,6 +2326,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "haze-media-protocol"
+version = "0.1.0"
+
+[[package]]
 name = "haze-playout"
 version = "0.1.0"
 dependencies = [
@@ -2333,6 +2340,7 @@ dependencies = [
  "cpal",
  "dunce",
  "haze-media",
+ "haze-media-protocol",
  "hound",
  "memmap2",
  "mimalloc",

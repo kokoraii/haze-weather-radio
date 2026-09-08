@@ -17,9 +17,14 @@ use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use clap::Parser;
 use haze_media::{normalize_pcm, pcm16_samples, push_i16, AudioFormat, Pcm};
+use haze_media_protocol::{
+    decode_pcm_frame, pcm_frame_len_from_prefix, PCM_FRAME_MAGIC, PCM_FRAME_PREFIX_LEN,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 #[cfg(feature = "gstreamer-backend")]
 use tokio::net::UdpSocket;
 use tokio::net::{TcpListener, TcpStream};
@@ -46,13 +51,16 @@ const FRAME_SAMPLES: usize = SAMPLE_RATE as usize / 50;
 const FRAME_BYTES: usize = FRAME_SAMPLES * CHANNELS as usize * 2;
 const INPUT_QUEUE_CAPACITY: usize = 64;
 const PACED_FRAME_CAPACITY: usize = 64;
-const TARGET_SOURCE_QUEUE_MS: u64 = 240;
-const SOFT_SOURCE_QUEUE_MS: u64 = 1_000;
+// Live playout favours freshness. Queues beyond this target are stale audio,
+// not useful jitter protection, and must be discarded rather than replayed.
+const TARGET_SOURCE_QUEUE_MS: u64 = 120;
+const SOFT_SOURCE_QUEUE_MS: u64 = 400;
 const MAX_SOURCE_QUEUE_MS: u64 = 3_000;
 const SOURCE_DRIFT_TRIM_MS: u64 = 0;
 const FEED_CLOCK_REBASE_LAG_MS: u64 = 80;
 const CONCEALMENT_FRAMES: u8 = 3;
 const STATUS_INTERVAL: Duration = Duration::from_secs(5);
+const AUDIO_HEALTH_WINDOW: Duration = Duration::from_secs(60);
 const HTTP_HEADER_LIMIT: usize = 16 * 1024;
 const HTTP_BODY_LIMIT: usize = 512 * 1024;
 const MEDIA_BRIDGE_LINE_LIMIT: usize = 256 * 1024;
@@ -60,12 +68,6 @@ const MEDIA_BRIDGE_LINE_LIMIT: usize = 256 * 1024;
 const STR0M_WEBRTC_UDP_BUFFER: usize = 2_048;
 #[cfg_attr(not(feature = "gstreamer-backend"), allow(dead_code))]
 const STR0M_WEBRTC_ENCODED_QUEUE_CAPACITY: usize = 16;
-#[cfg_attr(not(feature = "gstreamer-backend"), allow(dead_code))]
-const STR0M_WEBRTC_PEER_PREROLL_FRAMES: usize = 3;
-#[cfg_attr(not(feature = "gstreamer-backend"), allow(dead_code))]
-const STR0M_WEBRTC_PEER_MAX_BUFFER_FRAMES: usize = 16;
-#[cfg_attr(not(feature = "gstreamer-backend"), allow(dead_code))]
-const STR0M_WEBRTC_PEER_DRAIN_LIMIT: usize = 16;
 const MAX_WEBRTC_UDP_PORTS: u32 = 4_096;
 #[cfg(feature = "gstreamer-backend")]
 static WEBRTC_UDP_PORT_CURSOR: AtomicU64 = AtomicU64::new(0);
@@ -330,6 +332,9 @@ struct PcmChunk {
     channels: u16,
     data: Vec<u8>,
     bypass_loudness: bool,
+    sequence: Option<u64>,
+    pts_ns: Option<u64>,
+    discontinuity: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -341,6 +346,8 @@ struct QueuedSample {
 #[derive(Debug, Clone)]
 struct PacedFrame {
     _sequence: u64,
+    source_pts_ns: Option<u64>,
+    source_discontinuity: bool,
     data: Arc<[u8]>,
 }
 
@@ -465,18 +472,27 @@ struct FeedStats {
     real_frames: u64,
     silence_frames: u64,
     concealed_frames: u64,
+    recent_concealed_frames: u64,
     partial_frames: u64,
+    recent_partial_frames: u64,
     late_ticks: u64,
+    recent_late_ticks: u64,
     catchup_ticks: u64,
+    recent_catchup_ticks: u64,
     dropped_input_chunks: u64,
+    recent_dropped_input_chunks: u64,
+    source_discontinuities: u64,
     stale_samples_dropped: u64,
+    recent_stale_samples_dropped: u64,
     source_drift_samples_trimmed: u64,
     near_silent_frames: u64,
     consecutive_near_silent_frames: u64,
     repeated_frames: u64,
     repeated_non_silent_frames: u64,
+    recent_repeated_non_silent_frames: u64,
     consecutive_repeated_frames: u64,
     clipped_samples: u64,
+    recent_clipped_samples: u64,
     last_peak: u16,
     last_rms_dbfs: f64,
     last_max_sample_jump: u16,
@@ -486,6 +502,8 @@ struct FeedStats {
     max_tick_gap_ms: u128,
     last_input_age_ms: Option<u128>,
     last_frame_age_ms: Option<u128>,
+    #[serde(skip)]
+    health_window_started_at: Option<Instant>,
 }
 
 struct FeedRuntime {
@@ -522,7 +540,10 @@ impl FeedRuntime {
     fn push(&self, chunk: PcmChunk) {
         if let Err(mpsc::error::TrySendError::Full(_)) = self.input_tx.try_send(chunk) {
             if let Ok(mut stats) = self.stats.lock() {
+                reset_audio_health_window(&mut stats, Instant::now());
                 stats.dropped_input_chunks = stats.dropped_input_chunks.saturating_add(1);
+                stats.recent_dropped_input_chunks =
+                    stats.recent_dropped_input_chunks.saturating_add(1);
             }
         }
     }
@@ -612,55 +633,6 @@ struct WebRTCPeerSnapshot {
     bytes_pushed: u64,
     frames_pushed: u64,
     dropped_frames: u64,
-}
-
-#[derive(Debug)]
-struct WebRTCPeerAudioPacer {
-    frames: VecDeque<Arc<[u8]>>,
-    silence: Arc<[u8]>,
-    primed: bool,
-}
-
-impl WebRTCPeerAudioPacer {
-    fn new() -> Self {
-        Self {
-            frames: VecDeque::with_capacity(STR0M_WEBRTC_PEER_MAX_BUFFER_FRAMES),
-            silence: Arc::from(vec![0u8; FRAME_BYTES]),
-            primed: false,
-        }
-    }
-
-    fn push(&mut self, frame: Arc<[u8]>) {
-        while self.frames.len() >= STR0M_WEBRTC_PEER_MAX_BUFFER_FRAMES {
-            self.frames.pop_front();
-        }
-        self.frames.push_back(frame);
-        if self.frames.len() >= STR0M_WEBRTC_PEER_PREROLL_FRAMES {
-            self.primed = true;
-        }
-    }
-
-    fn pop_paced(&mut self) -> (Arc<[u8]>, bool) {
-        if !self.primed {
-            if self.frames.len() >= STR0M_WEBRTC_PEER_PREROLL_FRAMES {
-                self.primed = true;
-            } else {
-                return (Arc::clone(&self.silence), false);
-            }
-        }
-        match self.frames.pop_front() {
-            Some(frame) => (frame, true),
-            None => {
-                self.primed = false;
-                (Arc::clone(&self.silence), false)
-            }
-        }
-    }
-
-    #[cfg(test)]
-    fn queued_frames(&self) -> usize {
-        self.frames.len()
-    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -1086,7 +1058,7 @@ fn media_clock_health() -> Value {
     })
 }
 
-#[tokio::main]
+#[tokio::main(worker_threads = 2)]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -1254,6 +1226,9 @@ fn feed_clock_thread(runtime: Arc<FeedRuntime>, mut input_rx: mpsc::Receiver<Pcm
     let mut sequence = 0u64;
     let mut last_input_at: Option<Instant> = None;
     let mut last_tick_at: Option<Instant> = None;
+    let mut expected_source_sequence: Option<u64> = None;
+    let mut next_source_pts_ns: Option<u64> = None;
+    let mut source_discontinuity_pending = false;
     let mut loudness = AudioLoudness::from_env();
     loop {
         let scheduled_tick = next_tick;
@@ -1275,6 +1250,24 @@ fn feed_clock_thread(runtime: Arc<FeedRuntime>, mut input_rx: mpsc::Receiver<Pcm
         while drained < INPUT_QUEUE_CAPACITY {
             match input_rx.try_recv() {
                 Ok(chunk) => {
+                    let sequence_gap = chunk.sequence.is_some_and(|sequence| {
+                        expected_source_sequence.is_some_and(|expected| sequence != expected)
+                    });
+                    if chunk.discontinuity || sequence_gap {
+                        samples.clear();
+                        primed = false;
+                        concealment_remaining = 0;
+                        next_source_pts_ns = chunk.pts_ns;
+                        source_discontinuity_pending = true;
+                        if let Ok(mut stats) = runtime.stats.lock() {
+                            stats.source_discontinuities =
+                                stats.source_discontinuities.saturating_add(1);
+                        }
+                    } else if samples.is_empty() && next_source_pts_ns.is_none() {
+                        next_source_pts_ns = chunk.pts_ns;
+                    }
+                    expected_source_sequence =
+                        chunk.sequence.map(|sequence| sequence.saturating_add(1));
                     append_normalized_chunk(&mut samples, chunk);
                     last_input_at = Some(Instant::now());
                     drained += 1;
@@ -1321,29 +1314,48 @@ fn feed_clock_thread(runtime: Arc<FeedRuntime>, mut input_rx: mpsc::Receiver<Pcm
         previous_output_frame.clear();
         previous_output_frame.extend_from_slice(&frame);
         let data: Arc<[u8]> = Arc::from(frame.as_slice());
+        let source_pts_ns = (real == FRAME_SAMPLES)
+            .then_some(next_source_pts_ns)
+            .flatten();
+        let source_discontinuity = source_discontinuity_pending && real == FRAME_SAMPLES;
+        if real == FRAME_SAMPLES {
+            next_source_pts_ns =
+                next_source_pts_ns.map(|pts| pts.saturating_add(FRAME_DURATION.as_nanos() as u64));
+            source_discontinuity_pending = false;
+        }
         let _ = runtime.frame_tx.send(PacedFrame {
             _sequence: sequence,
+            source_pts_ns,
+            source_discontinuity,
             data,
         });
         let now = Instant::now();
         if let Ok(mut stats) = runtime.stats.lock() {
+            reset_audio_health_window(&mut stats, now);
             stats.frames = stats.frames.saturating_add(1);
             if late_tick {
                 stats.late_ticks = stats.late_ticks.saturating_add(1);
+                stats.recent_late_ticks = stats.recent_late_ticks.saturating_add(1);
             }
             if catchup_tick {
                 stats.catchup_ticks = stats.catchup_ticks.saturating_add(1);
+                stats.recent_catchup_ticks = stats.recent_catchup_ticks.saturating_add(1);
             }
             if real == FRAME_SAMPLES {
                 stats.real_frames = stats.real_frames.saturating_add(1);
             } else if concealed {
                 stats.concealed_frames = stats.concealed_frames.saturating_add(1);
+                stats.recent_concealed_frames = stats.recent_concealed_frames.saturating_add(1);
             } else if real == 0 {
                 stats.silence_frames = stats.silence_frames.saturating_add(1);
             } else {
                 stats.partial_frames = stats.partial_frames.saturating_add(1);
+                stats.recent_partial_frames = stats.recent_partial_frames.saturating_add(1);
             }
             stats.stale_samples_dropped = stats.stale_samples_dropped.saturating_add(stale_dropped);
+            stats.recent_stale_samples_dropped = stats
+                .recent_stale_samples_dropped
+                .saturating_add(stale_dropped);
             if signal.near_silent {
                 stats.near_silent_frames = stats.near_silent_frames.saturating_add(1);
                 stats.consecutive_near_silent_frames =
@@ -1358,11 +1370,16 @@ fn feed_clock_thread(runtime: Arc<FeedRuntime>, mut input_rx: mpsc::Receiver<Pcm
                 if !signal.near_silent {
                     stats.repeated_non_silent_frames =
                         stats.repeated_non_silent_frames.saturating_add(1);
+                    stats.recent_repeated_non_silent_frames =
+                        stats.recent_repeated_non_silent_frames.saturating_add(1);
                 }
             } else {
                 stats.consecutive_repeated_frames = 0;
             }
             stats.clipped_samples = stats.clipped_samples.saturating_add(signal.clipped_samples);
+            stats.recent_clipped_samples = stats
+                .recent_clipped_samples
+                .saturating_add(signal.clipped_samples);
             stats.last_peak = signal.peak;
             stats.last_rms_dbfs = signal.rms_dbfs;
             stats.last_max_sample_jump = signal.max_sample_jump;
@@ -1509,41 +1526,56 @@ fn analyze_pcm_frame(frame: &[u8], previous: &[u8]) -> FrameSignal {
 
 fn classify_audio_health(stats: &FeedStats) -> (bool, Vec<String>) {
     let mut warnings = Vec::new();
-    if stats.dropped_input_chunks > 0 {
+    if stats.recent_dropped_input_chunks > 0 {
         warnings.push(format!(
-            "dropped_input_chunks={}",
-            stats.dropped_input_chunks
+            "recent_dropped_input_chunks={}",
+            stats.recent_dropped_input_chunks
         ));
     }
-    if stats.stale_samples_dropped > 0 {
+    if stats.recent_stale_samples_dropped > 0 {
         warnings.push(format!(
-            "stale_samples_dropped={}",
-            stats.stale_samples_dropped
+            "recent_stale_samples_dropped={}",
+            stats.recent_stale_samples_dropped
         ));
     }
-    if stats.concealed_frames > 0 {
-        warnings.push(format!("concealed_frames={}", stats.concealed_frames));
-    }
-    if stats.partial_frames > 0 {
-        warnings.push(format!("partial_frames={}", stats.partial_frames));
-    }
-    if stats.repeated_non_silent_frames > 0 {
+    if stats.recent_concealed_frames > 0 {
         warnings.push(format!(
-            "repeated_non_silent_frames={}",
-            stats.repeated_non_silent_frames
+            "recent_concealed_frames={}",
+            stats.recent_concealed_frames
         ));
     }
-    if stats.clipped_samples > 0 {
-        warnings.push(format!("clipped_samples={}", stats.clipped_samples));
+    if stats.recent_partial_frames > 0 {
+        warnings.push(format!(
+            "recent_partial_frames={}",
+            stats.recent_partial_frames
+        ));
     }
-    if stats.late_ticks > 0 {
-        warnings.push(format!("late_ticks={}", stats.late_ticks));
+    if stats.recent_repeated_non_silent_frames > 0 {
+        warnings.push(format!(
+            "recent_repeated_non_silent_frames={}",
+            stats.recent_repeated_non_silent_frames
+        ));
     }
-    if stats.catchup_ticks > 0 {
-        warnings.push(format!("catchup_ticks={}", stats.catchup_ticks));
+    if stats.recent_clipped_samples > 0 {
+        warnings.push(format!(
+            "recent_clipped_samples={}",
+            stats.recent_clipped_samples
+        ));
     }
-    if stats.max_tick_gap_ms > AUDIO_HEALTH_TICK_GAP_WARN_MS {
-        warnings.push(format!("max_tick_gap_ms={}", stats.max_tick_gap_ms));
+    if stats.recent_late_ticks > 0 {
+        warnings.push(format!("recent_late_ticks={}", stats.recent_late_ticks));
+    }
+    if stats.recent_catchup_ticks > 0 {
+        warnings.push(format!(
+            "recent_catchup_ticks={}",
+            stats.recent_catchup_ticks
+        ));
+    }
+    if stats.last_tick_gap_ms > Some(AUDIO_HEALTH_TICK_GAP_WARN_MS) {
+        warnings.push(format!(
+            "last_tick_gap_ms={}",
+            stats.last_tick_gap_ms.unwrap_or_default()
+        ));
     }
     if stats.frames > 50 && stats.queued_samples < FRAME_SAMPLES {
         warnings.push(format!("source_queue_low_samples={}", stats.queued_samples));
@@ -1558,6 +1590,22 @@ fn classify_audio_health(stats: &FeedStats) -> (bool, Vec<String>) {
         }
     }
     (warnings.is_empty(), warnings)
+}
+
+fn reset_audio_health_window(stats: &mut FeedStats, now: Instant) {
+    let started_at = stats.health_window_started_at.get_or_insert(now);
+    if now.saturating_duration_since(*started_at) < AUDIO_HEALTH_WINDOW {
+        return;
+    }
+    stats.recent_concealed_frames = 0;
+    stats.recent_partial_frames = 0;
+    stats.recent_late_ticks = 0;
+    stats.recent_catchup_ticks = 0;
+    stats.recent_dropped_input_chunks = 0;
+    stats.recent_stale_samples_dropped = 0;
+    stats.recent_repeated_non_silent_frames = 0;
+    stats.recent_clipped_samples = 0;
+    stats.health_window_started_at = Some(now);
 }
 
 fn append_normalized_chunk(samples: &mut VecDeque<QueuedSample>, chunk: PcmChunk) {
@@ -1676,30 +1724,75 @@ async fn run_pcm_bridge_connection(stream: TcpStream, state: &MediaState) -> Res
         json!({
             "type": "bridge.client",
             "source": SOURCE_ID,
-            "data": { "receive_events": true },
+            "data": {
+                "receive_events": true,
+                "binary_pcm": true,
+            },
         }),
     )
     .await?;
 
     let mut reader = BufReader::new(reader);
-    let mut line = Vec::with_capacity(16 * 1024);
+    let mut payload = Vec::with_capacity(16 * 1024);
     loop {
-        line.clear();
-        let read = reader
-            .read_until(b'\n', &mut line)
-            .await
-            .context("failed to read host media bridge line")?;
-        if read == 0 {
+        let Some(is_binary) = read_pcm_bridge_payload(&mut reader, &mut payload).await? else {
             bail!("host media bridge closed");
-        }
-        if line.len() > MEDIA_BRIDGE_LINE_LIMIT {
-            warn!(bytes = line.len(), "dropping oversized media bridge event");
+        };
+        if !is_binary && payload.len() > MEDIA_BRIDGE_LINE_LIMIT {
+            warn!(
+                bytes = payload.len(),
+                "dropping oversized media bridge event"
+            );
             continue;
         }
-        if let Some(chunk) = decode_pcm_event(&line) {
+        let chunk = if is_binary {
+            decode_binary_pcm_frame(&payload)
+        } else {
+            decode_pcm_event(&payload)
+        };
+        if let Some(chunk) = chunk {
             state.publish_pcm(chunk);
         }
     }
+}
+
+/// Reads either a newline-delimited legacy event or one compact PCM frame.
+async fn read_pcm_bridge_payload<R>(reader: &mut R, payload: &mut Vec<u8>) -> Result<Option<bool>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    payload.clear();
+    let mut first = [0u8; 1];
+    let read = reader
+        .read(&mut first)
+        .await
+        .context("failed to read host media bridge payload")?;
+    if read == 0 {
+        return Ok(None);
+    }
+    payload.push(first[0]);
+    if first[0] != PCM_FRAME_MAGIC[0] {
+        reader
+            .read_until(b'\n', payload)
+            .await
+            .context("failed to read host media bridge event")?;
+        return Ok(Some(false));
+    }
+
+    let mut prefix_tail = [0u8; PCM_FRAME_PREFIX_LEN - 1];
+    reader
+        .read_exact(&mut prefix_tail)
+        .await
+        .context("failed to read host media bridge PCM prefix")?;
+    payload.extend_from_slice(&prefix_tail);
+    let frame_len =
+        pcm_frame_len_from_prefix(payload).context("invalid host media bridge PCM prefix")?;
+    payload.resize(frame_len, 0);
+    reader
+        .read_exact(&mut payload[PCM_FRAME_PREFIX_LEN..])
+        .await
+        .context("failed to read host media bridge PCM frame")?;
+    Ok(Some(true))
 }
 
 async fn publish_status<W>(writer: &mut W, state: &MediaState) -> Result<()>
@@ -1803,6 +1896,30 @@ fn decode_pcm_event(raw: &[u8]) -> Option<PcmChunk> {
         channels,
         data,
         bypass_loudness: event.data.bypass_loudness || event.data.audio_processing.bypass_loudness,
+        sequence: None,
+        pts_ns: None,
+        discontinuity: false,
+    })
+}
+
+fn decode_binary_pcm_frame(raw: &[u8]) -> Option<PcmChunk> {
+    let frame = decode_pcm_frame(raw).ok()?;
+    let sample_rate = frame.sample_rate.max(8_000);
+    let channels = frame.channels.max(1);
+    let frame_bytes = AudioFormat::new(sample_rate, channels).frame_bytes();
+    if frame_bytes == 0 || frame.pcm.len() < frame_bytes {
+        return None;
+    }
+    let aligned = frame.pcm.len() - frame.pcm.len() % frame_bytes;
+    Some(PcmChunk {
+        feed_id: frame.feed_id.to_string(),
+        sample_rate,
+        channels,
+        data: frame.pcm[..aligned].to_vec(),
+        bypass_loudness: false,
+        sequence: Some(frame.sequence),
+        pts_ns: Some(frame.pts_ns),
+        discontinuity: frame.discontinuity,
     })
 }
 
@@ -2668,46 +2785,41 @@ fn start_webrtc_peer_feeder(
         let feed_state = state.clone();
         let mut rx = feed.subscribe();
         let feed_task = tokio::spawn(async move {
-            let mut ticker = interval(FRAME_DURATION);
-            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            let mut pacer = WebRTCPeerAudioPacer::new();
             'feed: loop {
-                ticker.tick().await;
-                let mut drained = 0usize;
-                while drained < STR0M_WEBRTC_PEER_DRAIN_LIMIT {
-                    match rx.try_recv() {
-                        Ok(frame) => {
-                            pacer.push(frame.data);
-                            drained += 1;
+                let frame = match rx.recv().await {
+                    Ok(frame) => frame,
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        for _ in 0..skipped {
+                            feed_state.record_webrtc_peer_drop(peer_id);
                         }
-                        Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
-                            for _ in 0..skipped {
-                                feed_state.record_webrtc_peer_drop(peer_id);
-                            }
-                            let skipped =
-                                usize::try_from(skipped).unwrap_or(STR0M_WEBRTC_PEER_DRAIN_LIMIT);
-                            drained = drained.saturating_add(skipped);
-                        }
-                        Err(broadcast::error::TryRecvError::Empty) => break,
-                        Err(broadcast::error::TryRecvError::Closed) => break 'feed,
+                        continue;
                     }
-                }
-                let (data, real_frame) = pacer.pop_paced();
-                if !real_frame {
-                    feed_state.record_webrtc_peer_drop(peer_id);
-                }
-                let pts_ns = next_gst_audio_pts(&mut next_pts_ns, frame_duration_ns);
-                let buffer = match build_gst_audio_buffer(&data, pts_ns, frame_duration_ns) {
-                    Ok(buffer) => buffer,
-                    Err(err) => {
-                        warn!("failed to build WebRTC encoder buffer: {err:#}");
-                        break;
-                    }
+                    Err(broadcast::error::RecvError::Closed) => break 'feed,
                 };
+                if frame.source_discontinuity {
+                    next_pts_ns = frame.source_pts_ns;
+                }
+                let pts_ns = frame
+                    .source_pts_ns
+                    .unwrap_or_else(|| next_gst_audio_pts(&mut next_pts_ns, frame_duration_ns));
+                next_pts_ns = Some(pts_ns.saturating_add(frame_duration_ns));
+                let mut buffer =
+                    match build_gst_audio_buffer(&frame.data, pts_ns, frame_duration_ns) {
+                        Ok(buffer) => buffer,
+                        Err(err) => {
+                            warn!("failed to build WebRTC encoder buffer: {err:#}");
+                            break;
+                        }
+                    };
+                if frame.source_discontinuity {
+                    if let Some(buffer) = buffer.get_mut() {
+                        buffer.set_flags(gstreamer::BufferFlags::DISCONT);
+                    }
+                }
                 if encoder_appsrc.push_buffer(buffer).is_err() {
                     break;
                 }
-                feed_state.record_webrtc_peer_push(peer_id, data.len());
+                feed_state.record_webrtc_peer_push(peer_id, frame.data.len());
             }
         });
 
@@ -4437,6 +4549,9 @@ mod tests {
         assert_eq!(chunk.channels, 1);
         assert_eq!(chunk.data, raw_pcm);
         assert!(!chunk.bypass_loudness);
+        assert_eq!(chunk.sequence, None);
+        assert_eq!(chunk.pts_ns, None);
+        assert!(!chunk.discontinuity);
     }
 
     #[test]
@@ -4457,6 +4572,72 @@ mod tests {
         let chunk = decode_pcm_event(serde_json::to_string(&event).unwrap().as_bytes()).unwrap();
 
         assert!(chunk.bypass_loudness);
+    }
+
+    #[test]
+    fn decodes_compact_pcm_frame() {
+        let raw_pcm = [1u8, 0, 2, 0];
+        let mut frame = Vec::new();
+        haze_media_protocol::encode_pcm_frame(
+            &mut frame,
+            haze_media_protocol::PcmFrame {
+                feed_id: "sk-0001",
+                queue_id: Some("alert-1"),
+                sample_rate: 48_000,
+                channels: 1,
+                duration_ms: 20,
+                sequence: 7,
+                pts_ns: 140_000_000,
+                discontinuity: true,
+                media_kind: haze_media_protocol::PcmMediaKind::Alert,
+                pcm: &raw_pcm,
+            },
+        )
+        .expect("encode PCM frame");
+
+        let chunk = decode_binary_pcm_frame(&frame).expect("decode PCM frame");
+
+        assert_eq!(chunk.feed_id, "sk-0001");
+        assert_eq!(chunk.sample_rate, 48_000);
+        assert_eq!(chunk.channels, 1);
+        assert_eq!(chunk.data, raw_pcm);
+        assert!(!chunk.bypass_loudness);
+        assert_eq!(chunk.sequence, Some(7));
+        assert_eq!(chunk.pts_ns, Some(140_000_000));
+        assert!(chunk.discontinuity);
+    }
+
+    #[tokio::test]
+    async fn reads_compact_pcm_frame_from_bridge() {
+        let mut frame = Vec::new();
+        haze_media_protocol::encode_pcm_frame(
+            &mut frame,
+            haze_media_protocol::PcmFrame {
+                feed_id: "sk-0001",
+                queue_id: None,
+                sample_rate: 48_000,
+                channels: 1,
+                duration_ms: 20,
+                sequence: 0,
+                pts_ns: 0,
+                discontinuity: false,
+                media_kind: haze_media_protocol::PcmMediaKind::Routine,
+                pcm: &[0, 0],
+            },
+        )
+        .expect("encode PCM frame");
+        let (mut writer, reader) = tokio::io::duplex(frame.len());
+        writer.write_all(&frame).await.expect("write PCM frame");
+        drop(writer);
+        let mut reader = BufReader::new(reader);
+        let mut payload = Vec::new();
+
+        let is_binary = read_pcm_bridge_payload(&mut reader, &mut payload)
+            .await
+            .expect("read PCM payload");
+
+        assert_eq!(is_binary, Some(true));
+        assert_eq!(payload, frame);
     }
 
     #[test]
@@ -4657,49 +4838,6 @@ mod tests {
             deadline.duration_since(last_network_at),
             WEBRTC_CONNECTED_IDLE_TIMEOUT
         );
-    }
-
-    #[test]
-    fn webrtc_peer_audio_pacer_prerolls_then_outputs_in_order() {
-        let mut pacer = WebRTCPeerAudioPacer::new();
-
-        let (first, real) = pacer.pop_paced();
-
-        assert!(!real);
-        assert_eq!(first.len(), FRAME_BYTES);
-        for value in 1..=(STR0M_WEBRTC_PEER_PREROLL_FRAMES + 1) {
-            pacer.push(Arc::from(vec![value as u8; FRAME_BYTES]));
-        }
-
-        let (first, real) = pacer.pop_paced();
-        let (second, real_second) = pacer.pop_paced();
-
-        assert!(real);
-        assert!(real_second);
-        assert_eq!(first[0], 1);
-        assert_eq!(second[0], 2);
-    }
-
-    #[test]
-    fn webrtc_peer_audio_pacer_bounds_backlog_and_uses_silence_when_starved() {
-        let mut pacer = WebRTCPeerAudioPacer::new();
-        for value in 0..(STR0M_WEBRTC_PEER_MAX_BUFFER_FRAMES + 3) {
-            pacer.push(Arc::from(vec![value as u8; FRAME_BYTES]));
-        }
-
-        assert_eq!(pacer.queued_frames(), STR0M_WEBRTC_PEER_MAX_BUFFER_FRAMES);
-
-        let (first, real) = pacer.pop_paced();
-        assert!(real);
-        assert_eq!(first[0], 3);
-
-        for _ in 0..STR0M_WEBRTC_PEER_MAX_BUFFER_FRAMES {
-            let _ = pacer.pop_paced();
-        }
-        let (silence, real) = pacer.pop_paced();
-
-        assert!(!real);
-        assert!(silence.iter().all(|byte| *byte == 0));
     }
 
     #[test]
@@ -5202,12 +5340,16 @@ mod tests {
             frames: 10_000,
             real_frames: 9_990,
             concealed_frames: 5,
+            recent_concealed_frames: 5,
             repeated_non_silent_frames: 4,
+            recent_repeated_non_silent_frames: 4,
             clipped_samples: 2,
+            recent_clipped_samples: 2,
             late_ticks: 1,
+            recent_late_ticks: 1,
             queued_samples: FRAME_SAMPLES * 12,
             last_input_age_ms: Some(20),
-            max_tick_gap_ms: 55,
+            last_tick_gap_ms: Some(55),
             ..FeedStats::default()
         };
 
@@ -5215,16 +5357,32 @@ mod tests {
         assert!(!ok);
         assert!(warnings
             .iter()
-            .any(|warning| warning.starts_with("concealed_frames=")));
+            .any(|warning| warning.starts_with("recent_concealed_frames=")));
         assert!(warnings
             .iter()
-            .any(|warning| warning.starts_with("repeated_non_silent_frames=")));
+            .any(|warning| warning.starts_with("recent_repeated_non_silent_frames=")));
         assert!(warnings
             .iter()
-            .any(|warning| warning.starts_with("clipped_samples=")));
+            .any(|warning| warning.starts_with("recent_clipped_samples=")));
         assert!(warnings
             .iter()
-            .any(|warning| warning.starts_with("late_ticks=")));
+            .any(|warning| warning.starts_with("recent_late_ticks=")));
+    }
+
+    #[test]
+    fn audio_health_recovers_after_rolling_window() {
+        let now = Instant::now();
+        let mut stats = FeedStats {
+            recent_concealed_frames: 8,
+            recent_dropped_input_chunks: 2,
+            health_window_started_at: Some(now - AUDIO_HEALTH_WINDOW),
+            ..FeedStats::default()
+        };
+
+        reset_audio_health_window(&mut stats, now);
+
+        assert_eq!(stats.recent_concealed_frames, 0);
+        assert_eq!(stats.recent_dropped_input_chunks, 0);
     }
 
     #[cfg(feature = "gstreamer-backend")]

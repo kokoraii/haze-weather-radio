@@ -201,6 +201,21 @@ func TestMediaHubDoesNotStartHTTPSourceWhenBridgeIsAvailable(t *testing.T) {
 	}
 }
 
+func TestMediaHubBridgeUsesPacedMediaServiceWhenConfigured(t *testing.T) {
+	config := Config{}
+	config.Services.Rust.Media.Enabled = true
+	config.Services.Rust.Media.Addr = "127.0.0.1:8097"
+
+	if got := mediaHubBridgeAddr(config, "127.0.0.1:9001", "127.0.0.1:9000"); got != "" {
+		t.Fatalf("media hub bridge address = %q, want paced media service", got)
+	}
+
+	config.Services.Rust.Media.Enabled = false
+	if got := mediaHubBridgeAddr(config, "127.0.0.1:9001", "127.0.0.1:9000"); got != "127.0.0.1:9001" {
+		t.Fatalf("legacy media hub bridge address = %q", got)
+	}
+}
+
 func TestCopyRealtimeHTTPAudioFlushesChunks(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	if err := copyRealtimeHTTPAudio(recorder, strings.NewReader("pcm")); err != nil {

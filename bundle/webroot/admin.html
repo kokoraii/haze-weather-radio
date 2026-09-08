@@ -806,6 +806,38 @@
                             </section>
                         </aside>
                     </div>
+
+                    <section class="section-block wx-api-secrets">
+                        <div class="section-hd">
+                            <span>App API Secrets</span>
+                            <span class="section-hd-sub">Give other applications access to weather data, generated audio, or both.</span>
+                        </div>
+                        <div class="section-body">
+                            <p class="wx-hint">Secret values are shown once when generated. Store them in the calling app, then use <code>Authorization: Bearer …</code>.</p>
+                            <div class="wx-secret-create">
+                                <label class="form-group"><span>Name</span><input id="wxSecretName" maxlength="100" placeholder="Example dashboard"></label>
+                                <label class="form-group"><span>Expires (optional)</span><input id="wxSecretExpiry" type="datetime-local"></label>
+                                <fieldset class="wx-secret-scopes">
+                                    <legend>Permissions</legend>
+                                    <label><input id="wxSecretWeather" type="checkbox" checked disabled> Weather data</label>
+                                    <label><input id="wxSecretAudio" type="checkbox"> Generated audio</label>
+                                </fieldset>
+                                <button id="wxSecretCreate" class="btn-primary" type="button">Generate Secret</button>
+                            </div>
+                            <div id="wxSecretReveal" class="wx-secret-reveal" hidden>
+                                <strong>Copy this secret now. It cannot be viewed again.</strong>
+                                <code id="wxSecretValue"></code>
+                            </div>
+                            <div class="wx-secret-transfer">
+                                <button id="wxSecretExport" class="btn-ghost" type="button">Export Backup</button>
+                                <label class="btn-ghost" for="wxSecretImportFile">Import Backup</label>
+                                <input id="wxSecretImportFile" type="file" accept="application/json,.json" hidden>
+                                <span id="wxSecretTransferStatus" class="wx-hint">Backups contain keyed verifiers, not usable secret values.</span>
+                            </div>
+                            <div id="wxSecretImportConflicts" class="wx-secret-import" hidden></div>
+                            <div id="wxSecretList" class="wx-secret-list"><p class="wx-hint">Loading API secrets...</p></div>
+                        </div>
+                    </section>
                 </main>
             </div>
 

@@ -39,7 +39,9 @@ struct Args {
     alert_poll: String,
 }
 
-#[tokio::main]
+// Audio preparation is explicitly bounded. Two executor workers keep bridge I/O
+// responsive without scaling scheduler overhead with the host's CPU count.
+#[tokio::main(worker_threads = 2)]
 async fn main() -> Result<()> {
     let args = Args::parse();
     init_tracing();

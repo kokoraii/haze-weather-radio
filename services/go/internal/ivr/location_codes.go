@@ -35,6 +35,7 @@ type telephoneLocationCode struct {
 	PostalCodes          []string `json:"postal_codes,omitempty"`
 	PostalCodeFormat     string   `json:"postal_code_format,omitempty"`
 	PostalCodesTruncated bool     `json:"postal_codes_truncated,omitempty"`
+	AvailableProducts    []string `json:"available_products"`
 }
 
 type telephoneLocationCodePage struct {
@@ -93,7 +94,7 @@ func (s *Service) handleLocationCodes(writer http.ResponseWriter, request *http.
 		return
 	}
 
-	all := s.resolver.telephoneLocationCodes()
+	all := s.locationCodesWithProducts()
 	filtered := make([]telephoneLocationCode, 0, len(all))
 	for _, location := range all {
 		if province != "" && !strings.EqualFold(location.Province, province) {

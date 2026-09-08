@@ -29,9 +29,11 @@ type Options struct {
 }
 
 type rootConfig struct {
-	FeedsFile string                  `yaml:"feeds_file"`
-	Storage   datastore.StorageConfig `yaml:"storage"`
-	Operator  struct {
+	FeedsFile    string                  `yaml:"feeds_file"`
+	ProductsFile string                  `yaml:"products_file"`
+	PackagesFile string                  `yaml:"packages_file"`
+	Storage      datastore.StorageConfig `yaml:"storage"`
+	Operator     struct {
 		OnAirName     any `yaml:"on_air_name"`
 		TelephoneName any `yaml:"telephone_name"`
 	} `yaml:"operator"`

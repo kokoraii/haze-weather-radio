@@ -99,6 +99,7 @@ type accountAuth struct {
 	loginLimiter        *attemptLimiter
 	loginIPLimiter      *attemptLimiter
 	originationLimiter  *attemptLimiter
+	apiSecretLimiter    *attemptLimiter
 	expiryAuditLimiter  *attemptLimiter
 	preauthAuditLimiter *attemptLimiter
 	accountMutationMu   sync.Mutex
@@ -218,6 +219,7 @@ func newAccountAuth(config Config, configPath string) *accountAuth {
 		loginLimiter:        newAttemptLimiter(),
 		loginIPLimiter:      newAttemptLimiter(),
 		originationLimiter:  newAttemptLimiter(),
+		apiSecretLimiter:    newAttemptLimiter(),
 		expiryAuditLimiter:  newAttemptLimiter(),
 		preauthAuditLimiter: newAttemptLimiter(),
 		argonSlots:          make(chan struct{}, 2),

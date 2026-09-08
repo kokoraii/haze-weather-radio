@@ -1,4 +1,4 @@
-version: 26.08.24
+version: 26.09.07
 daemon_settings_file: runtime/state/daemonSettings.json
 
 storage:
@@ -112,6 +112,7 @@ services:
     product_render:
       enabled: true
       refresh: "5m"
+      workers: 4 # Routine render concurrency (1-32); changes take effect on restart.
       cleanup:
         enabled: true
         hour: 3

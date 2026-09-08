@@ -45,6 +45,9 @@ const state = {
     objectUrl: null,
     busy: false,
     generation: 0,
+    apiSecrets: [],
+    importBackup: null,
+    importEntries: [],
 };
 
 const el = {
@@ -81,6 +84,18 @@ const el = {
     generatePath: document.getElementById('generatePath'),
     packagesPath: document.getElementById('packagesPath'),
     readersPath: document.getElementById('readersPath'),
+    secretName: document.getElementById('wxSecretName'),
+    secretExpiry: document.getElementById('wxSecretExpiry'),
+    secretWeather: document.getElementById('wxSecretWeather'),
+    secretAudio: document.getElementById('wxSecretAudio'),
+    secretCreate: document.getElementById('wxSecretCreate'),
+    secretReveal: document.getElementById('wxSecretReveal'),
+    secretValue: document.getElementById('wxSecretValue'),
+    secretList: document.getElementById('wxSecretList'),
+    secretExport: document.getElementById('wxSecretExport'),
+    secretImportFile: document.getElementById('wxSecretImportFile'),
+    secretTransferStatus: document.getElementById('wxSecretTransferStatus'),
+    secretImportConflicts: document.getElementById('wxSecretImportConflicts'),
 };
 
 function detectApiBase() {
@@ -244,6 +259,7 @@ function update() {
     const curl = [
         `curl -s -X POST ${apiRequestUrl()}`,
         `  -H 'Content-Type: application/json'`,
+        `  -H 'Authorization: Bearer $HAZE_WX_SECRET'`,
         `  -d '${JSON.stringify(body)}'`,
     ];
     if (!TEXT_FORMATS.has(body.format)) {
@@ -257,6 +273,167 @@ function update() {
     el.pkgClearBtn.disabled = state.busy || packageCount === 0;
     updatePackageSummary();
     updateEndpoints();
+}
+
+function localDateTime(value) {
+    if (!value) return '';
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return '';
+    const pad = (number) => String(number).padStart(2, '0');
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function renderAPISecrets() {
+    if (!el.secretList) return;
+    if (!state.apiSecrets.length) {
+        el.secretList.innerHTML = '<p class="wx-hint">No app API secrets have been created.</p>';
+        return;
+    }
+    el.secretList.innerHTML = state.apiSecrets.map((secret) => {
+        const revoked = Boolean(secret.revoked_at);
+        const scopes = new Set(secret.scopes || []);
+        const status = revoked ? 'Revoked' : secret.expires_at && new Date(secret.expires_at) <= new Date() ? 'Expired' : 'Active';
+        return `<article class="wx-secret-row${revoked ? ' is-revoked' : ''}" data-secret-id="${escapeHtml(secret.id)}">
+            <div class="wx-secret-row-main">
+                <label>Name<input data-field="name" maxlength="100" value="${escapeHtml(secret.name)}" ${revoked ? 'disabled' : ''}></label>
+                <code>${escapeHtml(secret.prefix)}…</code>
+                <span class="wx-secret-status">${status}</span>
+            </div>
+            <div class="wx-secret-row-controls">
+                <label><input data-field="weather" type="checkbox" checked disabled> Weather</label>
+                <label><input data-field="audio" type="checkbox" ${scopes.has('audio') ? 'checked' : ''} ${revoked ? 'disabled' : ''}> Audio</label>
+                <label>Expires<input data-field="expires" type="datetime-local" value="${localDateTime(secret.expires_at)}" ${revoked ? 'disabled' : ''}></label>
+                <button class="btn-ghost" data-action="save" type="button" ${revoked ? 'disabled' : ''}>Save</button>
+                <button class="btn-danger" data-action="revoke" type="button" ${revoked ? 'disabled' : ''}>Revoke</button>
+            </div>
+            <small>Created ${escapeHtml(new Date(secret.created_at).toLocaleString())}${secret.last_used_at ? `, last used ${escapeHtml(new Date(secret.last_used_at).toLocaleString())}` : ''}</small>
+        </article>`;
+    }).join('');
+}
+
+async function loadAPISecrets() {
+    if (!el.secretList) return;
+    try {
+        const result = await apiCommand('wx.secrets.list');
+        state.apiSecrets = Array.isArray(result.secrets) ? result.secrets : [];
+        renderAPISecrets();
+    } catch (error) {
+        el.secretList.innerHTML = `<p class="wx-hint">API secret management is unavailable: ${escapeHtml(error.message || 'request failed')}</p>`;
+    }
+}
+
+function secretExpiryISO(input) {
+    if (!input) return '';
+    const date = new Date(input);
+    if (Number.isNaN(date.getTime())) throw new Error('Enter a valid expiry date.');
+    return date.toISOString();
+}
+
+async function createAPISecret() {
+    const name = el.secretName.value.trim();
+    if (!name) throw new Error('Enter a name for the app secret.');
+    const result = await apiCommand('wx.secrets.create', {
+        name,
+        scopes: el.secretAudio.checked ? ['weather', 'audio'] : ['weather'],
+        expires_at: secretExpiryISO(el.secretExpiry.value),
+    });
+    el.secretValue.textContent = result.value;
+    el.secretReveal.hidden = false;
+    el.secretName.value = '';
+    el.secretExpiry.value = '';
+    el.secretAudio.checked = false;
+    await loadAPISecrets();
+}
+
+async function updateAPISecret(row) {
+    const id = row.dataset.secretId;
+    const name = row.querySelector('[data-field="name"]').value.trim();
+    const audio = row.querySelector('[data-field="audio"]').checked;
+    const expires = row.querySelector('[data-field="expires"]').value;
+    await apiCommand('wx.secrets.update', { id, name, scopes: audio ? ['weather', 'audio'] : ['weather'], expires_at: secretExpiryISO(expires) });
+    await loadAPISecrets();
+}
+
+async function revokeAPISecret(row) {
+    const id = row.dataset.secretId;
+    if (!window.confirm('Revoke this secret? Connected apps will stop working immediately.')) return;
+    await apiCommand('wx.secrets.revoke', { id });
+    await loadAPISecrets();
+}
+
+function downloadAPISecretBackup(backup) {
+    const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `haze-wx-secrets-${new Date().toISOString().slice(0, 10)}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+}
+
+async function exportAPISecrets() {
+    const result = await apiCommand('wx.secrets.export');
+    downloadAPISecretBackup(result.backup);
+    el.secretTransferStatus.textContent = 'Backup downloaded. Keep it confidential.';
+}
+
+function importEntryControls(entry) {
+    if (!entry.conflict) return '<span class="wx-secret-status">New secret</span>';
+    const renameDisabled = entry.conflict_kind === 'secret' ? 'disabled' : '';
+    return `<label>Conflict
+        <select data-import-field="action">
+            <option value="keep">Keep existing</option>
+            <option value="overwrite">Overwrite existing</option>
+            <option value="rename_new" ${renameDisabled}>Keep both, rename new</option>
+            <option value="rename_old" ${renameDisabled}>Keep both, rename existing</option>
+        </select>
+    </label>
+    <label data-import-rename-new hidden>New name<input data-import-field="new_name" maxlength="100" value="${escapeHtml(`${entry.name} imported`)}"></label>
+    <label data-import-rename-old hidden>Existing name<input data-import-field="old_name" maxlength="100" value="${escapeHtml(`${entry.existing?.name || entry.name} existing`)}"></label>`;
+}
+
+function renderImportPreview() {
+    const entries = state.importEntries;
+    el.secretImportConflicts.hidden = false;
+    el.secretImportConflicts.innerHTML = `<div class="wx-secret-import-head"><strong>Import preview</strong><span>${entries.length} secret${entries.length === 1 ? '' : 's'} found</span></div>
+        <div class="wx-secret-import-entries">${entries.map((entry) => `<article class="wx-secret-row" data-import-index="${entry.index}">
+            <div class="wx-secret-row-main"><strong>${escapeHtml(entry.name)}</strong><span>${escapeHtml((entry.scopes || []).join(', '))}</span>${entry.conflict ? `<span class="wx-secret-status">Conflicts with ${escapeHtml(entry.existing?.name || 'an existing secret')}</span>` : ''}</div>
+            <div class="wx-secret-row-controls">${importEntryControls(entry)}</div>
+        </article>`).join('')}</div>
+        <div class="wx-secret-import-actions"><button id="wxSecretImportApply" class="btn-primary" type="button">Import Secrets</button><button id="wxSecretImportCancel" class="btn-ghost" type="button">Cancel</button></div>`;
+}
+
+function updateImportRenameFields(row) {
+    const action = row.querySelector('[data-import-field="action"]')?.value;
+    row.querySelector('[data-import-rename-new]').hidden = action !== 'rename_new';
+    row.querySelector('[data-import-rename-old]').hidden = action !== 'rename_old';
+}
+
+async function previewAPISecretImport(file) {
+    if (file.size > 512 * 1024) throw new Error('The backup file is too large.');
+    const backup = JSON.parse(await file.text());
+    const result = await apiCommand('wx.secrets.import.preview', { backup });
+    state.importBackup = backup;
+    state.importEntries = Array.isArray(result.entries) ? result.entries : [];
+    renderImportPreview();
+    el.secretTransferStatus.textContent = 'Choose a resolution for each conflict, then import.';
+}
+
+async function applyAPISecretImport() {
+    const choices = [...el.secretImportConflicts.querySelectorAll('[data-import-index]')]
+        .filter((row) => state.importEntries[Number(row.dataset.importIndex)]?.conflict)
+        .map((row) => ({
+            index: Number(row.dataset.importIndex),
+            action: row.querySelector('[data-import-field="action"]').value,
+            new_name: row.querySelector('[data-import-field="new_name"]').value,
+            old_name: row.querySelector('[data-import-field="old_name"]').value,
+        }));
+    const result = await apiCommand('wx.secrets.import', { backup: state.importBackup, choices });
+    state.importBackup = null;
+    state.importEntries = [];
+    el.secretImportConflicts.hidden = true;
+    el.secretTransferStatus.textContent = `Imported ${result.imported || 0}, kept ${result.skipped || 0}.`;
+    await loadAPISecrets();
 }
 
 async function copyText(text) {
@@ -434,6 +611,62 @@ function bindEvents() {
         el.status.className = 'try-status';
         setBusy(false);
     });
+    el.secretCreate?.addEventListener('click', async () => {
+        try {
+            await createAPISecret();
+        } catch (error) {
+            el.status.textContent = error.message || 'Unable to create API secret.';
+            el.status.className = 'try-status err';
+        }
+    });
+    el.secretList?.addEventListener('click', async (event) => {
+        const button = event.target.closest('button[data-action]');
+        if (!button) return;
+        const row = button.closest('[data-secret-id]');
+        try {
+            if (button.dataset.action === 'save') await updateAPISecret(row);
+            if (button.dataset.action === 'revoke') await revokeAPISecret(row);
+        } catch (error) {
+            el.status.textContent = error.message || 'Unable to update API secret.';
+            el.status.className = 'try-status err';
+        }
+    });
+    el.secretExport?.addEventListener('click', async () => {
+        try {
+            await exportAPISecrets();
+        } catch (error) {
+            el.secretTransferStatus.textContent = error.message || 'Unable to export API secrets.';
+        }
+    });
+    el.secretImportFile?.addEventListener('change', async () => {
+        const [file] = el.secretImportFile.files;
+        if (!file) return;
+        try {
+            await previewAPISecretImport(file);
+        } catch (error) {
+            el.secretTransferStatus.textContent = error.message || 'Unable to read API secret backup.';
+        } finally {
+            el.secretImportFile.value = '';
+        }
+    });
+    el.secretImportConflicts?.addEventListener('change', (event) => {
+        const row = event.target.closest('[data-import-index]');
+        if (row) updateImportRenameFields(row);
+    });
+    el.secretImportConflicts?.addEventListener('click', async (event) => {
+        if (event.target.id === 'wxSecretImportCancel') {
+            state.importBackup = null;
+            state.importEntries = [];
+            el.secretImportConflicts.hidden = true;
+            return;
+        }
+        if (event.target.id !== 'wxSecretImportApply') return;
+        try {
+            await applyAPISecretImport();
+        } catch (error) {
+            el.secretTransferStatus.textContent = error.message || 'Unable to import API secrets.';
+        }
+    });
 }
 
 async function boot() {
@@ -447,6 +680,7 @@ async function boot() {
         setHealth(false, `Panel API unavailable: ${error.message || 'request failed'}`, 'Unavailable');
     }
     await Promise.allSettled([loadPackages(), loadReaders()]);
+    await loadAPISecrets();
     if (!state.allPackages.length) {
         state.allPackages = Object.keys(PACKAGE_DESCRIPTIONS);
         selectDefaultPackages();

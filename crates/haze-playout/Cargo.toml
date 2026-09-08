@@ -18,6 +18,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 cpal = "0.16"
 dunce = "1.0"
 haze-media = { path = "../haze-media" }
+haze-media-protocol = { path = "../haze-media-protocol" }
 hound = "3.5"
 memmap2 = "0.9"
 mimalloc = { version = "0.1", default-features = false }

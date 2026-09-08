@@ -6,6 +6,7 @@ members = [
     "crates/haze-easnet",
     "crates/haze-location",
     "crates/haze-media",
+    "crates/haze-media-protocol",
     "crates/haze-playout",
 ]
 resolver = "2"
