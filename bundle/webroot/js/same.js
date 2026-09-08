@@ -72,7 +72,6 @@ function buildLayout() {
             <section class="section-block ba-panel">
                 <div class="section-hd">
                     <span>Alert Details</span>
-                    <span class="section-hd-sub">SAME metadata and spoken alert text.</span>
                 </div>
                 <div class="section-body ba-form-grid">
                     <label class="ba-field ba-template-field">
@@ -104,7 +103,6 @@ function buildLayout() {
             <section class="section-block ba-panel">
                 <div class="section-hd">
                     <span>Routing</span>
-                    <span class="section-hd-sub">Compact feed and location targets.</span>
                 </div>
                 <div class="section-body ba-routing-grid">
                     <div class="ba-table-box">
@@ -159,7 +157,6 @@ function buildLayout() {
             <section class="section-block ba-panel">
                 <div class="section-hd">
                     <span>Broadcast Audio</span>
-                    <span class="section-hd-sub">Priority alert audio rendered by the playlist service.</span>
                 </div>
                 <div class="section-body ba-audio-grid">
                     <div class="ba-option-group">
@@ -249,7 +246,6 @@ function buildLayout() {
             <section class="section-block ba-panel">
                 <div class="section-hd">
                     <span>Timing</span>
-                    <span class="section-hd-sub">Immediate or scheduled priority insertion.</span>
                 </div>
                 <div class="section-body ba-timing-row">
                     <label class="ba-switch">
@@ -832,12 +828,15 @@ function clearOriginationPolicyStatus() {
 
 function fallbackIntro() {
     if (allFeedLocations.checked) {
-        return 'The intro is generated separately for each feed\'s broadcast area. Audio preview uses the first selected feed.';
+        return `Environment Canada has issued a ${eventName(eventSelect.value)}.`;
     }
     const areas = selectedAreaNames();
+    if (!areas.length) {
+        return `Environment Canada has issued a ${eventName(eventSelect.value)}.`;
+    }
     const areaText = areas.length > 1
         ? `${areas.slice(0, -1).join(', ')}, and ${areas.at(-1)}`
-        : (areas[0] || 'the selected area');
+        : areas[0];
     return `Environment Canada has issued a ${eventName(eventSelect.value)} for ${areaText}.`;
 }
 
@@ -867,8 +866,12 @@ async function refreshIntro() {
 
 function updateAll() {
     const mode = audioMode();
-    manualLocations.hidden = allFeedLocations.checked;
-    locationsNone.hidden = allFeedLocations.checked;
+    const manualLocationsDisabled = allFeedLocations.checked;
+    manualLocations.classList.toggle('ba-manual-locations-disabled', manualLocationsDisabled);
+    manualLocations.querySelectorAll('input, button').forEach((element) => {
+        element.disabled = manualLocationsDisabled;
+    });
+    locationsNone.disabled = manualLocationsDisabled;
     feedCount.textContent = selectedFeedIds.size;
     locationCount.textContent = allFeedLocations.checked ? 'Feed' : selectedLocationCodes.size;
     planEvent.textContent = `${eventSelect.value} - ${eventName(eventSelect.value)}`;

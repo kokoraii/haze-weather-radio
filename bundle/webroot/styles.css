@@ -567,6 +567,11 @@ a {
 	flex-wrap: wrap
 }
 
+.section-hd-sub,
+.topbar-title > p {
+	display: none;
+}
+
 .section-hd-sub {
 	font-weight: 400;
 	color: var(--muted);
@@ -5766,6 +5771,11 @@ select option:checked {
 .ba-location-scroll {
 	height: 290px;
 	max-height: 640px
+}
+
+.ba-manual-locations-disabled {
+	opacity: .75;
+	pointer-events: none
 }
 
 .ba-table {
