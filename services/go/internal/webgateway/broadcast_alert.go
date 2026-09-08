@@ -20,6 +20,7 @@ func (s *wsSession) broadcastAlert(payload map[string]any) (map[string]any, erro
 		return nil, err
 	}
 	includeSame := boolPayload(payload, "include_same", true)
+	allFeedLocations := boolPayload(payload, "all_feed_locations", false)
 	alertID := safeID(firstNonBlank(
 		stringPayload(payload, "alert_id", ""),
 		fmt.Sprintf("manual-%d", time.Now().UTC().UnixNano()),
@@ -29,7 +30,11 @@ func (s *wsSession) broadcastAlert(payload map[string]any) (map[string]any, erro
 		return nil, err
 	}
 	scheduleAt := parseOptionalTime(stringPayload(payload, "schedule_at", ""))
-	data := s.broadcastAlertData(payload, targets, alertID, includeSame)
+	dataByFeed, err := s.broadcastAlertDataByFeed(payload, targets, alertID, includeSame, allFeedLocations)
+	if err != nil {
+		return nil, err
+	}
+	data := dataByFeed[targets[0]]
 
 	if !scheduleAt.IsZero() && scheduleAt.After(time.Now()) {
 		delay := time.Until(scheduleAt)
@@ -38,7 +43,7 @@ func (s *wsSession) broadcastAlert(payload map[string]any) (map[string]any, erro
 			timer := time.NewTimer(delay)
 			defer timer.Stop()
 			<-timer.C
-			_ = publishAlertBroadcast(configPath, targets, data)
+			_ = publishAlertBroadcast(configPath, targets, dataByFeed)
 		}()
 		return map[string]any{
 			"scheduled":    true,
@@ -51,7 +56,7 @@ func (s *wsSession) broadcastAlert(payload map[string]any) (map[string]any, erro
 		}, nil
 	}
 
-	if err := publishAlertBroadcast(s.configPath, targets, data); err != nil {
+	if err := publishAlertBroadcast(s.configPath, targets, dataByFeed); err != nil {
 		return nil, err
 	}
 	return map[string]any{
@@ -64,13 +69,72 @@ func (s *wsSession) broadcastAlert(payload map[string]any) (map[string]any, erro
 	}, nil
 }
 
-func (s *wsSession) broadcastAlertData(payload map[string]any, targets []string, alertID string, includeSame bool) map[string]any {
-	primaryFeed := ""
-	if len(targets) > 0 {
-		primaryFeed = targets[0]
+// broadcastAlertDataByFeed creates a distinct event payload for every target feed.
+// With all_feed_locations, each payload carries only that feed's configured SAME area.
+func (s *wsSession) broadcastAlertDataByFeed(payload map[string]any, targets []string, alertID string, includeSame bool, allFeedLocations bool) (map[string]map[string]any, error) {
+	locationsByFeed, err := alertLocationsByFeed(s.configPath, payload, targets, allFeedLocations)
+	if err != nil {
+		return nil, err
 	}
-	sameLocations := expandSameLocationsForFeeds(s.configPath, targets, stringSlicePayload(payload, "locations"))
-	introPayload := withFeedFallback(payload, primaryFeed)
+	dataByFeed := make(map[string]map[string]any, len(targets))
+	for _, feedID := range targets {
+		dataByFeed[feedID] = s.broadcastAlertDataForFeed(payload, feedID, locationsByFeed[feedID], alertID, includeSame, allFeedLocations)
+	}
+	return dataByFeed, nil
+}
+
+func alertLocationsByFeed(configPath string, payload map[string]any, targets []string, allFeedLocations bool) (map[string][]string, error) {
+	locationsByFeed := make(map[string][]string, len(targets))
+	if !allFeedLocations {
+		locations := expandSameLocationsForFeeds(configPath, targets, stringSlicePayload(payload, "locations"))
+		for _, feedID := range targets {
+			locationsByFeed[feedID] = locations
+		}
+		return locationsByFeed, nil
+	}
+
+	feeds, err := loadFeedSummaries(configPath)
+	if err != nil {
+		return nil, err
+	}
+	configured := make(map[string][]string, len(feeds))
+	for _, feed := range feeds {
+		feedID := strings.TrimSpace(fmt.Sprint(feed["id"]))
+		if feedID != "" {
+			configured[feedID] = normalizeAlertLocations(stringListAny(feed["same_locations"]))
+		}
+	}
+	for _, feedID := range targets {
+		locations := configured[feedID]
+		if len(locations) == 0 {
+			return nil, fmt.Errorf("feed %q has no configured SAME locations", feedID)
+		}
+		locationsByFeed[feedID] = locations
+	}
+	return locationsByFeed, nil
+}
+
+func normalizeAlertLocations(locations []string) []string {
+	seen := map[string]struct{}{}
+	for _, raw := range locations {
+		code := cleanLocationCode(raw)
+		if code == "000000" {
+			return []string{"000000"}
+		}
+		if code != "" {
+			seen[code] = struct{}{}
+		}
+	}
+	return sortedKeys(seen)
+}
+
+func (s *wsSession) broadcastAlertDataForFeed(payload map[string]any, feedID string, sameLocations []string, alertID string, includeSame bool, allFeedLocations bool) map[string]any {
+	introPayload := withFeedFallback(payload, feedID)
+	introPayload["feed_id"] = feedID
+	introPayload["feed_ids"] = []string{feedID}
+	if allFeedLocations {
+		delete(introPayload, "area_names")
+	}
 	introPayload["locations"] = sameLocations
 	introRequest := alertIntroRequestFromPayload(s.configPath, introPayload)
 	intro := buildSAMEToTextIntro(introRequest)
@@ -104,27 +168,30 @@ func (s *wsSession) broadcastAlertData(payload map[string]any, targets []string,
 	bannerText := bannerTextFromManualAlert(intro, customText, description, instruction)
 	audioMode := normalizeBroadcastAudioMode(stringPayload(payload, "audio_mode", "tts"))
 	data := map[string]any{
-		"feed_ids":         targets,
-		"alert_id":         alertID,
-		"message_type":     "Alert",
-		"title":            title,
-		"event":            event,
-		"alert_text":       alertText,
-		"banner_text":      bannerText,
-		"description":      description,
-		"instruction":      instruction,
-		"include_same":     includeSame,
-		"same_intro":       intro,
-		"same_translation": intro,
-		"same_event":       event,
-		"same_originator":  strings.ToUpper(stringPayload(payload, "originator", "EAS")),
-		"same_locations":   sameLocations,
-		"same_duration":    sameDuration(payload),
-		"same_tone":        strings.ToUpper(stringPayload(payload, "tone_type", "WXR")),
+		"feed_id":            feedID,
+		"feed_ids":           []string{feedID},
+		"alert_id":           alertID,
+		"message_type":       "Alert",
+		"title":              title,
+		"event":              event,
+		"alert_text":         alertText,
+		"banner_text":        bannerText,
+		"description":        description,
+		"instruction":        instruction,
+		"include_same":       includeSame,
+		"same_intro":         intro,
+		"same_translation":   intro,
+		"same_event":         event,
+		"same_originator":    strings.ToUpper(stringPayload(payload, "originator", "EAS")),
+		"same_locations":     sameLocations,
+		"all_feed_locations": allFeedLocations,
+		"area_names":         introRequest.AreaNames,
+		"same_duration":      sameDuration(payload),
+		"same_tone":          strings.ToUpper(stringPayload(payload, "tone_type", "WXR")),
 		"same_callsign": firstNonBlank(
 			stringPayload(payload, "sender_id", ""),
 			stringPayload(payload, "same_callsign", ""),
-			sameCallsignFromConfig(s.configPath, primaryFeed),
+			sameCallsignFromConfig(s.configPath, feedID),
 		),
 		"alert_sent_at":            time.Now().UTC().Format(time.RFC3339Nano),
 		"source":                   "webpanel",
@@ -229,20 +296,20 @@ func withFeedFallback(payload map[string]any, feedID string) map[string]any {
 	return out
 }
 
-func publishAlertBroadcast(configPath string, targets []string, data map[string]any) error {
+func publishAlertBroadcast(configPath string, targets []string, dataByFeed map[string]map[string]any) error {
 	bridgeAddr := strings.TrimSpace(os.Getenv("HAZE_HOST_BRIDGE_ADDR"))
 	if bridgeAddr == "" {
 		return fmt.Errorf("event bridge is not available")
 	}
 	for _, feedID := range targets {
-		eventData := cloneBroadcastMap(data)
+		eventData := cloneBroadcastMap(dataByFeed[feedID])
 		eventData["feed_id"] = feedID
 		delete(eventData, "feed_ids")
 		publisher := events.NewHostBridgePublisher(bridgeAddr)
 		err := publisher.Publish(events.Event{
 			Type:    "cap.alert.broadcast.requested",
 			Source:  "haze-web",
-			Subject: strings.TrimSpace(fmt.Sprint(data["alert_id"])),
+			Subject: strings.TrimSpace(fmt.Sprint(eventData["alert_id"])),
 			Data:    eventData,
 		})
 		_ = publisher.Close()

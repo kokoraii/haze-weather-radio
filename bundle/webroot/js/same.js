@@ -130,22 +130,27 @@ function buildLayout() {
                             <span>SAME Locations</span>
                             <strong id="baLocationCount">0</strong>
                             <div class="ba-mini-actions">
-                                <button id="baLocationsAll" class="btn-action" type="button">All</button>
                                 <button id="baLocationsNone" class="btn-action" type="button">None</button>
                             </div>
                         </div>
-                        <div class="ba-table-scroll ba-location-scroll" id="baLocationScroll">
-                            <table class="ba-table">
-                                <thead>
-                                    <tr><th></th><th>Area</th><th>SAME Location</th><th>Region</th></tr>
-                                </thead>
-                                <tbody id="baLocationRows"></tbody>
-                            </table>
-                        </div>
-                        <div class="ba-custom-location">
-                            <input id="baCustomCode" type="text" inputmode="numeric" maxlength="6" placeholder="SAME Location">
-                            <input id="baCustomName" type="text" placeholder="Name">
-                            <button id="baAddCustom" class="btn-action" type="button">Add</button>
+                        <label class="ba-switch">
+                            <input id="baAllFeedLocations" type="checkbox">
+                            <span>Send all Feed Locations</span>
+                        </label>
+                        <div id="baManualLocations">
+                            <div class="ba-table-scroll ba-location-scroll" id="baLocationScroll">
+                                <table class="ba-table">
+                                    <thead>
+                                        <tr><th></th><th>Area</th><th>SAME Location</th><th>Region</th></tr>
+                                    </thead>
+                                    <tbody id="baLocationRows"></tbody>
+                                </table>
+                            </div>
+                            <div class="ba-custom-location">
+                                <input id="baCustomCode" type="text" inputmode="numeric" maxlength="6" placeholder="SAME Location">
+                                <input id="baCustomName" type="text" placeholder="Name">
+                                <button id="baAddCustom" class="btn-action" type="button">Add</button>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -306,6 +311,9 @@ const feedRows = document.getElementById('baFeedRows');
 const locationRows = document.getElementById('baLocationRows');
 const feedScroll = document.getElementById('baFeedScroll');
 const locationScroll = document.getElementById('baLocationScroll');
+const allFeedLocations = document.getElementById('baAllFeedLocations');
+const manualLocations = document.getElementById('baManualLocations');
+const locationsNone = document.getElementById('baLocationsNone');
 const feedCount = document.getElementById('baFeedCount');
 const locationCount = document.getElementById('baLocationCount');
 const customCode = document.getElementById('baCustomCode');
@@ -466,10 +474,11 @@ function applyTemplate(key) {
     }
 
     const locations = templateLocations(template);
+    allFeedLocations.checked = false;
     if (locations.length) {
         selectedLocationCodes = normalizeSelectedLocationSet(locations);
-        renderLocations();
     }
+    renderLocations();
     updateAll();
     setStatus(`Loaded template: ${templateName(key, template)}.`, 'ok');
 }
@@ -670,6 +679,9 @@ function durationCode() {
 }
 
 function headerText() {
+    if (allFeedLocations.checked) {
+        return 'Feed-specific SAME headers will use each feed\'s broadcast locations.';
+    }
     const locs = selectedLocationCodes.has('000000') ? ['000000'] : [...selectedLocationCodes];
     const locText = (locs.length ? locs.slice(0, 31) : ['000000']).join('-');
     const now = new Date();
@@ -764,8 +776,7 @@ function payload() {
         originator: originator.value,
         event: eventSelect.value,
         same_event: eventSelect.value,
-        locations: locs,
-        area_names: selectedAreaNames(),
+        all_feed_locations: allFeedLocations.checked,
         duration: durationCode(),
         duration_hours: parseInt(hoursInput.value, 10) || 0,
         duration_minutes: parseInt(minutesInput.value, 10) || 0,
@@ -785,6 +796,10 @@ function payload() {
         mimic_endec: 'SAGE',
         audio_mode: audioMode(),
     };
+    if (!base.all_feed_locations) {
+        base.locations = locs;
+        base.area_names = selectedAreaNames();
+    }
     if (audioMode() === 'tts') {
         base.reader_id = readerSelect.value;
     }
@@ -816,6 +831,9 @@ function clearOriginationPolicyStatus() {
 }
 
 function fallbackIntro() {
+    if (allFeedLocations.checked) {
+        return 'The intro is generated separately for each feed\'s broadcast area. Audio preview uses the first selected feed.';
+    }
     const areas = selectedAreaNames();
     const areaText = areas.length > 1
         ? `${areas.slice(0, -1).join(', ')}, and ${areas.at(-1)}`
@@ -830,6 +848,12 @@ function refreshIntroSoon() {
 
 async function refreshIntro() {
     introTimer = null;
+    if (allFeedLocations.checked) {
+        introText = fallbackIntro();
+        introBox.value = introText;
+        railIntro.textContent = introText;
+        return;
+    }
     const current = payload();
     try {
         const result = await apiCommand('same.intro', current, 8000);
@@ -843,11 +867,13 @@ async function refreshIntro() {
 
 function updateAll() {
     const mode = audioMode();
+    manualLocations.hidden = allFeedLocations.checked;
+    locationsNone.hidden = allFeedLocations.checked;
     feedCount.textContent = selectedFeedIds.size;
-    locationCount.textContent = selectedLocationCodes.size;
+    locationCount.textContent = allFeedLocations.checked ? 'Feed' : selectedLocationCodes.size;
     planEvent.textContent = `${eventSelect.value} - ${eventName(eventSelect.value)}`;
     planFeeds.textContent = String(selectedFeedIds.size);
-    planLocations.textContent = String(selectedLocationCodes.size);
+    planLocations.textContent = allFeedLocations.checked ? 'Each feed\'s coverage' : String(selectedLocationCodes.size);
     planAudio.textContent = audioModeLabel(mode);
     planSame.textContent = includeSame.checked ? `${selectedTone}` : 'Disabled';
     planTiming.textContent = scheduleEnabled.checked && scheduleAt.value ? new Date(scheduleAt.value).toLocaleString() : 'Now';
@@ -889,7 +915,7 @@ function startConfirm() {
 function validatePayload() {
     if (!selectedFeedIds.size) return 'Select at least one feed.';
     const mode = audioMode();
-    if (mode !== 'operator' && mode !== 'stream' && !selectedLocationCodes.size) return 'Select at least one location.';
+    if (mode !== 'operator' && mode !== 'stream' && !allFeedLocations.checked && !selectedLocationCodes.size) return 'Select at least one location.';
     if (mode === 'tts' && !includeSame.checked && !messageBox.value.trim() && !prependIntro.checked) {
         return 'Add message text or enable the generated intro.';
     }
@@ -1288,17 +1314,12 @@ function bindEvents() {
         renderLocations();
         updateAll();
     });
-    document.getElementById('baLocationsAll').addEventListener('click', () => {
-        const rows = targetLocationRows();
-        selectedLocationCodes = rows.some((row) => row.code === '000000')
-            ? new Set(['000000'])
-            : new Set(rows.map((row) => row.code));
-        renderLocations();
-        updateAll();
-    });
     document.getElementById('baLocationsNone').addEventListener('click', () => {
         selectedLocationCodes.clear();
         renderLocations();
+        updateAll();
+    });
+    allFeedLocations.addEventListener('change', () => {
         updateAll();
     });
     addCustom.addEventListener('click', () => {

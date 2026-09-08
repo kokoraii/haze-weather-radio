@@ -20,8 +20,20 @@ func (s *wsSession) previewAlert(payload map[string]any) (map[string]any, error)
 		return nil, err
 	}
 	includeSame := boolPayload(payload, "include_same", true)
+	allFeedLocations := boolPayload(payload, "all_feed_locations", false)
 	alertID := safeID(fmt.Sprintf("preview-%d", time.Now().UTC().UnixNano()))
-	data := s.broadcastAlertData(payload, targets, alertID, includeSame)
+	locationsByFeed, err := alertLocationsByFeed(s.configPath, payload, targets, allFeedLocations)
+	if err != nil {
+		return nil, err
+	}
+	scopedPayload := withFeedFallback(payload, targets[0])
+	scopedPayload["feed_id"] = targets[0]
+	scopedPayload["feed_ids"] = []string{targets[0]}
+	if allFeedLocations {
+		delete(scopedPayload, "area_names")
+	}
+	scopedPayload["locations"] = locationsByFeed[targets[0]]
+	data := s.broadcastAlertDataForFeed(payload, targets[0], locationsByFeed[targets[0]], alertID, includeSame, allFeedLocations)
 	alertText := strings.TrimSpace(stringValue(data, "alert_text"))
 	if alertText == "" {
 		return nil, fmt.Errorf("alert preview text is empty")
@@ -29,11 +41,11 @@ func (s *wsSession) previewAlert(payload map[string]any) (map[string]any, error)
 
 	ctx, cancel := context.WithTimeout(context.Background(), alertPreviewTimeout)
 	defer cancel()
-	voicePCM, err := synthesizeAlertPreviewVoice(ctx, s.configPath, payload, targets[0], alertID, alertText)
+	voicePCM, err := synthesizeAlertPreviewVoice(ctx, s.configPath, scopedPayload, targets[0], alertID, alertText)
 	if err != nil {
 		return nil, err
 	}
-	lead, tail, header, err := alertPreviewLeadTail(s.configPath, payload, includeSame)
+	lead, tail, header, err := alertPreviewLeadTail(s.configPath, scopedPayload, includeSame)
 	if err != nil {
 		return nil, err
 	}

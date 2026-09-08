@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/meowraii/haze-weather-radio/services/go/internal/alertmodel"
 )
 
 func TestServerIPUsesNonLoopbackLocalAddress(t *testing.T) {
@@ -2620,7 +2621,7 @@ func TestBroadcastAlertDataCanDisableSame(t *testing.T) {
 	dir := t.TempDir()
 	writePanelFixture(t, dir)
 	session := wsSession{configPath: filepath.Join(dir, "config.yaml")}
-	data := session.broadcastAlertData(map[string]any{
+	data := session.broadcastAlertDataForFeed(map[string]any{
 		"originator":               "WXR",
 		"event":                    "RWT",
 		"locations":                []any{"065522"},
@@ -2629,7 +2630,7 @@ func TestBroadcastAlertDataCanDisableSame(t *testing.T) {
 		"voice_message":            "This is only a drill.",
 		"duration_hours":           float64(0),
 		"duration_minutes":         float64(15),
-	}, []string{"sk-0001"}, "manual-test", false)
+	}, "sk-0001", []string{"065522"}, "manual-test", false, false)
 
 	if data["include_same"] != false {
 		t.Fatalf("include_same = %#v", data["include_same"])
@@ -2640,11 +2641,70 @@ func TestBroadcastAlertDataCanDisableSame(t *testing.T) {
 	}
 }
 
+func TestBroadcastAlertDataByFeedUsesEachFeedLocations(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "config.yaml"), "version: test\nfeeds_file: managed/configs/feeds.xml\n")
+	mustWrite(t, filepath.Join(dir, "managed", "configs", "feeds.xml"), `<?xml version="1.0" encoding="UTF-8"?>
+<feeds>
+  <feed id="mb-0001" enabled="true"><locations><coverage><region id="046200"><subregion id="046211"/></region></coverage></locations><transmitter_metadata><transmitter><callsign>MBRADIO</callsign></transmitter></transmitter_metadata></feed>
+  <feed id="nb-0001" enabled="true"><locations><coverage><region id="013200"><subregion id="013211"/></region></coverage></locations><transmitter_metadata><transmitter><callsign>NBRADIO</callsign></transmitter></transmitter_metadata></feed>
+</feeds>`)
+	mustWrite(t, filepath.Join(dir, "managed", "csv", "CLC_Base_Zone.csv"), "CLC,FEATURE_ID,NAME,NOM\n046200,fixture,Manitoba coverage,\n046211,fixture,Manitoba local,\n013200,fixture,New Brunswick coverage,\n013211,fixture,New Brunswick local,\n")
+
+	session := wsSession{configPath: filepath.Join(dir, "config.yaml")}
+	dataByFeed, err := session.broadcastAlertDataByFeed(map[string]any{
+		"originator":         "WXR",
+		"event":              "RWT",
+		"all_feed_locations": true,
+		"feed_id":            "mb-0001",
+		"feed_ids":           []any{"mb-0001", "nb-0001"},
+		"locations":          []any{"046211"},
+		"area_names":         []any{"Foreign manual area"},
+	}, []string{"mb-0001", "nb-0001"}, "manual-test", true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		feedID    string
+		locations []string
+		callsign  string
+		areaName  string
+	}{
+		{feedID: "mb-0001", locations: []string{"046200", "046211"}, callsign: "MBRADIO", areaName: "Manitoba coverage"},
+		{feedID: "nb-0001", locations: []string{"013200", "013211"}, callsign: "NBRADIO", areaName: "New Brunswick coverage"},
+	}
+	for _, test := range tests {
+		t.Run(test.feedID, func(t *testing.T) {
+			data := dataByFeed[test.feedID]
+			if got := stringSlicePayload(data, "same_locations"); strings.Join(got, ",") != strings.Join(test.locations, ",") {
+				t.Fatalf("same_locations = %#v, want %#v", got, test.locations)
+			}
+			if data["feed_id"] != test.feedID {
+				t.Fatalf("feed_id = %#v, want %q", data["feed_id"], test.feedID)
+			}
+			if data["same_callsign"] != test.callsign {
+				t.Fatalf("same_callsign = %#v, want %q", data["same_callsign"], test.callsign)
+			}
+			if data["feed_ids"].([]string)[0] != test.feedID {
+				t.Fatalf("feed_ids = %#v", data["feed_ids"])
+			}
+			if areas := stringListAny(data["area_names"]); len(areas) == 0 || areas[0] != test.areaName {
+				t.Fatalf("area_names = %#v", areas)
+			}
+			packet, ok := alertmodel.FromMap(data)
+			if !ok || packet.SAME == nil || strings.Join(packet.SAME.Locations, ",") != strings.Join(test.locations, ",") {
+				t.Fatalf("alert packet SAME locations = %#v", packet)
+			}
+		})
+	}
+}
+
 func TestBroadcastAlertDataDoesNotPrependSameTranslationWhenDisabled(t *testing.T) {
 	dir := t.TempDir()
 	writePanelFixture(t, dir)
 	session := wsSession{configPath: filepath.Join(dir, "config.yaml")}
-	data := session.broadcastAlertData(map[string]any{
+	data := session.broadcastAlertDataForFeed(map[string]any{
 		"originator":               "WXR",
 		"event":                    "RWT",
 		"locations":                []any{"065522"},
@@ -2653,7 +2713,7 @@ func TestBroadcastAlertDataDoesNotPrependSameTranslationWhenDisabled(t *testing.
 		"voice_message":            "This is only a drill.",
 		"duration_hours":           float64(0),
 		"duration_minutes":         float64(15),
-	}, []string{"sk-0001"}, "manual-test", false)
+	}, "sk-0001", []string{"065522"}, "manual-test", false, false)
 
 	text, _ := data["alert_text"].(string)
 	if text != "This is only a drill." {
@@ -2669,7 +2729,7 @@ func TestBroadcastAlertDataDoesNotUseSameIntroFallbackWhenSameEnabled(t *testing
 	dir := t.TempDir()
 	writePanelFixture(t, dir)
 	session := wsSession{configPath: filepath.Join(dir, "config.yaml")}
-	data := session.broadcastAlertData(map[string]any{
+	data := session.broadcastAlertDataForFeed(map[string]any{
 		"originator":               "WXR",
 		"event":                    "RWT",
 		"locations":                []any{"065522"},
@@ -2679,7 +2739,7 @@ func TestBroadcastAlertDataDoesNotUseSameIntroFallbackWhenSameEnabled(t *testing
 		"instruction":              "No action is required.",
 		"duration_hours":           float64(0),
 		"duration_minutes":         float64(15),
-	}, []string{"sk-0001"}, "manual-test", true)
+	}, "sk-0001", []string{"065522"}, "manual-test", true, false)
 
 	text, _ := data["alert_text"].(string)
 	if strings.Contains(text, "has issued") {
@@ -2700,7 +2760,7 @@ func TestBroadcastAlertDataCarriesAudioSourceFields(t *testing.T) {
 	dir := t.TempDir()
 	writePanelFixture(t, dir)
 	session := wsSession{configPath: filepath.Join(dir, "config.yaml")}
-	data := session.broadcastAlertData(map[string]any{
+	data := session.broadcastAlertDataForFeed(map[string]any{
 		"originator":        "WXR",
 		"event":             "RWT",
 		"locations":         []any{"065522"},
@@ -2714,7 +2774,7 @@ func TestBroadcastAlertDataCarriesAudioSourceFields(t *testing.T) {
 		"audio_sample_rate": float64(48000),
 		"audio_channels":    float64(1),
 		"reader_id":         "02",
-	}, []string{"sk-0001"}, "manual-test", true)
+	}, "sk-0001", []string{"065522"}, "manual-test", true, false)
 
 	if data["audio_mode"] != "file" {
 		t.Fatalf("audio_mode = %#v", data["audio_mode"])
