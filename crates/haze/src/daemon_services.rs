@@ -509,12 +509,6 @@ impl ScheduleZone {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct SchedulerFeedsXml {
-    #[serde(rename = "feed", default)]
-    feeds: Vec<SchedulerFeedXml>,
-}
-
 #[derive(Debug, Default, Deserialize)]
 struct SchedulerFeedXml {
     #[serde(rename = "@id", default)]
@@ -966,16 +960,49 @@ fn load_automation_feeds(
         Path::new(
             feeds_file
                 .filter(|raw| !raw.trim().is_empty())
-                .unwrap_or("managed/configs/feeds.xml"),
+                .unwrap_or("managed/feeds"),
         ),
     );
-    let raw = fs::read_to_string(&feeds_path)
-        .with_context(|| format!("failed to read feeds XML {}", feeds_path.display()))?;
-    let raw = expand_env_vars(&raw);
-    let parsed: SchedulerFeedsXml = quick_xml::de::from_str(&raw)
-        .with_context(|| format!("failed to parse feeds XML {}", feeds_path.display()))?;
+    if !feeds_path.is_dir() {
+        bail!(
+            "configured feeds path is not a directory: {}",
+            feeds_path.display()
+        );
+    }
+    let mut entries = fs::read_dir(&feeds_path)
+        .with_context(|| format!("failed to read feeds directory {}", feeds_path.display()))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+
     let mut feeds = Vec::new();
-    for feed in parsed.feeds {
+    for entry in entries {
+        let path = entry.path();
+        if !path.is_file()
+            || !path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("xml"))
+        {
+            continue;
+        }
+        let raw = expand_env_vars(
+            &fs::read_to_string(&path)
+                .with_context(|| format!("failed to read feed XML {}", path.display()))?,
+        );
+        let mut feed: SchedulerFeedXml = quick_xml::de::from_str(&raw)
+            .with_context(|| format!("failed to parse feed XML {}", path.display()))?;
+        if feed.id.trim().is_empty() {
+            feed.id = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or_default()
+                .to_string();
+        }
+        feeds.push(feed);
+    }
+
+    let mut automation_feeds = Vec::new();
+    for feed in feeds {
         let id = feed.id.trim().to_string();
         if id.is_empty() || !xml_bool(&feed.enabled, true) {
             continue;
@@ -993,9 +1020,9 @@ fn load_automation_feeds(
             );
             ScheduleZone::Local
         });
-        feeds.push(AutomationFeed { id, timezone });
+        automation_feeds.push(AutomationFeed { id, timezone });
     }
-    Ok(feeds)
+    Ok(automation_feeds)
 }
 
 fn automation_targets(
@@ -2682,6 +2709,39 @@ mod tests {
         assert_eq!(targets[0].timezone.name(), "America/Toronto");
         assert_eq!(targets[1].feed_id, "cwxr-ab01");
         assert_eq!(targets[1].timezone.name(), "America/Edmonton");
+    }
+
+    #[test]
+    fn automation_feed_loader_reads_directory_feed_files() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let feeds_directory = directory.path().join("managed/feeds");
+        fs::create_dir_all(&feeds_directory).expect("feeds directory");
+        fs::write(
+            feeds_directory.join("cwxr-on01.xml"),
+            r#"<feed enabled="true" timezone="America/Toronto">
+  <playout routine="true" same="true"/>
+</feed>"#,
+        )
+        .expect("Toronto feed");
+        fs::write(
+            feeds_directory.join("cwxr-sk01.xml"),
+            r#"<feed enabled="true" timezone="America/Regina">
+  <playout routine="true" same="true"/>
+</feed>"#,
+        )
+        .expect("Regina feed");
+        fs::write(feeds_directory.join("README.md"), "ignored").expect("README");
+
+        let config_path = directory.path().join("config.yaml");
+        fs::write(&config_path, "feeds_file: ./managed/feeds\n").expect("config");
+        let feeds = load_automation_feeds(&config_path, Some("./managed/feeds"))
+            .expect("directory feed loader");
+
+        assert_eq!(feeds.len(), 2);
+        assert_eq!(feeds[0].id, "cwxr-on01");
+        assert_eq!(feeds[0].timezone.name(), "America/Toronto");
+        assert_eq!(feeds[1].id, "cwxr-sk01");
+        assert_eq!(feeds[1].timezone.name(), "America/Regina");
     }
 
     #[test]
