@@ -86,6 +86,67 @@ func TestAccountBrowserCloseCookieHasNoPersistentExpiry(t *testing.T) {
 	}
 }
 
+func TestBootstrapAccountPersistentLoginSetsThirtyDayCookie(t *testing.T) {
+	manager, _ := newTestAccountAuthManager(t, false)
+	defer manager.Close()
+	request := testLoginRequest("192.0.2.20:5000")
+	result, err := manager.LoginWithRequest(context.Background(), LoginInput{
+		Username: "admin", Password: "correct horse battery staple", Persistent: true, Request: request,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Persistent || !result.Identity.Session.Persistent {
+		t.Fatalf("persistent login was downgraded: %#v", result.Identity.Session)
+	}
+	if remaining := time.Until(result.Identity.Session.ExpiresAt); remaining < 29*24*time.Hour || remaining > 30*24*time.Hour {
+		t.Fatalf("persistent session lifetime = %v", remaining)
+	}
+	recorder := httptest.NewRecorder()
+	manager.SetLoginCookie(recorder, request, result)
+	cookies := recorder.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].MaxAge < 29*24*60*60 || cookies[0].Expires.IsZero() {
+		t.Fatalf("persistent cookie missing expiry: %#v", cookies)
+	}
+	if !cookies[0].HttpOnly || !cookies[0].Secure || cookies[0].SameSite != http.SameSiteStrictMode {
+		t.Fatalf("persistent cookie is missing required protections: %#v", cookies[0])
+	}
+	authRequest := httptest.NewRequest(http.MethodGet, "https://example.test/admin", nil)
+	authRequest.RemoteAddr = request.RemoteAddr
+	authRequest.AddCookie(cookies[0])
+	if _, err := manager.Identity(authRequest); err != nil {
+		t.Fatalf("persistent cookie could not authenticate: %v", err)
+	}
+}
+
+func TestPersistentLoginDeniedByExistingAccountPolicy(t *testing.T) {
+	manager, _ := newTestAccountAuthManager(t, false)
+	defer manager.Close()
+	ctx := context.Background()
+	account, err := manager.accounts.store.ByUsername(ctx, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	account.AllowPersistentSessions = false
+	if err := manager.accounts.store.Save(ctx, account); err != nil {
+		t.Fatal(err)
+	}
+	request := testLoginRequest("192.0.2.20:5000")
+	_, err = manager.LoginWithRequest(ctx, LoginInput{
+		Username: "admin", Password: "correct horse battery staple", Persistent: true, Request: request,
+	})
+	var authErr *AuthError
+	if !errors.As(err, &authErr) || authErr.Code != "persistent_session_not_allowed" || authErr.HTTPStatus != http.StatusForbidden {
+		t.Fatalf("disallowed persistent login = %#v", err)
+	}
+	result, err := manager.LoginWithRequest(ctx, LoginInput{
+		Username: "admin", Password: "correct horse battery staple", Request: request,
+	})
+	if err != nil || result.Persistent {
+		t.Fatalf("browser-close login after denial = persistent:%v err:%v", result.Persistent, err)
+	}
+}
+
 func TestAccountLoginRejectsPlainHTTP(t *testing.T) {
 	manager, _ := newTestAccountAuthManager(t, false)
 	defer manager.Close()

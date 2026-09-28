@@ -199,20 +199,20 @@ fn execute(
 fn execute_batch(
     catalog: &WorkerCatalog,
     snapshot: &CatalogSnapshot,
-    request: QueryRequest,
+    mut request: QueryRequest,
 ) -> Result<QueryResponse, CatalogError> {
     if request.inputs.is_empty() || request.inputs.len() > 100 {
         return Err(CatalogError::Invalid(
             "batch_resolve requires between 1 and 100 inputs".to_string(),
         ));
     }
-    let mut batches = Vec::with_capacity(request.inputs.len());
+    let inputs = std::mem::take(&mut request.inputs);
+    let mut batches = Vec::with_capacity(inputs.len());
     let mut truncated = false;
-    for (index, input) in request.inputs.iter().cloned().enumerate() {
-        let mut child = request.clone();
-        child.operation = Operation::Resolve;
+    let mut child = request.clone();
+    child.operation = Operation::Resolve;
+    for (index, input) in inputs.into_iter().enumerate() {
         child.input = Some(input);
-        child.inputs.clear();
         let mut results = execute_single(catalog, &child)?;
         apply_station_preference(&mut results, child.options.station_mode_preference);
         truncated |= results.len() > child.options.limit;

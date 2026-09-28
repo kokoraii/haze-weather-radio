@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed enabled="true" timezone="America/Regina">
+  <!-- No callsign or frequency listed for this town in the referenced Weatheradio directory. -->
+  <playout routine="true" same="true" same_originator="EAS" />
+  <alerts>
+    <cap_cp enabled="true">
+      <filter use_feed_locations="true" coverage_mode="polygon_first">
+        <blocklist>
+          <severity>Minor</severity>
+          <severity>Unknown</severity>
+          <certainty>Unknown</certainty>
+          <certainty>Past</certainty>
+          <naads_event>fog</naads_event>
+          <other value_name="layer:EC-MSC-SMC:1.0:Alert_Type" value="advisory" />
+        </blocklist>
+      </filter>
+    </cap_cp>
+    <nws_cap enabled="false" />
+  </alerts>
+  <languages>
+    <lang code="en-US" interval="0" />
+  </languages>
+  <description>
+    <lang code="en-US" text="This service is operated by a joint effort between Sherwood Weather, and the Haze Weather Radio open source project." suffix="We do not imply any association with Environment Canada." />
+  </description>
+  <locations>
+    <coverage>
+      <region id="066200" source="eccc" derive_forecast="sk-34" />
+    </coverage>
+    <observationLocations>
+      <location id="sk-34" source="eccc" />
+    </observationLocations>
+  </locations>
+  <transmitter_metadata>
+    <transmitter>
+      <site_name>North Battleford</site_name>
+    </transmitter>
+  </transmitter_metadata>
+</feed>

@@ -29,6 +29,7 @@ const PLAYOUT_SUBSCRIPTIONS: &[&str] = &[
     "playlist.item.ready",
     "playlist.item.group",
     "cap.alert.audio.ready",
+    "cap.alert.cancelled",
     "playlist.control",
     "operator.breakin.*",
     "tts.synthesized",
@@ -129,9 +130,21 @@ pub(crate) async fn connect(addr: &str) -> Result<BridgeConnection> {
 }
 
 pub(crate) async fn connect_retry(addr: &str) -> Result<BridgeConnection> {
+    connect_consumer_retry(addr, PLAYOUT_CLIENT_ID, PLAYOUT_SUBSCRIPTIONS).await
+}
+
+pub(crate) async fn connect_consumer_retry(
+    addr: &str,
+    client_id: &str,
+    subscriptions: &[&str],
+) -> Result<BridgeConnection> {
     loop {
         match connect(addr).await {
-            Ok(connection) => match connection.client.register_playout_consumer().await {
+            Ok(connection) => match connection
+                .client
+                .register_consumer(client_id, subscriptions)
+                .await
+            {
                 Ok(()) => return Ok(connection),
                 Err(err) => {
                     tracing::warn!(
@@ -202,13 +215,9 @@ impl BridgeClient {
             .await
     }
 
-    async fn register_playout_consumer(&self) -> Result<()> {
-        self.publish(client_registration(
-            true,
-            Some(PLAYOUT_CLIENT_ID),
-            PLAYOUT_SUBSCRIPTIONS,
-        ))
-        .await
+    async fn register_consumer(&self, client_id: &str, subscriptions: &[&str]) -> Result<()> {
+        self.publish(client_registration(true, Some(client_id), subscriptions))
+            .await
     }
 
     pub(crate) async fn service_ready(&self, feeds: usize) {

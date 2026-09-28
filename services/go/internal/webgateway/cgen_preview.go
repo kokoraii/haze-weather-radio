@@ -25,13 +25,18 @@ func (s *Server) cgenPreview(writer http.ResponseWriter, request *http.Request) 
 		return
 	}
 	path := resolveConfigPath(s.configPath, filepath.Join("runtime", "cgen", safeCgenRuntimeID(feedID)+".preview.jpg"))
-	initial, err := os.ReadFile(path)
-	if err != nil || len(initial) == 0 {
+	lastInfo, err := os.Stat(path)
+	if err != nil || lastInfo.Size() == 0 {
 		http.NotFound(writer, request)
 		return
 	}
 	if request.Method == http.MethodHead {
 		writer.Header().Set("Content-Type", "multipart/x-mixed-replace; boundary="+cgenPreviewBoundary)
+		return
+	}
+	initial, err := os.ReadFile(path)
+	if err != nil || len(initial) == 0 {
+		http.NotFound(writer, request)
 		return
 	}
 	flusher, _ := writer.(http.Flusher)
@@ -57,7 +62,19 @@ func (s *Server) cgenPreview(writer http.ResponseWriter, request *http.Request) 
 		flusher.Flush()
 	}
 	for {
-		raw, err := os.ReadFile(path)
+		raw, info, err := readChangedCgenPreview(path, lastInfo)
+		if err == nil {
+			lastInfo = info
+			if info.Size() > 0 {
+				if !deadline.Stop() {
+					select {
+					case <-deadline.C:
+					default:
+					}
+				}
+				deadline.Reset(30 * time.Second)
+			}
+		}
 		if err == nil && len(raw) > 0 {
 			if !bytes.Equal(raw, last) {
 				last = append(last[:0], raw...)
@@ -74,13 +91,6 @@ func (s *Server) cgenPreview(writer http.ResponseWriter, request *http.Request) 
 					flusher.Flush()
 				}
 			}
-			if !deadline.Stop() {
-				select {
-				case <-deadline.C:
-				default:
-				}
-			}
-			deadline.Reset(30 * time.Second)
 		}
 		select {
 		case <-request.Context().Done():
@@ -90,4 +100,21 @@ func (s *Server) cgenPreview(writer http.ResponseWriter, request *http.Request) 
 		case <-ticker.C:
 		}
 	}
+}
+
+// CGEN atomically replaces preview frames. Checking file identity and metadata
+// avoids decoding the same JPEG from disk on every stream tick.
+func readChangedCgenPreview(path string, previous os.FileInfo) ([]byte, os.FileInfo, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, previous, err
+	}
+	if os.SameFile(previous, info) && previous.Size() == info.Size() && previous.ModTime().Equal(info.ModTime()) {
+		return nil, info, nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, previous, err
+	}
+	return raw, info, nil
 }

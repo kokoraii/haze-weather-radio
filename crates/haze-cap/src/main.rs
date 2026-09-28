@@ -68,7 +68,14 @@ async fn main() -> Result<()> {
     let interval = parse_duration(&args.interval).context("invalid --interval")?;
     let timeout = parse_duration(&args.timeout).context("invalid --timeout")?;
     let startup_seed = parse_bool(&args.startup_seed).context("invalid --startup-seed")?;
-    let publisher = EventPublisher::new(args.bridge);
+    let publisher = EventPublisher::new(args.bridge, args.source_id.clone());
+    let replayed = publisher.replay_pending().await?;
+    if replayed > 0 {
+        info!(
+            replayed,
+            "replayed pending CAP deliveries from durable journal"
+        );
+    }
 
     let run_tcp = matches!(mode, IngestMode::Tcp)
         || matches!(mode, IngestMode::Auto) && source == SourceKind::Naads;

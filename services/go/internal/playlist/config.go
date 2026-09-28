@@ -29,12 +29,17 @@ type rootConfig struct {
 		OnAirName any `yaml:"on_air_name"`
 	} `yaml:"operator"`
 	Services struct {
+		Rust struct {
+			Playout struct {
+				Enabled bool `yaml:"enabled"`
+			} `yaml:"playout"`
+		} `yaml:"rust"`
 		Go struct {
 			Playlist playlistConfig `yaml:"playlist"`
 		} `yaml:"go"`
 	} `yaml:"services"`
-	Playout  playoutConfig        `yaml:"playout"`
-	Daemon   daemonConfig         `yaml:"daemon"`
+	Playout playoutConfig `yaml:"playout"`
+	Daemon  daemonConfig  `yaml:"daemon"`
 }
 
 type playlistConfig struct {

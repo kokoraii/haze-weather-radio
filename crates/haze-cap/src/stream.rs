@@ -8,7 +8,9 @@ use futures::StreamExt;
 use reqwest::header::ACCEPT;
 use reqwest::{Client, StatusCode};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
@@ -25,6 +27,7 @@ const READ_CHUNK_BYTES: usize = 16 * 1024;
 const ECCC_DATAMART_CAP_BASE_URL: &str = "https://dd.weather.gc.ca/today/alerts/cap";
 const ECCC_DATAMART_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const ECCC_DATAMART_LOOKBACK_HOURS: i64 = 1;
+const STREAM_STATE_DIR: &str = "runtime/state/cap-ingest";
 
 #[derive(Clone, Debug)]
 pub struct StreamConfig {
@@ -42,13 +45,70 @@ pub struct NaadsTcpIngest {
     publisher: Arc<EventPublisher>,
     http: Client,
     state: Arc<Mutex<StreamState>>,
+    state_path: std::path::PathBuf,
 }
 
 #[derive(Debug, Default)]
 struct StreamState {
     seen_alerts: HashSet<AlertKey>,
+    publishing_alerts: HashSet<AlertKey>,
     seen_references: HashSet<ReferenceKey>,
+    fetching_references: HashSet<ReferenceKey>,
     seeded_heartbeat: bool,
+}
+
+#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
+struct StreamCheckpoint {
+    #[serde(default)]
+    seeded_heartbeat: bool,
+    #[serde(default)]
+    seeded_references: Vec<ReferenceKey>,
+}
+
+fn stream_state_path(source_id: &str) -> std::path::PathBuf {
+    let digest = Sha256::digest(source_id.as_bytes());
+    std::path::PathBuf::from(STREAM_STATE_DIR).join(format!("{:x}.stream.json", digest))
+}
+
+fn load_stream_checkpoint(path: &std::path::Path) -> Result<StreamCheckpoint> {
+    match std::fs::read(path) {
+        Ok(raw) => serde_json::from_slice(&raw)
+            .with_context(|| format!("failed to parse NAADS stream state {}", path.display())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(StreamCheckpoint::default()),
+        Err(err) => Err(err)
+            .with_context(|| format!("failed to read NAADS stream state {}", path.display())),
+    }
+}
+
+async fn persist_seeded_heartbeat(
+    path: &std::path::Path,
+    seeded: bool,
+    references: &[ReferenceKey],
+) -> Result<()> {
+    let parent = path.parent().expect("NAADS stream state path has a parent");
+    tokio::fs::create_dir_all(parent).await.with_context(|| {
+        format!(
+            "failed to create NAADS stream state directory {}",
+            parent.display()
+        )
+    })?;
+    let temporary = path.with_extension("json.tmp");
+    let raw = serde_json::to_vec(&StreamCheckpoint {
+        seeded_heartbeat: seeded,
+        seeded_references: references.to_vec(),
+    })
+    .context("failed to encode NAADS stream state")?;
+    let mut file = tokio::fs::File::create(&temporary).await.with_context(|| {
+        format!(
+            "failed to create NAADS stream state {}",
+            temporary.display()
+        )
+    })?;
+    file.write_all(&raw).await?;
+    file.sync_all().await?;
+    tokio::fs::rename(&temporary, path)
+        .await
+        .with_context(|| format!("failed to commit NAADS stream state {}", path.display()))
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -59,7 +119,7 @@ struct AlertKey {
     references: String,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
 struct ReferenceKey {
     identifier: String,
     sent: String,
@@ -82,11 +142,18 @@ impl NaadsTcpIngest {
             .user_agent(config.user_agent.clone())
             .build()
             .context("failed to create NAADS repository HTTP client")?;
+        let state_path = stream_state_path(&config.source_id);
+        let checkpoint = load_stream_checkpoint(&state_path)?;
         Ok(Self {
             config,
             publisher: Arc::new(publisher),
             http,
-            state: Arc::new(Mutex::new(StreamState::default())),
+            state: Arc::new(Mutex::new(StreamState {
+                seen_references: checkpoint.seeded_references.into_iter().collect(),
+                seeded_heartbeat: checkpoint.seeded_heartbeat,
+                ..StreamState::default()
+            })),
+            state_path,
         })
     }
 
@@ -102,6 +169,7 @@ impl NaadsTcpIngest {
                 publisher: Arc::clone(&self.publisher),
                 http: self.http.clone(),
                 state: Arc::clone(&self.state),
+                state_path: self.state_path.clone(),
             };
             tasks.push(tokio::spawn(async move { worker.run_forever().await }));
         }
@@ -115,6 +183,7 @@ impl NaadsTcpIngest {
             publisher: Arc::clone(&self.publisher),
             http: self.http.clone(),
             state: Arc::clone(&self.state),
+            state_path: self.state_path.clone(),
         };
         tasks.push(tokio::spawn(async move {
             EcccDatamartFallback {
@@ -140,6 +209,7 @@ struct StreamWorker {
     publisher: Arc<EventPublisher>,
     http: Client,
     state: Arc<Mutex<StreamState>>,
+    state_path: std::path::PathBuf,
 }
 
 struct EcccDatamartFallback {
@@ -520,6 +590,14 @@ impl StreamWorker {
         let seed_only = {
             let mut state = self.state.lock().await;
             if self.startup_seed && !state.seeded_heartbeat {
+                let seeded_references = references
+                    .iter()
+                    .map(|reference| ReferenceKey {
+                        identifier: reference.identifier.clone(),
+                        sent: reference.sent.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                persist_seeded_heartbeat(&self.state_path, true, &seeded_references).await?;
                 for reference in &references {
                     state.seen_references.insert(ReferenceKey {
                         identifier: reference.identifier.clone(),
@@ -529,7 +607,10 @@ impl StreamWorker {
                 state.seeded_heartbeat = true;
                 true
             } else {
-                state.seeded_heartbeat = true;
+                if !state.seeded_heartbeat {
+                    persist_seeded_heartbeat(&self.state_path, true, &[]).await?;
+                    state.seeded_heartbeat = true;
+                }
                 false
             }
         };
@@ -552,15 +633,19 @@ impl StreamWorker {
         }
 
         for reference in references {
+            let key = ReferenceKey {
+                identifier: reference.identifier.clone(),
+                sent: reference.sent.clone(),
+            };
             let should_fetch = {
                 let mut state = self.state.lock().await;
-                state.seen_references.insert(ReferenceKey {
-                    identifier: reference.identifier.clone(),
-                    sent: reference.sent.clone(),
-                })
+                claim_reference_fetch(&mut state, &key)
             };
             if should_fetch {
-                if let Err(err) = self.fetch_reference(reference).await {
+                let result = self.fetch_reference(reference).await;
+                let mut state = self.state.lock().await;
+                finish_reference_fetch(&mut state, &key, result.is_ok());
+                if let Err(err) = result {
                     warn!(
                         source = self.source_id,
                         stream = self.stream_url,
@@ -659,8 +744,7 @@ impl StreamWorker {
         };
         let is_new = {
             let mut state = self.state.lock().await;
-            state.seen_references.insert(reference_key);
-            state.seen_alerts.insert(key)
+            !state.seen_alerts.contains(&key) && state.publishing_alerts.insert(key.clone())
         };
         if !is_new {
             debug!(
@@ -672,7 +756,7 @@ impl StreamWorker {
         }
 
         let alert_value = serde_json::to_value(&alert)?;
-        if self.shadow {
+        let publish_result = if self.shadow {
             self.publish_status(json!({
                 "source_id": self.source_id,
                 "source": "naads",
@@ -689,29 +773,43 @@ impl StreamWorker {
                 "parse_ms": parse_ms,
                 "timestamp_unix_ms": unix_ms(),
             }))
-            .await?;
+            .await
+        } else {
+            let ingest = json!({
+                "source": "naads",
+                "source_id": self.source_id,
+                "mode": "tcp",
+                "shadow": false,
+                "transport": transport,
+                "stream_url": self.stream_url,
+                "cap_url": cap_url,
+                "fetch_latency_ms": fetch_ms,
+                "parse_latency_ms": parse_ms,
+                "publish_started_unix_ms": unix_ms(),
+            });
+            self.publisher
+                .publish(&EventEnvelope::cap_alert(
+                    &self.source_id,
+                    alert_value,
+                    ingest,
+                ))
+                .await
+        };
+        match publish_result {
+            Ok(()) => {
+                let mut state = self.state.lock().await;
+                state.publishing_alerts.remove(&key);
+                state.seen_alerts.insert(key);
+                state.seen_references.insert(reference_key);
+            }
+            Err(err) => {
+                self.state.lock().await.publishing_alerts.remove(&key);
+                return Err(err);
+            }
+        }
+        if self.shadow {
             return Ok(true);
         }
-
-        let ingest = json!({
-            "source": "naads",
-            "source_id": self.source_id,
-            "mode": "tcp",
-            "shadow": false,
-            "transport": transport,
-            "stream_url": self.stream_url,
-            "cap_url": cap_url,
-            "fetch_latency_ms": fetch_ms,
-            "parse_latency_ms": parse_ms,
-            "publish_started_unix_ms": unix_ms(),
-        });
-        self.publisher
-            .publish(&EventEnvelope::cap_alert(
-                &self.source_id,
-                alert_value,
-                ingest,
-            ))
-            .await?;
         info!(
             source = self.source_id,
             identifier = alert.identifier,
@@ -730,6 +828,17 @@ impl StreamWorker {
                 data,
             ))
             .await
+    }
+}
+
+fn claim_reference_fetch(state: &mut StreamState, key: &ReferenceKey) -> bool {
+    !state.seen_references.contains(key) && state.fetching_references.insert(key.clone())
+}
+
+fn finish_reference_fetch(state: &mut StreamState, key: &ReferenceKey, succeeded: bool) {
+    state.fetching_references.remove(key);
+    if succeeded {
+        state.seen_references.insert(key.clone());
     }
 }
 
@@ -919,5 +1028,46 @@ mod tests {
 
         assert_eq!(buckets["20260811"], vec!["23"]);
         assert_eq!(buckets["20260812"], vec!["00"]);
+    }
+
+    #[test]
+    fn failed_reference_fetch_remains_retryable() {
+        let key = ReferenceKey {
+            identifier: "alert-1".to_string(),
+            sent: "2026-08-12T12:00:00Z".to_string(),
+        };
+        let mut state = StreamState::default();
+
+        assert!(claim_reference_fetch(&mut state, &key));
+        assert!(!claim_reference_fetch(&mut state, &key));
+        finish_reference_fetch(&mut state, &key, false);
+        assert!(!state.seen_references.contains(&key));
+
+        assert!(claim_reference_fetch(&mut state, &key));
+        finish_reference_fetch(&mut state, &key, true);
+        assert!(state.seen_references.contains(&key));
+        assert!(!claim_reference_fetch(&mut state, &key));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_startup_seed_survives_restart_with_seeded_references() {
+        let state_path = std::env::temp_dir().join(format!(
+            "haze-cap-stream-test-{}-{}.json",
+            std::process::id(),
+            unix_ms()
+        ));
+        let references = vec![ReferenceKey {
+            identifier: "alert-1".to_string(),
+            sent: "2026-08-12T12:00:00Z".to_string(),
+        }];
+
+        persist_seeded_heartbeat(&state_path, true, &references)
+            .await
+            .expect("persist heartbeat startup seed");
+        let checkpoint = load_stream_checkpoint(&state_path).expect("reload stream checkpoint");
+
+        assert!(checkpoint.seeded_heartbeat);
+        assert_eq!(checkpoint.seeded_references, references);
+        std::fs::remove_file(state_path).expect("remove temporary stream checkpoint");
     }
 }

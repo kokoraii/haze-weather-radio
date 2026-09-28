@@ -17,7 +17,11 @@ func TestHostBridgePublisherPublishesJSONL(t *testing.T) {
 		_ = listener.Close()
 	}()
 
-	received := make(chan Event, 1)
+	type published struct {
+		registration map[string]any
+		event        Event
+	}
+	received := make(chan published, 1)
 	go func() {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -26,7 +30,16 @@ func TestHostBridgePublisherPublishesJSONL(t *testing.T) {
 		defer func() {
 			_ = conn.Close()
 		}()
-		line, err := bufio.NewReader(conn).ReadBytes('\n')
+		reader := bufio.NewReader(conn)
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			return
+		}
+		var registration map[string]any
+		if err := json.Unmarshal(line, &registration); err != nil {
+			return
+		}
+		line, err = reader.ReadBytes('\n')
 		if err != nil {
 			return
 		}
@@ -34,7 +47,7 @@ func TestHostBridgePublisherPublishesJSONL(t *testing.T) {
 		if err := json.Unmarshal(line, &event); err != nil {
 			return
 		}
-		received <- event
+		received <- published{registration: registration, event: event}
 	}()
 
 	publisher := NewHostBridgePublisher(listener.Addr().String())
@@ -46,11 +59,23 @@ func TestHostBridgePublisherPublishesJSONL(t *testing.T) {
 		t.Fatalf("publish: %v", err)
 	}
 
-	event := <-received
-	if event.Type != "cap.alert.received" {
-		t.Fatalf("type = %q", event.Type)
+	var result published
+	select {
+	case result = <-received:
+	case <-time.After(time.Second):
+		t.Fatal("publisher event did not arrive")
 	}
-	if event.Timestamp.IsZero() {
+	if result.registration["type"] != "bridge.client" {
+		t.Fatalf("registration type = %v", result.registration["type"])
+	}
+	data, _ := result.registration["data"].(map[string]any)
+	if data["receive_events"] != false {
+		t.Fatalf("publisher registration receives events: %v", result.registration)
+	}
+	if result.event.Type != "cap.alert.received" {
+		t.Fatalf("type = %q", result.event.Type)
+	}
+	if result.event.Timestamp.IsZero() {
 		t.Fatal("timestamp was not populated")
 	}
 }

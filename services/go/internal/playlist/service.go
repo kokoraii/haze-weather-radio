@@ -1,6 +1,7 @@
 package playlist
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -27,6 +28,7 @@ const serviceID = "haze-playlist"
 const routineRetryDelay = 30 * time.Second
 const startupPrimerDelay = 2 * time.Second
 const pendingReplayInterval = 2 * time.Second
+const playlistStateHeartbeat = 5 * time.Second
 const cachedRoutineFallbackMaxAge = 15 * time.Minute
 const cachedStartupFallbackMaxAge = 30 * time.Minute
 const productSegmentWorkerLimit = 4
@@ -188,6 +190,9 @@ func (s *Service) runConnected(ctx context.Context) error {
 }
 
 func (s *Service) handleEvent(ctx context.Context, event map[string]any) {
+	if shouldDeferCAPPlayoutToRust(s.cfg.Root.Services.Rust.Playout.Enabled, event) {
+		return
+	}
 	switch stringAt(event, "type") {
 	case "playlist.control":
 		data := mapAt(event, "data")
@@ -283,6 +288,18 @@ func (s *Service) handleEvent(ctx context.Context, event map[string]any) {
 	}
 }
 
+func shouldDeferCAPPlayoutToRust(rustPlayoutEnabled bool, event map[string]any) bool {
+	if !rustPlayoutEnabled {
+		return false
+	}
+	switch stringAt(event, "type") {
+	case "cap.alert.broadcast.requested", "cap.alert.cancelled":
+		return true
+	default:
+		return false
+	}
+}
+
 func eventDataWithIdentity(event map[string]any) map[string]any {
 	data := mapAt(event, "data")
 	copyData := make(map[string]any, len(data)+2)
@@ -366,6 +383,8 @@ type feedPlanner struct {
 	current              *playlistItem
 	lastFixed            map[string]time.Time
 	lastError            string
+	lastStateBody        []byte
+	lastStateWriteAt     time.Time
 }
 
 type playlistItem struct {
@@ -2795,6 +2814,9 @@ func (p *feedPlanner) applyControl(action string) {
 	case "pause_after_current", "flush_restart_after_current", "flush_stop_after_current":
 		p.pendingAfterCurrent = action
 	}
+	// A repeated control still needs a fresh timestamp for the web panel's
+	// command-settle response, even when it leaves the state unchanged.
+	p.lastStateWriteAt = time.Time{}
 	p.writeState()
 }
 
@@ -3013,8 +3035,18 @@ func (p *feedPlanner) writeState() {
 		"queue":                 p.queue,
 		"next":                  firstQueued(p.queue),
 		"last_error":            p.lastError,
-		"updated_at":            time.Now().UTC().Format(time.RFC3339Nano),
 	}
+	// Ticks are frequent, but an unchanged state only needs a periodic heartbeat.
+	// Compare before adding updated_at so the timestamp does not force a write.
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	if bytes.Equal(body, p.lastStateBody) && now.Sub(p.lastStateWriteAt) < playlistStateHeartbeat {
+		return
+	}
+	payload["updated_at"] = now.UTC().Format(time.RFC3339Nano)
 	path := filepath.Join(p.cfg.BaseDir, "runtime", "playlists", safeID(p.feed.ID)+".json")
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return
@@ -3029,7 +3061,11 @@ func (p *feedPlanner) writeState() {
 	if os.WriteFile(tmp, append(raw, '\n'), 0o644) == nil {
 		if err := os.Rename(tmp, path); err != nil {
 			_ = os.Remove(path)
-			_ = os.Rename(tmp, path)
+			err = os.Rename(tmp, path)
+		}
+		if err == nil {
+			p.lastStateBody = body
+			p.lastStateWriteAt = now
 		}
 	}
 }

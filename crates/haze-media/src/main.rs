@@ -862,10 +862,10 @@ impl MediaState {
     }
 
     #[cfg_attr(not(feature = "gstreamer-backend"), allow(dead_code))]
-    fn record_webrtc_peer_drop(&self, peer_id: u64) {
+    fn record_webrtc_peer_drop(&self, peer_id: u64, frames: u64) {
         if let Ok(mut peers) = self.webrtc_peers.lock() {
             if let Some(peer) = peers.get_mut(&peer_id) {
-                peer.dropped_frames = peer.dropped_frames.saturating_add(1);
+                peer.dropped_frames = peer.dropped_frames.saturating_add(frames);
             }
         }
     }
@@ -2675,7 +2675,7 @@ fn build_gstreamer_webrtc_encoder(
                 match encoded_tx.try_send(data) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
-                        state.record_webrtc_peer_drop(peer_id);
+                        state.record_webrtc_peer_drop(peer_id, 1);
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         return Err(gst::FlowError::Eos);
@@ -2789,9 +2789,7 @@ fn start_webrtc_peer_feeder(
                 let frame = match rx.recv().await {
                     Ok(frame) => frame,
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        for _ in 0..skipped {
-                            feed_state.record_webrtc_peer_drop(peer_id);
-                        }
+                        feed_state.record_webrtc_peer_drop(peer_id, skipped);
                         continue;
                     }
                     Err(broadcast::error::RecvError::Closed) => break 'feed,
@@ -2895,9 +2893,7 @@ fn start_webrtc_peer_feeder(
                         skipped_encoded_frames = skipped_encoded_frames.saturating_add(1);
                     }
                     if skipped_encoded_frames > 0 {
-                        for _ in 0..skipped_encoded_frames {
-                            state.record_webrtc_peer_drop(peer_id);
-                        }
+                        state.record_webrtc_peer_drop(peer_id, skipped_encoded_frames);
                         rtp_time = rtp_time.saturating_add(frame_ticks.saturating_mul(skipped_encoded_frames));
                     }
                     if connected {
@@ -2922,10 +2918,10 @@ fn start_webrtc_peer_feeder(
                                 }
                             }
                         } else {
-                            state.record_webrtc_peer_drop(peer_id);
+                            state.record_webrtc_peer_drop(peer_id, 1);
                         }
                     } else {
-                        state.record_webrtc_peer_drop(peer_id);
+                        state.record_webrtc_peer_drop(peer_id, 1);
                     }
                 }
                 _ = sleep(timeout_duration) => {
@@ -5258,6 +5254,19 @@ mod tests {
         assert!(duplicate.is_none());
         assert!(other_feed.is_some());
         assert!(other_client.is_some());
+    }
+
+    #[test]
+    fn webrtc_lag_records_all_skipped_frames_in_one_update() {
+        let state = MediaState::new(BTreeMap::new(), BackendMode::Legacy, false, Vec::new());
+        let peer_id = state
+            .register_webrtc_peer("feed-a", "opus", "172.16.1.56")
+            .expect("peer registered");
+
+        state.record_webrtc_peer_drop(peer_id, 7);
+        state.record_webrtc_peer_drop(peer_id, 2);
+
+        assert_eq!(state.webrtc_peer_snapshots()[0].dropped_frames, 9);
     }
 
     #[test]

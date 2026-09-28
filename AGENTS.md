@@ -15,6 +15,7 @@ Its structure is defined as an Event-Driven Architecture (EDA), a highly asynchr
 - Do not commit generated runtime data, large voice models, downloaded model weights, local bundles, `dist`, logs, secrets, or machine-specific artifacts.
 - Do not stash or discard user changes unless explicitly asked. The worktree is often dirty during active development.
 - Do not commit unless explicitly asked, or unless the user has clearly requested committing the current completed work.
+- Update `config.yaml`'s date-based version (`YY.MM.DD`) with every edit, unless it already reflects the current edit.
 - Do not use em dashes in docs, UI copy, logs, comments, or final user-facing text. Use commas, periods, parentheses, or a normal hyphen instead.
 
 ## Configuration layout
@@ -61,7 +62,7 @@ Its structure is defined as an Event-Driven Architecture (EDA), a highly asynchr
 
 ## Live instances
 
-- Haze is consolidated on `la-servinor` at `172.16.1.31`, reachable with `ssh la-servinor`. Its portable runtime is `/home/rai/haze-weather-radio`; build source changes from this repository before deployment.
+- Haze is consolidated on `la-servinor` at `192.168.2.21`, reachable with `ssh la-servinor` (or `ssh rai@192.168.2.21`). Its portable runtime is `/home/rai/haze-weather-radio`; build source changes from this repository before deployment.
 - This single instance serves both TeleWeather and CWRS. Managed feed, output, reader, webhook, account, and media configuration must preserve both services.
 - For source changes that affect the live instance, rebuild the affected binaries, sync them into `/home/rai/haze-weather-radio/bin`, sync required config/assets, then restart with `systemctl --user restart haze-weather-radio.service`.
 - After restarting the live instance, check `systemctl --user status haze-weather-radio.service` and relevant `journalctl --user -u haze-weather-radio.service` logs.

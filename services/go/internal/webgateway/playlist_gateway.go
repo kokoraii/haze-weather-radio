@@ -106,14 +106,15 @@ func playlistFeedState(state map[string]any, feedID string) map[string]any {
 
 func waitForPlaylistStateChange(configPath string, feedID string, previousUpdatedAt string, timeout time.Duration) (map[string]any, bool) {
 	deadline := time.Now().Add(timeout)
-	var latest map[string]any
 	for {
-		state, err := playlistStatePayload(configPath)
-		if err == nil {
-			latest = state
-			updatedAt := playlistFeedUpdatedAt(state, feedID)
-			if updatedAt != "" && updatedAt != previousUpdatedAt {
-				return state, true
+		updatedAt := playlistFeedRuntimeUpdatedAt(configPath, feedID)
+		if updatedAt != "" && updatedAt != previousUpdatedAt {
+			state, err := playlistStatePayload(configPath)
+			if err == nil {
+				assembledUpdatedAt := playlistFeedUpdatedAt(state, feedID)
+				if assembledUpdatedAt != "" && assembledUpdatedAt != previousUpdatedAt {
+					return state, true
+				}
 			}
 		}
 		if time.Now().After(deadline) {
@@ -121,14 +122,38 @@ func waitForPlaylistStateChange(configPath string, feedID string, previousUpdate
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	if latest != nil {
-		return latest, false
-	}
 	state, err := playlistStatePayload(configPath)
 	if err != nil {
 		return nil, false
 	}
 	return state, false
+}
+
+// The playout service writes one atomic state file per feed. Polling only its
+// timestamp avoids reparsing every managed feed and playlist during a control.
+func playlistFeedRuntimeUpdatedAt(configPath string, feedID string) string {
+	var fileID strings.Builder
+	for _, ch := range feedID {
+		if ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || ch == '-' || ch == '_' || ch == '.' {
+			fileID.WriteRune(ch)
+		}
+	}
+	name := fileID.String()
+	if name == "" {
+		name = "item"
+	}
+	raw, err := os.ReadFile(filepath.Join(playlistStateDir(configPath), name+".json"))
+	if err != nil {
+		return ""
+	}
+	var state struct {
+		FeedID    string `json:"feed_id"`
+		UpdatedAt string `json:"updated_at"`
+	}
+	if json.Unmarshal(raw, &state) != nil || !strings.EqualFold(strings.TrimSpace(state.FeedID), strings.TrimSpace(feedID)) {
+		return ""
+	}
+	return strings.TrimSpace(state.UpdatedAt)
 }
 
 func containsString(values []string, wanted string) bool {

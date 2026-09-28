@@ -2187,6 +2187,7 @@ dependencies = [
  "ctrlc",
  "dunce",
  "haze-media-protocol",
+ "haze-same",
  "ksni",
  "png",
  "quick-xml",
@@ -2217,6 +2218,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -2339,8 +2341,10 @@ dependencies = [
  "clap",
  "cpal",
  "dunce",
+ "haze-cap",
  "haze-media",
  "haze-media-protocol",
+ "haze-same",
  "hound",
  "memmap2",
  "mimalloc",
@@ -2349,6 +2353,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -2356,6 +2361,13 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "haze-same"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
 ]
 
 [[package]]

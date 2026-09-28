@@ -445,7 +445,7 @@ function beginCreate() {
     selectionEpoch += 1;
     fillEditor({
         id: '', username: '', allowed_originators: [], password_expiry_days: 90,
-        allow_user_pw_change: true, logging_enabled: true,
+        allow_user_pw_change: true, logging_enabled: true, allow_persistent_sessions: true,
     }, []);
     byID('accountUsername').focus();
     setStatus('Enter the new account policy and an initial password.', 'pending');

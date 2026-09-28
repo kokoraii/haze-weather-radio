@@ -106,7 +106,9 @@ impl HostBridge {
                     BridgePayload::Json(value) => match handle_client_message(value) {
                         ClientMessage::Event(message) => {
                             activate_origin_as_legacy(&mut clients, origin, &mut cap_replay);
-                            let _ = event_sender.send(message.clone());
+                            if host_consumes_event(&message) {
+                                let _ = event_sender.send(message.clone());
+                            }
                             let Ok(mut raw) = serde_json::to_vec(&message) else {
                                 continue;
                             };
@@ -612,6 +614,20 @@ fn replayable_event(value: &Value) -> bool {
     )
 }
 
+// The daemon only handles service controls and automation acknowledgements.
+// All other events still reach subscribed services through the bridge.
+fn host_consumes_event(value: &Value) -> bool {
+    matches!(
+        value.get("type").and_then(Value::as_str),
+        Some(
+            "service.control"
+                | "automation.dispatch.accepted"
+                | "automation.dispatch.completed"
+                | "automation.dispatch.failed"
+        )
+    )
+}
+
 fn prune_replay(replay: &mut VecDeque<(Instant, Vec<u8>)>) {
     let now = Instant::now();
     while replay
@@ -652,6 +668,22 @@ mod tests {
             ClientMessage::Event(value) => assert_eq!(value, event),
             _ => panic!("service event was not republished"),
         }
+    }
+
+    #[test]
+    fn host_queue_only_receives_events_handled_by_the_daemon() {
+        for event_type in [
+            "service.control",
+            "automation.dispatch.accepted",
+            "automation.dispatch.completed",
+            "automation.dispatch.failed",
+        ] {
+            assert!(host_consumes_event(&json!({ "type": event_type })));
+        }
+        assert!(!host_consumes_event(
+            &json!({ "type": "cap.alert.received" })
+        ));
+        assert!(!host_consumes_event(&json!({ "type": "playout.pcm" })));
     }
 
     #[test]

@@ -7,7 +7,7 @@ use chrono::{Datelike, Timelike, Utc};
 use clap::{Args, Subcommand};
 use serde::Serialize;
 
-use crate::same_core::{
+use haze_same::{
     attention_tone, eom_sequence, generate_same_header_attention_sequence,
     generate_same_header_attention_sequence_with_attention, generate_same_header_sequence,
     generate_same_header_sequence_with_attention, SameAudio, SameHeader, ToneType, SAMPLE_RATE,

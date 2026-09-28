@@ -1324,14 +1324,12 @@ impl WorkerCatalog {
                 }
                 candidates.extend(found);
             }
-            let filtered = self.finalize(candidates.clone(), filters, options)?;
-            if filtered.len() >= options.limit || radius_km >= maximum_radius {
-                candidates = filtered;
+            candidates = self.finalize(candidates, filters, options)?;
+            if candidates.len() >= options.limit || radius_km >= maximum_radius {
                 break;
             }
             radius_km = (radius_km * 2.0).min(maximum_radius);
         }
-        candidates.sort_by(candidate_order);
         Ok(candidates)
     }
 
@@ -1394,15 +1392,16 @@ impl WorkerCatalog {
         nearest_options.include_area_geometry = false;
         nearest_options.limit = options.limit.saturating_mul(8).clamp(16, 200);
         nearest_options.max_distance_km = options.max_distance_km.or(Some(250.0));
+        let mut seen_ids: HashSet<_> = candidates
+            .iter()
+            .map(|candidate| candidate.entity.id.clone())
+            .collect();
         for mut candidate in self.nearest(latitude, longitude, filters, &nearest_options)? {
-            if candidate.distance_m == Some(0.0)
-                && candidates
-                    .iter()
-                    .any(|existing| existing.entity.id == candidate.entity.id)
-            {
+            if candidate.distance_m == Some(0.0) && seen_ids.contains(&candidate.entity.id) {
                 continue;
             }
             candidate.facet = Some(facet_for_kind(&candidate.entity.kind).to_string());
+            seen_ids.insert(candidate.entity.id.clone());
             candidates.push(candidate);
         }
         let mut per_facet = HashMap::<String, usize>::new();

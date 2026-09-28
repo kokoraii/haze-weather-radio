@@ -430,7 +430,7 @@ func (h *accountAuth) bootstrapFirstAdmin(ctx context.Context, usernameEnv strin
 		AllowOrigination:        true,
 		AllowedOriginators:      []string{"CIV", "EAS", "PEP", "WXR"},
 		CanViewLogs:             true,
-		AllowPersistentSessions: false,
+		AllowPersistentSessions: true,
 		PasswordExpiryDays:      90,
 		AllowUserPasswordChange: true,
 		LoggingEnabled:          true,
@@ -658,7 +658,14 @@ func (h *accountAuth) Login(ctx context.Context, input LoginInput) (LoginResult,
 	if err != nil {
 		return LoginResult{}, err
 	}
-	persistent := input.Persistent && account.AllowPersistentSessions
+	if input.Persistent && !account.AllowPersistentSessions {
+		return LoginResult{}, &AuthError{
+			Code: "persistent_session_not_allowed",
+			Detail: "This account cannot keep sessions signed in. Uncheck that option, or ask an administrator to enable persistent sessions in Accounts.",
+			HTTPStatus: http.StatusForbidden,
+		}
+	}
+	persistent := input.Persistent
 	expiresAt := now.Add(h.sessionTTL)
 	if persistent {
 		expiresAt = now.Add(h.persistentTTL)

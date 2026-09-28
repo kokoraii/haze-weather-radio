@@ -99,6 +99,7 @@ pub(crate) struct WgpuFrameRenderer {
     ticker_start_pts_ns: Option<u64>,
     text_strip_cache: std::collections::BTreeMap<String, RenderedTextStrip>,
     text_strip_cache_bytes: usize,
+    clock_strip_cache: Option<(ClockStripKey, RenderedTextStrip)>,
     scene_text_shadow: msdf_text::SceneTextShadowPreview,
     rendered_frames: u64,
     dropped_frames: u64,
@@ -121,6 +122,43 @@ struct RenderedTextStrip {
     height: usize,
     stride: usize,
     bgra: Vec<u8>,
+}
+
+#[cfg(feature = "gpu-wgpu")]
+#[derive(Debug, PartialEq, Eq)]
+struct ClockStripKey {
+    text: String,
+    font_family: String,
+    font_weight: String,
+    font_size: u32,
+    color: String,
+    width: u32,
+    height: u32,
+}
+
+#[cfg(feature = "gpu-wgpu")]
+impl ClockStripKey {
+    fn matches(&self, state: &OverlayRenderState, width: u32, height: u32) -> bool {
+        self.text == state.clock_text.trim()
+            && self.font_family == state.font_family
+            && self.font_weight == state.font_weight
+            && self.font_size == state.clock_font_size.max(12)
+            && self.color == state.clock_color
+            && self.width == width
+            && self.height == height
+    }
+
+    fn from_state(state: &OverlayRenderState, width: u32, height: u32) -> Self {
+        Self {
+            text: state.clock_text.trim().to_string(),
+            font_family: state.font_family.clone(),
+            font_weight: state.font_weight.clone(),
+            font_size: state.clock_font_size.max(12),
+            color: state.clock_color.clone(),
+            width,
+            height,
+        }
+    }
 }
 
 #[cfg(feature = "gpu-wgpu")]
@@ -232,6 +270,7 @@ impl WgpuFrameRenderer {
             ticker_start_pts_ns: None,
             text_strip_cache: std::collections::BTreeMap::new(),
             text_strip_cache_bytes: 0,
+            clock_strip_cache: None,
             scene_text_shadow,
             rendered_frames: 0,
             dropped_frames: 0,
@@ -267,6 +306,7 @@ impl WgpuFrameRenderer {
             self.ticker_key = None;
             self.ticker_start_pts_ns = None;
             self.clear_text_strip_cache();
+            self.clock_strip_cache = None;
             self.rendered_frames = self.rendered_frames.saturating_add(1);
             return Ok(());
         };
@@ -438,23 +478,37 @@ impl WgpuFrameRenderer {
     ) -> Result<()> {
         let clock_text = state.clock_text.trim();
         if clock_text.is_empty() {
+            self.clock_strip_cache = None;
             return Ok(());
         }
-        let mut clock_state = state.clone();
-        clock_state.text = clock_text.to_string();
-        clock_state.source_text = clock_text.to_string();
-        clock_state.font_size = state.clock_font_size.max(12);
-        clock_state.text_width_px = estimated_text_width_px(clock_text, clock_state.font_size);
-        clock_state.visual_mode = "clock".to_string();
-        let strip_width = (clock_state.text_width_px.round().max(1.0) as u32)
-            .saturating_add(clock_state.clock_font_size.saturating_mul(2))
+        let font_size = state.clock_font_size.max(12);
+        let text_width_px = estimated_text_width_px(clock_text, font_size);
+        let strip_width = (text_width_px.round().max(1.0) as u32)
+            .saturating_add(font_size.saturating_mul(2))
             .min(self.width.max(1));
-        let strip_height = clock_state
-            .clock_font_size
-            .saturating_mul(2)
-            .max(24)
-            .min(self.height.max(1));
-        let strip = self.render_text_strip(strip_width, strip_height, 0, 0, &clock_state)?;
+        let strip_height = font_size.saturating_mul(2).max(24).min(self.height.max(1));
+        if !self
+            .clock_strip_cache
+            .as_ref()
+            .is_some_and(|(key, _)| key.matches(state, strip_width, strip_height))
+        {
+            let mut clock_state = state.clone();
+            clock_state.text = clock_text.to_string();
+            clock_state.source_text = clock_text.to_string();
+            clock_state.font_size = font_size;
+            clock_state.text_width_px = text_width_px;
+            clock_state.visual_mode = "clock".to_string();
+            let strip = self.render_text_strip(strip_width, strip_height, 0, 0, &clock_state)?;
+            self.clock_strip_cache = Some((
+                ClockStripKey::from_state(state, strip_width, strip_height),
+                strip,
+            ));
+        }
+        let strip = &self
+            .clock_strip_cache
+            .as_ref()
+            .expect("clock strip cached")
+            .1;
         blend_text_strip_at(
             frame,
             width,
@@ -1176,6 +1230,22 @@ mod tests {
     fn text_strip_uses_local_vertical_position() {
         assert_eq!(text_strip_top_px(96, 24.0), 36.0);
         assert_eq!(text_strip_top_px(12, 24.0), 0.0);
+    }
+
+    #[test]
+    fn clock_strip_cache_tracks_visible_text_style_and_size() {
+        let mut state = test_overlay_state();
+        state.clock_text = "12:34".to_string();
+        let key = ClockStripKey::from_state(&state, 150, 60);
+        assert!(key.matches(&state, 150, 60));
+
+        state.clock_text = "12:35".to_string();
+        assert!(!key.matches(&state, 150, 60));
+        state.clock_text = "12:34".to_string();
+        state.clock_color = "#ff0000".to_string();
+        assert!(!key.matches(&state, 150, 60));
+        state.clock_color = "#ffffff".to_string();
+        assert!(!key.matches(&state, 151, 60));
     }
 
     fn test_overlay_state() -> OverlayRenderState {

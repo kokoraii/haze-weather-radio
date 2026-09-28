@@ -70,7 +70,17 @@ type Service struct {
 	metrics           metrics
 	twilio            *twilioRuntime
 	twilioRequired    bool
+	staticPromptMu    sync.Mutex
+	staticPromptState staticPromptManifestState
 }
+
+type staticPromptManifestState struct {
+	manifest  staticPromptManifest
+	valid     bool
+	checkedAt time.Time
+}
+
+const staticPromptManifestCheckInterval = time.Second
 
 type metrics struct {
 	Lookups             atomic.Uint64 `json:"-"`
@@ -1530,6 +1540,13 @@ func (s *Service) staticPromptAudio(menuID string, lineKey string, values map[st
 }
 
 func (s *Service) currentStaticPromptManifest() (staticPromptManifest, bool) {
+	s.staticPromptMu.Lock()
+	defer s.staticPromptMu.Unlock()
+	if !s.staticPromptState.checkedAt.IsZero() && time.Since(s.staticPromptState.checkedAt) < staticPromptManifestCheckInterval {
+		return s.staticPromptState.manifest, s.staticPromptState.valid
+	}
+	s.staticPromptState.checkedAt = time.Now()
+	s.staticPromptState.valid = false
 	targetDir := filepath.Join(s.cfg.BaseDir, "audio", "ivr")
 	manifestPath := filepath.Join(targetDir, "manifest.json")
 	raw, err := os.ReadFile(filepath.Clean(manifestPath))
@@ -1547,6 +1564,8 @@ func (s *Service) currentStaticPromptManifest() (staticPromptManifest, bool) {
 	if err != nil || manifest.Fingerprint != fingerprint {
 		return staticPromptManifest{}, false
 	}
+	s.staticPromptState.manifest = manifest
+	s.staticPromptState.valid = true
 	return manifest, true
 }
 
@@ -1779,6 +1798,9 @@ func (s *Service) generateStaticPrompts(ctx context.Context) {
 		log.Printf("IVR static prompt manifest failed: %v", err)
 		return
 	}
+	s.staticPromptMu.Lock()
+	s.staticPromptState.checkedAt = time.Time{}
+	s.staticPromptMu.Unlock()
 	log.Printf("IVR static prompts regenerated with reader %s (%d clips)", fallbackText(policy.ReaderID, "default"), len(manifest.Files))
 }
 

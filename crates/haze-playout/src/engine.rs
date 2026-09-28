@@ -19,6 +19,7 @@ use tokio::time::{interval, Instant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
+use crate::alerts;
 use crate::bridge::{self, BridgeClient, ProductRenderRequest, RenderedProduct, SynthJob};
 use crate::config::{display_text, resolve_path, FeedConfig, LoadedConfig};
 use crate::sinks::{sinks_for_feed, Sink};
@@ -219,6 +220,11 @@ struct SegmentGroupManifestSegment {
 struct AudioItemMetadata {
     audio_path: String,
     duration_ms: u64,
+    decision_id: String,
+    delivery_id: String,
+    parent_alert_id: String,
+    alert_id: String,
+    received_at: String,
     alert_packet: Option<Value>,
     alert_text: String,
     banner_text: String,
@@ -510,8 +516,16 @@ struct FeedHandle {
     priority_prepare_tx: mpsc::Sender<Value>,
     recovery_priority_tx: mpsc::Sender<AudioItem>,
     breakin_tx: mpsc::Sender<BreakInCommand>,
+    alert_cancel_tx: mpsc::Sender<AlertCancellation>,
     request_tx: mpsc::Sender<PackageRequest>,
     control_tx: mpsc::Sender<PlayoutControl>,
+}
+
+#[derive(Debug)]
+struct AlertCancellation {
+    alert_ids: Vec<String>,
+    decision_id: String,
+    applied: Option<oneshot::Sender<()>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -520,6 +534,14 @@ struct AlertQueueItem {
     id: String,
     #[serde(default)]
     alert_id: String,
+    #[serde(default)]
+    decision_id: String,
+    #[serde(default)]
+    delivery_id: String,
+    #[serde(default)]
+    parent_alert_id: String,
+    #[serde(default)]
+    received_at: String,
     #[serde(default)]
     alert_packet: Option<Value>,
     #[serde(default)]
@@ -701,6 +723,20 @@ async fn run_connected(
     let routine_preparation = Arc::new(Semaphore::new(ROUTINE_PREPARATION_CONCURRENCY));
     let priority_preparation = Arc::new(Semaphore::new(PRIORITY_PREPARATION_CONCURRENCY));
     session_tasks.track_abortable(reader_task);
+    let alert_pipeline = match alerts::AlertPipeline::load(&cfg.base_dir) {
+        Ok(pipeline) => Arc::new(pipeline),
+        Err(err) => {
+            tracing::error!("failed to load durable CAP router state: {err:#}");
+            session_tasks.shutdown().await;
+            return ConnectedOutcome::Reconnect;
+        }
+    };
+    session_tasks.spawn_cooperative(alerts::run_router(
+        Arc::clone(&alert_pipeline),
+        Arc::clone(&cfg),
+        options.bridge_addr.clone(),
+        session_tasks.cancellation.clone(),
+    ));
     spawn_audio_cache_maintenance(&session_tasks, &audio_cache);
     for feed in cfg.enabled_feeds().cloned() {
         let media_client = match bridge::connect_publish_only_retry(media_bridge_addr).await {
@@ -751,7 +787,7 @@ async fn run_connected(
         if bridge::string_at(&event, "type") == "system.shutdown" {
             break ConnectedOutcome::Shutdown;
         }
-        dispatch_event(&cfg, &audio_cache, &handles, &session_tasks, event).await;
+        dispatch_event(&cfg, &audio_cache, &handles, &session_tasks, &client, event).await;
     };
     drop(handles);
     session_tasks.shutdown().await;
@@ -778,6 +814,7 @@ async fn dispatch_event(
     audio_cache: &Arc<AudioCache>,
     handles: &HashMap<String, FeedHandle>,
     tasks: &SessionTasks,
+    client: &BridgeClient,
     event: Value,
 ) {
     match bridge::string_at(&event, "type") {
@@ -814,9 +851,57 @@ async fn dispatch_event(
             let data = bridge::data(&event);
             let feed_id = bridge::first_text(&event, data, &["feed_id"]);
             let Some(handle) = handles.get(feed_id).cloned() else {
+                if !bridge::first_text(&event, data, &["decision_id"]).is_empty() {
+                    publish_dispatch_failure(client, &event, "target feed is not enabled").await;
+                }
                 return;
             };
             let package_id = bridge::first_text(&event, data, &["package_id", "pkg_id"]);
+            let decision_id = bridge::first_text(&event, data, &["decision_id"]).to_string();
+            if !decision_id.is_empty() {
+                let cfg = Arc::clone(cfg);
+                let audio_cache = Arc::clone(audio_cache);
+                let data = data.clone();
+                let event = event.clone();
+                let client = client.clone();
+                let feed_id = feed_id.to_string();
+                tasks.spawn(async move {
+                    match handle.audio_tx.clone().reserve_owned().await {
+                        Ok(permit) => {
+                            match audio_item_from_ready(
+                                &cfg,
+                                &audio_cache,
+                                &handle.feed,
+                                data.clone(),
+                            )
+                            .await
+                            {
+                                Ok(item) => {
+                                    permit.send(item);
+                                    publish_dispatch_ack(&client, &event).await;
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        feed_id,
+                                        "CAP routine alert item rejected: {err:#}"
+                                    );
+                                    publish_dispatch_failure(&client, &event, &err.to_string())
+                                        .await;
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            publish_dispatch_failure(
+                                &client,
+                                &event,
+                                "routine playout queue closed",
+                            )
+                            .await
+                        }
+                    }
+                });
+                return;
+            }
             let Some(permit) = try_reserve_routine_slot(&handle.audio_tx, feed_id, package_id)
             else {
                 return;
@@ -862,14 +947,85 @@ async fn dispatch_event(
         }
         "cap.alert.audio.ready" => {
             let targets = feed_targets_from_event(&event);
+            let decision_id = bridge::first_text(&event, bridge::data(&event), &["decision_id"]);
+            let mut matched = false;
             for handle in matching_feed_handles(handles, &targets) {
+                matched = true;
                 let data = bridge::data(&event).clone();
-                if handle.priority_prepare_tx.send(data).await.is_err() {
+                if handle.priority_prepare_tx.try_send(data).is_err() {
                     tracing::warn!(
                         feed_id = handle.feed.id,
                         "priority preparation queue closed before alert audio could be queued"
                     );
+                    if !decision_id.is_empty() {
+                        publish_dispatch_failure(
+                            client,
+                            &event,
+                            "priority preparation queue is full or closed",
+                        )
+                        .await;
+                    }
                 }
+            }
+            if !matched && !decision_id.is_empty() {
+                publish_dispatch_failure(client, &event, "no enabled target feed matched").await;
+            }
+        }
+        "cap.alert.cancelled" => {
+            let data = bridge::data(&event);
+            let decision_id = bridge::first_text(&event, data, &["decision_id"]).to_string();
+            if is_legacy_productrender_cancellation(&event) {
+                return;
+            }
+            let feed_id = bridge::first_text(&event, data, &["feed_id"]);
+            let cancellation = AlertCancellation {
+                alert_ids: value_string_array(data, "alert_ids"),
+                decision_id: decision_id.clone(),
+                applied: None,
+            };
+            if let Some(handle) = handles.get(feed_id) {
+                let (applied_tx, applied_rx) = if decision_id.is_empty() {
+                    (None, None)
+                } else {
+                    let (sender, receiver) = oneshot::channel();
+                    (Some(sender), Some(receiver))
+                };
+                let mut cancellation = cancellation;
+                cancellation.applied = applied_tx;
+                if handle.alert_cancel_tx.send(cancellation).await.is_err() {
+                    tracing::warn!(feed_id, "CAP cancellation could not reach the feed mixer");
+                    if !decision_id.is_empty() {
+                        publish_dispatch_failure(client, &event, "CAP cancellation queue closed")
+                            .await;
+                    }
+                } else if let Some(applied_rx) = applied_rx {
+                    if tokio::time::timeout(Duration::from_secs(5), applied_rx)
+                        .await
+                        .is_ok_and(|result| result.is_ok())
+                    {
+                        let _ = client
+                            .publish(json!({
+                                "type": "cap.alert.cancellation.applied",
+                                "source": SOURCE_ID,
+                                "subject": decision_id,
+                                "data": {
+                                    "decision_id": decision_id,
+                                    "delivery_id": bridge::first_text(&event, data, &["delivery_id"]),
+                                    "feed_id": feed_id,
+                                }
+                            }))
+                            .await;
+                    } else {
+                        publish_dispatch_failure(
+                            client,
+                            &event,
+                            "feed mixer did not apply CAP cancellation",
+                        )
+                        .await;
+                    }
+                }
+            } else if !decision_id.is_empty() {
+                publish_dispatch_failure(client, &event, "target feed is not enabled").await;
             }
         }
         "playlist.control" => {
@@ -886,6 +1042,52 @@ async fn dispatch_event(
         }
         _ => {}
     }
+}
+
+fn is_legacy_productrender_cancellation(event: &Value) -> bool {
+    bridge::string_at(event, "source") == "haze-product-render"
+        && bridge::first_text(event, bridge::data(event), &["decision_id"]).is_empty()
+}
+
+async fn publish_dispatch_ack(client: &BridgeClient, event: &Value) {
+    let data = bridge::data(event);
+    let decision_id = bridge::first_text(event, data, &["decision_id"]);
+    if decision_id.is_empty() {
+        return;
+    }
+    let _ = client
+        .publish(json!({
+            "type": "cap.alert.playlist.dispatch.acknowledged",
+            "source": SOURCE_ID,
+            "subject": decision_id,
+            "data": {
+                "decision_id": decision_id,
+                "delivery_id": bridge::first_text(event, data, &["delivery_id"]),
+                "feed_id": bridge::first_text(event, data, &["feed_id"]),
+            }
+        }))
+        .await;
+}
+
+async fn publish_dispatch_failure(client: &BridgeClient, event: &Value, reason: &str) {
+    let data = bridge::data(event);
+    let decision_id = bridge::first_text(event, data, &["decision_id"]);
+    if decision_id.is_empty() {
+        return;
+    }
+    let _ = client
+        .publish(json!({
+            "type": "cap.alert.playlist.dispatch.failed",
+            "source": SOURCE_ID,
+            "subject": decision_id,
+            "data": {
+                "decision_id": decision_id,
+                "delivery_id": bridge::first_text(event, data, &["delivery_id"]),
+                "feed_id": bridge::first_text(event, data, &["feed_id"]),
+                "error": reason,
+            }
+        }))
+        .await;
 }
 
 async fn dispatch_package(
@@ -1659,6 +1861,7 @@ impl FeedHandle {
         let (priority_prepare_tx, priority_prepare_rx) =
             mpsc::channel(PRIORITY_PREPARE_QUEUE_CAPACITY);
         let (breakin_tx, breakin_rx) = mpsc::channel(BREAKIN_COMMAND_QUEUE_CAPACITY);
+        let (alert_cancel_tx, alert_cancel_rx) = mpsc::channel(CONTROL_QUEUE_CAPACITY);
         let (request_tx, request_rx) = mpsc::channel(PACKAGE_REQUEST_QUEUE_CAPACITY);
         let (control_tx, control_rx) = mpsc::channel(CONTROL_QUEUE_CAPACITY);
         let segment_group_mailbox = Arc::new(StdMutex::new(SegmentGroupMailbox::default()));
@@ -1677,6 +1880,7 @@ impl FeedHandle {
         ));
         tasks.spawn(priority_builder(
             Arc::clone(&cfg),
+            client.clone(),
             feed.clone(),
             Arc::clone(&audio_cache),
             priority_prepare_rx,
@@ -1711,6 +1915,7 @@ impl FeedHandle {
                 segment_group_revision_rx,
                 priority_rx,
                 breakin_rx,
+                alert_cancel_rx,
                 control_rx,
                 sinks: Vec::new(),
                 after_current_action: None,
@@ -1728,6 +1933,7 @@ impl FeedHandle {
             priority_prepare_tx,
             recovery_priority_tx: priority_tx,
             breakin_tx,
+            alert_cancel_tx,
             request_tx,
             control_tx,
         }
@@ -1744,6 +1950,7 @@ struct FeedRunner {
     segment_group_revision_rx: mpsc::Receiver<SegmentGroupRevisionMessage>,
     priority_rx: mpsc::Receiver<AudioItem>,
     breakin_rx: mpsc::Receiver<BreakInCommand>,
+    alert_cancel_rx: mpsc::Receiver<AlertCancellation>,
     control_rx: mpsc::Receiver<PlayoutControl>,
     sinks: Vec<Box<dyn Sink>>,
     after_current_action: Option<AfterCurrentAction>,
@@ -1809,6 +2016,7 @@ impl FeedRunner {
         let mut interrupted_priority: Option<AudioItem> = None;
         let mut interrupted_routine: Option<AudioItem> = None;
         let mut active_priority_ids = HashSet::<String>::new();
+        let mut cancelled_alert_ids = HashSet::<String>::new();
         let mut active_routine_ids = HashSet::<String>::new();
         let mut completed_routine_ids = HashSet::<String>::new();
         let mut completed_routine_order = VecDeque::<String>::new();
@@ -1884,6 +2092,42 @@ impl FeedRunner {
                             &mut completed_routine_ids,
                             &mut completed_routine_order,
                         );
+                    }
+                }
+                Some(cancellation) = self.alert_cancel_rx.recv() => {
+                    let interrupted = retract_cancelled_alerts(
+                        &self.cfg,
+                        &self.feed.id,
+                        &cancellation.alert_ids,
+                        &cancellation.decision_id,
+                        &mut current,
+                        &mut pending,
+                        &mut priority_pending,
+                        &mut interrupted_priority,
+                        &mut interrupted_routine,
+                        &mut deferred_routine,
+                        &mut active_priority_ids,
+                        &mut active_routine_ids,
+                        &mut cancelled_alert_ids,
+                    ).await;
+                    if let Some(item) = interrupted {
+                        spawn_interrupt_item(
+                            &self.tasks,
+                            self.client.clone(),
+                            self.feed.id.clone(),
+                            item,
+                        );
+                        position = 0;
+                        gap_until = Instant::now();
+                        spawn_update_runtime(
+                            &self.tasks,
+                            Arc::clone(&self.cfg),
+                            self.feed.id.clone(),
+                            "Idle".to_string(),
+                        );
+                    }
+                    if let Some(applied) = cancellation.applied {
+                        let _ = applied.send(());
                     }
                 }
                 Some(command) = self.breakin_rx.recv() => {
@@ -2081,6 +2325,7 @@ impl FeedRunner {
                             &mut self.priority_rx,
                             &mut priority_pending,
                             &mut active_priority_ids,
+                            &cancelled_alert_ids,
                             &self.feed.id,
                         ) {
                             spawn_accept_item(
@@ -2144,6 +2389,10 @@ impl FeedRunner {
                                     &mut segment_groups,
                                     &self.feed.id,
                                 ) {
+                                    if matches_alert_identity(&item, &cancelled_alert_ids) {
+                                        active_routine_ids.remove(&item.id);
+                                        continue;
+                                    }
                                     spawn_accept_item(
                                         &self.tasks,
                                         self.client.clone(),
@@ -2436,6 +2685,7 @@ fn drain_priority_receiver(
     priority_rx: &mut mpsc::Receiver<AudioItem>,
     priority_pending: &mut VecDeque<AudioItem>,
     active_priority_ids: &mut HashSet<String>,
+    cancelled_alert_ids: &HashSet<String>,
     feed_id: &str,
 ) -> Vec<AudioItem> {
     let mut accepted = Vec::new();
@@ -2443,6 +2693,14 @@ fn drain_priority_receiver(
         let Ok(item) = priority_rx.try_recv() else {
             break;
         };
+        if matches_alert_identity(&item, cancelled_alert_ids) {
+            tracing::debug!(
+                feed_id,
+                queue_id = item.id,
+                "skipping cancelled queued CAP alert"
+            );
+            continue;
+        }
         if !remember_priority_item(active_priority_ids, &item.id) {
             tracing::warn!(
                 feed_id,
@@ -3668,6 +3926,7 @@ fn try_reserve_routine_slot(
 
 async fn priority_builder(
     cfg: Arc<LoadedConfig>,
+    client: BridgeClient,
     feed: FeedConfig,
     audio_cache: Arc<AudioCache>,
     mut requests: mpsc::Receiver<Value>,
@@ -3678,17 +3937,37 @@ async fn priority_builder(
         let Ok(_permit) = preparation.acquire().await else {
             break;
         };
-        match audio_item_from_priority_ready(&cfg, &audio_cache, &feed, data).await {
-            Ok(item) => {
+        let event = data.clone();
+        match audio_item_from_priority_ready(&cfg, &audio_cache, data).await {
+            Ok(Some(item)) => {
                 if priority_tx.send(item).await.is_err() {
                     tracing::warn!(
                         feed_id = feed.id,
                         "priority queue closed before alert audio could be queued"
                     );
+                    publish_dispatch_failure(
+                        &client,
+                        &json!({"data": event}),
+                        "priority playout queue closed",
+                    )
+                    .await;
                     break;
                 }
+                if let Err(err) = mark_alert_queued_for_item(&event, &cfg) {
+                    tracing::warn!(
+                        feed_id = feed.id,
+                        "failed to persist accepted alert queue state: {err}"
+                    );
+                }
+                publish_dispatch_ack(&client, &json!({"data": event})).await;
             }
-            Err(err) => tracing::warn!(feed_id = feed.id, "priority alert rejected: {err}"),
+            Ok(None) => {
+                publish_dispatch_ack(&client, &json!({"data": event})).await;
+            }
+            Err(err) => {
+                tracing::warn!(feed_id = feed.id, "priority alert rejected: {err}");
+                publish_dispatch_failure(&client, &json!({"data": event}), &err.to_string()).await;
+            }
         }
     }
 }
@@ -4196,6 +4475,12 @@ async fn audio_item_from_ready(
         metadata: AudioItemMetadata {
             audio_path: audio_path.to_string(),
             duration_ms,
+            decision_id: bridge::first_text(&Value::Null, &data, &["decision_id"]).to_string(),
+            delivery_id: bridge::first_text(&Value::Null, &data, &["delivery_id"]).to_string(),
+            parent_alert_id: bridge::first_text(&Value::Null, &data, &["parent_alert_id"])
+                .to_string(),
+            alert_id: bridge::first_text(&Value::Null, &data, &["alert_id"]).to_string(),
+            received_at: bridge::first_text(&Value::Null, &data, &["received_at"]).to_string(),
             ..Default::default()
         },
         gap_after: package_gap(cfg),
@@ -4218,11 +4503,10 @@ async fn audio_item_from_ready(
 async fn audio_item_from_priority_ready(
     cfg: &LoadedConfig,
     audio_cache: &AudioCache,
-    feed: &FeedConfig,
     data: Value,
-) -> Result<AudioItem> {
+) -> Result<Option<AudioItem>> {
     if priority_request_is_cancelled(&data) {
-        anyhow::bail!("priority alert is cancelled or superseded");
+        return Ok(None);
     }
     let audio_path = bridge::first_text(&Value::Null, &data, &["audio_path"]);
     if audio_path.is_empty() {
@@ -4253,15 +4537,12 @@ async fn audio_item_from_priority_ready(
         .join(ALERT_QUEUE_DIR)
         .join(format!("{queue_id}.json"));
     if manifest_path.exists() {
-        if let Err(err) = mark_alert_event_queued(&manifest_path) {
-            tracing::warn!(
-                feed_id = feed.id,
-                queue_id,
-                "failed to mark alert event queued: {err}"
-            );
+        let manifest = read_alert_item(&manifest_path)?;
+        if alert_manifest_already_dispatched(&manifest.status) {
+            return Ok(None);
         }
     }
-    Ok(AudioItem {
+    Ok(Some(AudioItem {
         id: queue_id.clone(),
         package_id: "same_alert".to_string(),
         title: title.clone(),
@@ -4269,6 +4550,12 @@ async fn audio_item_from_priority_ready(
         metadata: AudioItemMetadata {
             audio_path: audio_path.to_string(),
             duration_ms,
+            decision_id: bridge::first_text(&Value::Null, &data, &["decision_id"]).to_string(),
+            delivery_id: bridge::first_text(&Value::Null, &data, &["delivery_id"]).to_string(),
+            parent_alert_id: bridge::first_text(&Value::Null, &data, &["parent_alert_id"])
+                .to_string(),
+            alert_id: bridge::first_text(&Value::Null, &data, &["alert_id"]).to_string(),
+            received_at: bridge::first_text(&Value::Null, &data, &["received_at"]).to_string(),
             alert_packet: data.get("alert_packet").cloned(),
             alert_text: bridge::first_text(
                 &Value::Null,
@@ -4295,7 +4582,22 @@ async fn audio_item_from_priority_ready(
             event,
         },
         segment_group: None,
-    })
+    }))
+}
+
+fn mark_alert_queued_for_item(data: &Value, cfg: &LoadedConfig) -> Result<()> {
+    let queue_id = bridge::first_text(&Value::Null, data, &["queue_id", "id"]);
+    if queue_id.is_empty() {
+        return Ok(());
+    }
+    let manifest_path = cfg
+        .base_dir
+        .join(ALERT_QUEUE_DIR)
+        .join(format!("{queue_id}.json"));
+    if manifest_path.exists() {
+        mark_alert_queued(&manifest_path)?;
+    }
+    Ok(())
 }
 
 fn priority_request_is_cancelled(data: &Value) -> bool {
@@ -4591,6 +4893,11 @@ async fn audio_item_from_alert(
         metadata: AudioItemMetadata {
             audio_path: item.audio_path.clone(),
             duration_ms,
+            decision_id: item.decision_id.clone(),
+            delivery_id: item.delivery_id.clone(),
+            parent_alert_id: item.parent_alert_id.clone(),
+            alert_id: item.alert_id.clone(),
+            received_at: item.received_at.clone(),
             alert_packet: item.alert_packet.clone(),
             alert_text: item.alert_text.clone(),
             banner_text: item.banner_text.clone(),
@@ -4652,13 +4959,27 @@ fn mark_alert_started(path: &Path) -> Result<()> {
     write_alert_item(path, &item)
 }
 
-fn mark_alert_event_queued(path: &Path) -> Result<()> {
+fn mark_alert_queued(path: &Path) -> Result<()> {
     let mut item = read_alert_item(path)?;
-    item.status = "event_queued".to_string();
+    item.status = "queued".to_string();
     item.claimed_at = Some(Utc::now().to_rfc3339());
     item.failed_at = None;
     item.last_error = None;
     write_alert_item(path, &item)
+}
+
+fn alert_manifest_already_dispatched(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "queued"
+            | "claimed"
+            | "event_queued"
+            | "playing"
+            | "played"
+            | "cancelled"
+            | "canceled"
+            | "superseded"
+    )
 }
 
 fn alert_targets_feed(item: &AlertQueueItem, feed: &FeedConfig) -> bool {
@@ -4725,6 +5046,150 @@ fn next_unique_routine_item(
     None
 }
 
+fn matches_alert_identity(item: &AudioItem, alert_ids: &HashSet<String>) -> bool {
+    alert_ids.contains(item.metadata.parent_alert_id.trim())
+        || alert_ids.contains(item.metadata.alert_id.trim())
+        || item
+            .metadata
+            .alert_packet
+            .as_ref()
+            .and_then(|packet| packet.get("id"))
+            .and_then(Value::as_str)
+            .is_some_and(|id| alert_ids.contains(id.trim()))
+}
+
+fn matches_cancelled_audio_item(
+    item: &AudioItem,
+    alert_ids: &HashSet<String>,
+    protected_decision_id: &str,
+) -> bool {
+    (protected_decision_id.is_empty() || item.metadata.decision_id != protected_decision_id)
+        && matches_alert_identity(item, alert_ids)
+}
+
+async fn retract_cancelled_alerts(
+    cfg: &LoadedConfig,
+    feed_id: &str,
+    alert_ids: &[String],
+    protected_decision_id: &str,
+    current: &mut Option<AudioItem>,
+    pending: &mut Option<AudioItem>,
+    priority_pending: &mut VecDeque<AudioItem>,
+    interrupted_priority: &mut Option<AudioItem>,
+    interrupted_routine: &mut Option<AudioItem>,
+    deferred_routine: &mut VecDeque<AudioItem>,
+    active_priority_ids: &mut HashSet<String>,
+    active_routine_ids: &mut HashSet<String>,
+    cancelled_ids: &mut HashSet<String>,
+) -> Option<AudioItem> {
+    let ids = alert_ids
+        .iter()
+        .map(|id| id.trim())
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    if ids.is_empty() {
+        return None;
+    }
+    cancelled_ids.extend(ids.iter().cloned());
+
+    let interrupted = if current
+        .as_ref()
+        .is_some_and(|item| matches_cancelled_audio_item(item, &ids, protected_decision_id))
+    {
+        current.take()
+    } else {
+        None
+    };
+    if let Some(item) = interrupted.as_ref() {
+        active_priority_ids.remove(&item.id);
+        active_routine_ids.remove(&item.id);
+    }
+    if pending
+        .as_ref()
+        .is_some_and(|item| matches_cancelled_audio_item(item, &ids, protected_decision_id))
+    {
+        if let Some(item) = pending.take() {
+            active_priority_ids.remove(&item.id);
+            active_routine_ids.remove(&item.id);
+        }
+    }
+    priority_pending.retain(|item| {
+        if matches_cancelled_audio_item(item, &ids, protected_decision_id) {
+            active_priority_ids.remove(&item.id);
+            false
+        } else {
+            true
+        }
+    });
+    if interrupted_priority
+        .as_ref()
+        .is_some_and(|item| matches_cancelled_audio_item(item, &ids, protected_decision_id))
+    {
+        if let Some(item) = interrupted_priority.take() {
+            active_priority_ids.remove(&item.id);
+        }
+    }
+    if interrupted_routine
+        .as_ref()
+        .is_some_and(|item| matches_cancelled_audio_item(item, &ids, protected_decision_id))
+    {
+        if let Some(item) = interrupted_routine.take() {
+            active_routine_ids.remove(&item.id);
+        }
+    }
+    deferred_routine.retain(|item| {
+        if matches_cancelled_audio_item(item, &ids, protected_decision_id) {
+            active_routine_ids.remove(&item.id);
+            false
+        } else {
+            true
+        }
+    });
+
+    let base_dir = cfg.base_dir.clone();
+    let feed_for_log = feed_id.to_string();
+    let feed_id = feed_for_log.clone();
+    let protected_decision_id = protected_decision_id.to_string();
+    if let Err(err) = tokio::task::spawn_blocking(move || {
+        let queue_dir = base_dir.join(ALERT_QUEUE_DIR);
+        if !queue_dir.exists() {
+            return Ok::<(), anyhow::Error>(());
+        }
+        for entry in fs::read_dir(&queue_dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(mut item) = read_alert_item(&path) else {
+                continue;
+            };
+            let targets_feed =
+                item.feed_id == feed_id || item.feed_ids.iter().any(|id| id == &feed_id);
+            let target_ids = [item.alert_id.as_str(), item.parent_alert_id.as_str()];
+            if targets_feed
+                && (protected_decision_id.is_empty() || item.decision_id != protected_decision_id)
+                && target_ids.iter().any(|id| ids.contains(id.trim()))
+                && alert_pending(&item.status)
+            {
+                item.status = "cancelled".to_string();
+                item.failed_at = Some(Utc::now().to_rfc3339());
+                item.last_error = Some("CAP alert cancelled".to_string());
+                write_alert_item(&path, &item)?;
+            }
+        }
+        Ok(())
+    })
+    .await
+    {
+        tracing::warn!(
+            feed_id = feed_for_log,
+            "failed to retract cancelled CAP alert manifests: {err}"
+        );
+    }
+    interrupted
+}
+
 fn alert_item_stale_for_priority(item: &AlertQueueItem, now: DateTime<Utc>) -> bool {
     if item.message_type.eq_ignore_ascii_case("cancel") {
         return true;
@@ -4781,6 +5246,11 @@ fn item_event_data(feed_id: &str, item: &AudioItem) -> Value {
         "title": item.title,
         "audio_path": item.metadata.audio_path,
         "duration_ms": item.metadata.duration_ms,
+        "decision_id": item.metadata.decision_id,
+        "delivery_id": item.metadata.delivery_id,
+        "parent_alert_id": item.metadata.parent_alert_id,
+        "alert_id": item.metadata.alert_id,
+        "received_at": item.metadata.received_at,
         "alert_packet": item.metadata.alert_packet,
         "alert_text": item.metadata.alert_text,
         "banner_text": item.metadata.banner_text,
@@ -4921,6 +5391,24 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_cap_ready_events_do_not_requeue_dispatched_alerts() {
+        for status in [
+            "queued",
+            "claimed",
+            "event_queued",
+            "playing",
+            "played",
+            "cancelled",
+            "canceled",
+            "superseded",
+        ] {
+            assert!(alert_manifest_already_dispatched(status), "{status}");
+        }
+        assert!(!alert_manifest_already_dispatched("pending"));
+        assert!(!alert_manifest_already_dispatched("failed"));
+    }
+
+    #[test]
     fn active_priority_ids_reject_duplicate_alerts() {
         let mut active = HashSet::<String>::new();
 
@@ -4948,6 +5436,10 @@ mod tests {
 }"#,
         )
         .expect("write manifest");
+
+        mark_alert_queued(&path).expect("mark queued");
+        let queued = read_alert_item(&path).expect("read queued");
+        assert_eq!(queued.status, "queued");
 
         mark_alert_started(&path).expect("mark started");
         let started = read_alert_item(&path).expect("read started");
@@ -4977,6 +5469,7 @@ mod tests {
                 priority: "same".to_string(),
                 feed_ids: vec!["sk-0001".to_string(), "CAP-IT-ALL".to_string()],
                 broadcast_immediate: true,
+                ..Default::default()
             },
             gap_after: Duration::from_millis(500),
             not_before: None,
@@ -5015,6 +5508,7 @@ mod tests {
             alerts: Some(crate::config::FeedAlertsConfig {
                 cap_cp: crate::config::FeedAlertProviderConfig {
                     enabled: Some("true".to_string()),
+                    ..Default::default()
                 },
                 ..Default::default()
             }),
@@ -5390,6 +5884,7 @@ mod tests {
             &mut rx,
             &mut priority_pending,
             &mut active_priority_ids,
+            &HashSet::new(),
             "sk-0001",
         );
 
@@ -5457,6 +5952,7 @@ mod tests {
             &mut rx,
             &mut priority_pending,
             &mut active_priority_ids,
+            &HashSet::new(),
             "sk-0001",
         );
 
@@ -6340,6 +6836,25 @@ mod tests {
         assert!(!priority_request_is_cancelled(&json!({
             "status": "queued",
             "header": "Severe Thunderstorm Warning"
+        })));
+    }
+
+    #[test]
+    fn ignores_legacy_productrender_cancellations_but_keeps_rust_dispatches() {
+        assert!(is_legacy_productrender_cancellation(&json!({
+            "type": "cap.alert.cancelled",
+            "source": "haze-product-render",
+            "data": {"alert_ids": ["alert-1"]}
+        })));
+        assert!(!is_legacy_productrender_cancellation(&json!({
+            "type": "cap.alert.cancelled",
+            "source": "haze-cap-alert-router",
+            "data": {"decision_id": "decision-1"}
+        })));
+        assert!(!is_legacy_productrender_cancellation(&json!({
+            "type": "cap.alert.cancelled",
+            "source": "haze-webgateway",
+            "data": {"alert_ids": ["alert-1"]}
         })));
     }
 

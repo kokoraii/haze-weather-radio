@@ -158,8 +158,8 @@ function Initialize-Clang64BuildEnvironment {
     $env:AR_x86_64_pc_windows_gnullvm = Join-Path $Clang64Bin "llvm-ar.exe"
     $env:LIBCLANG_PATH = $Clang64Bin
     # msdfgen-sys consumes this exact variable while generating its bindings.
-    $env:CXX_STDLIB = "c++"
-    $env:CXXSTDLIB_x86_64_pc_windows_gnullvm = "c++"
+    $env:CXX_STDLIB = "libc++"
+    $env:CXXSTDLIB_x86_64_pc_windows_gnullvm = "libc++"
     $env:BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnullvm = "--target=x86_64-w64-windows-gnu"
     $env:PKG_CONFIG = Join-Path $Clang64Bin "pkg-config.exe"
     $env:PKG_CONFIG_PATH = "$(Join-Path $Clang64Lib "pkgconfig");$(Join-Path $Clang64Root "share\pkgconfig")"

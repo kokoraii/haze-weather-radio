@@ -983,6 +983,26 @@ func TestStaticPromptAudioRejectsStaleManifestText(t *testing.T) {
 	}
 }
 
+func TestStaticPromptManifestCacheRechecksAfterInterval(t *testing.T) {
+	service := staticPromptTestService(t, "default__one_moment", "One moment.")
+	if _, ok := service.currentStaticPromptManifest(); !ok {
+		t.Fatal("initial manifest unavailable")
+	}
+	path := filepath.Join(service.cfg.BaseDir, "audio", "ivr", "manifest.json")
+	if err := os.WriteFile(path, []byte(`{"version":0}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := service.currentStaticPromptManifest(); !ok {
+		t.Fatal("manifest was reloaded during its cache interval")
+	}
+	service.staticPromptMu.Lock()
+	service.staticPromptState.checkedAt = time.Now().Add(-staticPromptManifestCheckInterval)
+	service.staticPromptMu.Unlock()
+	if _, ok := service.currentStaticPromptManifest(); ok {
+		t.Fatal("stale manifest survived the cache interval")
+	}
+}
+
 func TestHandlePromptServesStaticPromptBeforeTTSCache(t *testing.T) {
 	service := staticPromptTestService(t, "default__one_moment", "One moment.")
 	request := httptest.NewRequest(http.MethodGet, "http://ivr.test/ivr/v1/prompt?line=one_moment&format=pcmu", nil)
@@ -1015,7 +1035,7 @@ func recentBroadcastHub(feedID string) *broadcastHub {
 	return hub
 }
 
-func staticPromptTestService(t *testing.T, key string, text string) *Service {
+func staticPromptTestService(t testing.TB, key string, text string) *Service {
 	t.Helper()
 	dir := t.TempDir()
 	service := &Service{cfg: loadedConfig{

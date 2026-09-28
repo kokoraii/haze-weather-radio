@@ -1630,8 +1630,7 @@ func (s *wsSession) publishPlaylistCommand(eventType string, payload map[string]
 	if bridgeAddr == "" {
 		return nil, fmt.Errorf("event bridge is not available")
 	}
-	before, _ := playlistStatePayload(s.configPath)
-	previousUpdatedAt := playlistFeedUpdatedAt(before, feedID)
+	previousUpdatedAt := playlistFeedRuntimeUpdatedAt(s.configPath, feedID)
 	publisher := events.NewHostBridgePublisher(bridgeAddr)
 	defer publisher.Close()
 	if err := publisher.Publish(events.Event{

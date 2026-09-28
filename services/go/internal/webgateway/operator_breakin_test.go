@@ -57,6 +57,14 @@ func TestOperatorBreakInPublishesLiveEvents(t *testing.T) {
 	if live, _ := result["live"].(bool); !live {
 		t.Fatalf("finish result did not report live mode: %#v", result)
 	}
+	registration := <-received
+	if registration["type"] != "bridge.client" {
+		t.Fatalf("publisher registration type = %v", registration["type"])
+	}
+	registrationData, _ := registration["data"].(map[string]any)
+	if registrationData["receive_events"] != false {
+		t.Fatalf("publisher registration receives events: %#v", registration)
+	}
 	wantTypes := []string{"operator.breakin.start", "operator.breakin.chunk", "operator.breakin.finish"}
 	for _, want := range wantTypes {
 		event := <-received

@@ -70,6 +70,7 @@ func (s *wsSession) accountCommand(command string, payload map[string]any) (any,
 		}
 		account := accountPolicyFromPayload(Account{
 			PasswordExpiryDays: 90, AllowUserPasswordChange: true, LoggingEnabled: true,
+			AllowPersistentSessions: true,
 		}, payload)
 		password := stringValue(payload, "password")
 		hash, err := s.auth.accounts.hashPassword(password)

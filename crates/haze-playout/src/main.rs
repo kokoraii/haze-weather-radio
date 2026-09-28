@@ -1,3 +1,4 @@
+mod alerts;
 mod bridge;
 mod config;
 mod engine;

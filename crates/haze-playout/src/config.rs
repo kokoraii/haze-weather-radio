@@ -24,9 +24,19 @@ pub(crate) struct RootConfig {
     #[serde(default)]
     pub(crate) operator: OperatorConfig,
     #[serde(default)]
+    pub(crate) same: SameConfig,
+    #[serde(default)]
     pub(crate) playout: PlayoutConfig,
     #[serde(default)]
     pub(crate) services: ServicesConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct SameConfig {
+    #[serde(default)]
+    pub(crate) default_attention_tone: String,
+    #[serde(default)]
+    pub(crate) attention_tone_override: Vec<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -178,6 +188,10 @@ pub(crate) struct FeedPlayoutConfig {
     pub(crate) routine: Option<String>,
     #[serde(rename = "@same", default)]
     pub(crate) same: Option<String>,
+    #[serde(rename = "@same_originator", default)]
+    pub(crate) same_originator: Option<String>,
+    #[serde(rename = "@same_attention_tone", default)]
+    pub(crate) same_attention_tone: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -192,6 +206,46 @@ pub(crate) struct FeedAlertsConfig {
 pub(crate) struct FeedAlertProviderConfig {
     #[serde(rename = "@enabled", default)]
     pub(crate) enabled: Option<String>,
+    #[serde(default)]
+    pub(crate) filter: AlertFilterConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct AlertFilterConfig {
+    #[serde(rename = "@use_feed_locations", default)]
+    pub(crate) use_feed_locations: Option<String>,
+    #[serde(rename = "@coverage_mode", default)]
+    pub(crate) coverage_mode: Option<String>,
+    #[serde(default)]
+    pub(crate) allowlist: AlertFilterListConfig,
+    #[serde(default)]
+    pub(crate) blocklist: AlertFilterListConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct AlertFilterListConfig {
+    #[serde(rename = "severity", default)]
+    pub(crate) severities: Vec<String>,
+    #[serde(rename = "urgency", default)]
+    pub(crate) urgencies: Vec<String>,
+    #[serde(rename = "certainty", default)]
+    pub(crate) certainties: Vec<String>,
+    #[serde(rename = "message_type", default)]
+    pub(crate) message_types: Vec<String>,
+    #[serde(rename = "event", default)]
+    pub(crate) events: Vec<String>,
+    #[serde(rename = "naads_event", default)]
+    pub(crate) naads_events: Vec<String>,
+    #[serde(rename = "other", default)]
+    pub(crate) others: Vec<AlertFilterOtherConfig>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct AlertFilterOtherConfig {
+    #[serde(rename = "@value_name", default)]
+    pub(crate) value_name: String,
+    #[serde(rename = "@value", default)]
+    pub(crate) value: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

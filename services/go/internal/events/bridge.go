@@ -9,6 +9,7 @@ import (
 )
 
 const hostBridgeTimeout = 3 * time.Second
+const publisherRegistration = "{\"type\":\"bridge.client\",\"data\":{\"receive_events\":false}}\n"
 
 // HostBridgePublisher emits events to the Haze loopback event bridge.
 type HostBridgePublisher struct {
@@ -64,6 +65,18 @@ func (p *HostBridgePublisher) write(raw []byte) error {
 	if p.conn == nil {
 		conn, err := net.DialTimeout("tcp", p.addr, p.timeout(p.dialTimeout))
 		if err != nil {
+			return err
+		}
+		if err := conn.SetWriteDeadline(time.Now().Add(p.timeout(p.writeTimeout))); err != nil {
+			_ = conn.Close()
+			return err
+		}
+		n, err := io.WriteString(conn, publisherRegistration)
+		if err == nil && n != len(publisherRegistration) {
+			err = io.ErrShortWrite
+		}
+		if err != nil {
+			_ = conn.Close()
 			return err
 		}
 		p.conn = conn

@@ -98,8 +98,8 @@ jobs:
           Set-CiEnv "PKG_CONFIG_ALLOW_CROSS" "1"
           Set-CiEnv "FFMPEG_PKG_CONFIG_PATH" $ffmpegPkgConfigPath
           Set-CiEnv "LIBCLANG_PATH" $bin
-          Set-CiEnv "CXX_STDLIB" "c++"
-          Set-CiEnv "CXXSTDLIB_x86_64_pc_windows_gnullvm" "c++"
+          Set-CiEnv "CXX_STDLIB" "libc++"
+          Set-CiEnv "CXXSTDLIB_x86_64_pc_windows_gnullvm" "libc++"
           Set-CiEnv "BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnullvm" "--target=x86_64-w64-windows-gnu"
           Set-CiEnv "CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER" "x86_64-w64-mingw32-clang.exe"
           Set-CiEnv "CC_x86_64_pc_windows_gnullvm" "x86_64-w64-mingw32-clang.exe"
@@ -437,7 +437,7 @@ jobs:
             test -n "${LIBCLANG_FILE}" || { echo "libclang is required for the FreeBSD MSDF build" >&2; exit 1; }
             export LIBCLANG_PATH="$(dirname "${LIBCLANG_FILE}")"
             export CXX="${CXX:-c++}"
-            export CXX_STDLIB=c++
+            export CXX_STDLIB=libc++
             go version
             rustc --version
             cargo --version

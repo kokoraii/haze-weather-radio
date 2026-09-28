@@ -17,6 +17,20 @@ import (
 	"github.com/meowraii/haze-weather-radio/services/go/internal/datastore"
 )
 
+func TestRustPlayoutOwnsCAPDispatchEventsWhenEnabled(t *testing.T) {
+	for _, eventType := range []string{"cap.alert.broadcast.requested", "cap.alert.cancelled"} {
+		if !shouldDeferCAPPlayoutToRust(true, map[string]any{"type": eventType}) {
+			t.Errorf("Rust playout did not claim %s", eventType)
+		}
+		if shouldDeferCAPPlayoutToRust(false, map[string]any{"type": eventType}) {
+			t.Errorf("Go playout unexpectedly deferred %s when Rust is disabled", eventType)
+		}
+	}
+	if shouldDeferCAPPlayoutToRust(true, map[string]any{"type": "cap.alert.routine.requested"}) {
+		t.Fatal("routine CAP dispatch should remain available to current consumers")
+	}
+}
+
 func TestPredictedStartRespectsFixedTarget(t *testing.T) {
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	timelineEnd := now.Add(10 * time.Second)

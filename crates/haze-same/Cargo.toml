@@ -1,0 +1,10 @@
+[package]
+name = "haze-same"
+description = "SAME header and alert audio generation for Haze Weather Radio"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[dependencies]
+thiserror = "2.0"

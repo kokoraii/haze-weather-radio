@@ -3,8 +3,6 @@ mod go_services;
 mod host_bridge;
 mod runtime_dir;
 mod same_cli;
-#[allow(dead_code)]
-mod same_core;
 mod signals;
 #[cfg(any(windows, target_os = "linux"))]
 mod tray;
@@ -16,7 +14,7 @@ use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::Duration;
 
@@ -241,14 +239,24 @@ fn wait_for_shutdown(
         if signals::shutdown_requested() {
             break;
         }
-        while let Ok(event) = service_events.try_recv() {
+        let first_event = match service_events.recv_timeout(Duration::from_millis(250)) {
+            Ok(event) => Some(event),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => {
+                tracing::warn!("host event bridge disconnected");
+                break;
+            }
+        };
+        for event in first_event
+            .into_iter()
+            .chain(service_events.try_iter().take(255))
+        {
             daemon_services.handle_event(&event);
             if go_services.handle_control_event(&event) {
                 go_services.poll_children();
             }
         }
         go_services.poll_children();
-        thread::sleep(Duration::from_millis(250));
     }
     info!("shutdown requested; stopping managed services");
     let _ = publisher.send(json!({
