@@ -8,10 +8,58 @@ import zipfile
 from pathlib import Path
 from unittest import mock
 
-from build_location_catalog import build, extract_shapefile_archive, identifier_value, source_bytes, stable_id
+from build_location_catalog import (
+    build,
+    extract_shapefile_archive,
+    identifier_value,
+    ingest_delimited_rows,
+    point_geometry,
+    source_bytes,
+    stable_id,
+)
 
 
 class CatalogBuilderGoldenTest(unittest.TestCase):
+    def test_point_geometry_omits_invalid_external_coordinates(self) -> None:
+        self.assertEqual(
+            point_geometry("52.13", "-106.67"),
+            {"type": "Point", "coordinates": [-106.67, 52.13]},
+        )
+        for latitude, longitude in (
+            ("not-a-number", "-106.67"),
+            ("91", "-106.67"),
+            ("52.13", "-181.102881"),
+            ("nan", "0"),
+        ):
+            with self.subTest(latitude=latitude, longitude=longitude):
+                self.assertIsNone(point_geometry(latitude, longitude))
+
+    def test_delimited_source_can_skip_metadata_before_header(self) -> None:
+        catalog = mock.Mock()
+        source = {
+            "id": "naps",
+            "kind": "air_quality_station",
+            "id_fields": ["NAPS_ID"],
+            "name_fields": ["Station_Name"],
+            "identifiers": [],
+            "skip_rows_before_header": 2,
+            "skip_rows_after_header": 1,
+        }
+        rows = iter(
+            (
+                "Metadata row 1\n",
+                "Metadata row 2\n",
+                "NAPS_ID,Station_Name\n",
+                "French ID,French name\n",
+                "010101,Duckworth and Ordinance\n",
+            )
+        )
+
+        ingest_delimited_rows(catalog, source, rows)
+
+        catalog.add_entity.assert_called_once()
+        self.assertEqual(catalog.add_entity.call_args.kwargs["provider_id"], "010101")
+
     def test_source_download_retries_transient_failure(self) -> None:
         response = mock.MagicMock()
         response.__enter__.return_value.read.return_value = b"catalog-source"

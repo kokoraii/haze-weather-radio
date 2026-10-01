@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -369,6 +370,22 @@ def first(properties: dict[str, Any], *keys: str) -> Any:
         if value is not None and str(value).strip():
             return value
     return None
+
+
+def point_geometry(latitude: Any, longitude: Any) -> dict[str, Any] | None:
+    try:
+        latitude_value = float(latitude)
+        longitude_value = float(longitude)
+    except (TypeError, ValueError):
+        return None
+    if not (
+        math.isfinite(latitude_value)
+        and math.isfinite(longitude_value)
+        and -90.0 <= latitude_value <= 90.0
+        and -180.0 <= longitude_value <= 180.0
+    ):
+        return None
+    return {"type": "Point", "coordinates": [longitude_value, latitude_value]}
 
 
 def identifier_value(properties: dict[str, Any], specification: dict[str, Any]) -> Any:
@@ -1281,6 +1298,9 @@ def delimited_source(catalog: Catalog, source: dict[str, Any], allow_downloads: 
 def ingest_delimited_rows(
     catalog: Catalog, source: dict[str, Any], text_stream: Iterable[str]
 ) -> None:
+    text_stream = iter(text_stream)
+    for _ in range(int(source.get("skip_rows_before_header", 0))):
+        next(text_stream, None)
     reader = csv.DictReader(text_stream, delimiter=source.get("delimiter", ","))
     for _ in range(int(source.get("skip_rows_after_header", 0))):
         next(reader, None)
@@ -1292,9 +1312,7 @@ def ingest_delimited_rows(
             continue
         latitude = first(properties, source.get("latitude_field", "latitude"))
         longitude = first(properties, source.get("longitude_field", "longitude"))
-        geometry = None
-        if latitude is not None and longitude is not None:
-            geometry = {"type": "Point", "coordinates": [float(longitude), float(latitude)]}
+        geometry = point_geometry(latitude, longitude)
         generic_geojson_record(catalog, source, {"properties": properties, "geometry": geometry})
 
 
@@ -1890,28 +1908,38 @@ def build(
         expected_counts: dict[str, int] = {}
         try:
             for source in pack.get("sources", []):
-                expected_counts[source["id"]] = int(source.get("expected_min", 1))
+                source_id = source["id"]
+                expected_counts[source_id] = int(source.get("expected_min", 1))
                 adapter = source["adapter"]
-                if adapter.startswith("eccc_") or adapter == "geojson":
-                    ogc_source(catalog, source, allow_downloads)
-                elif adapter == "shapefile":
-                    shapefile_source(catalog, source, allow_downloads)
-                elif adapter in {"csv", "delimited"}:
-                    delimited_source(catalog, source, allow_downloads)
-                elif adapter == "statcan_csd_population":
-                    statcan_csd_population_source(catalog, source, allow_downloads)
-                elif adapter == "ndbc_active":
-                    ndbc_source(catalog, source, allow_downloads)
-                elif adapter == "ndbc_metadata":
-                    ndbc_metadata_source(catalog, source, allow_downloads)
-                elif adapter == "epa_aqs_sites":
-                    epa_aqs_sites_source(catalog, source, allow_downloads)
-                elif adapter == "airnow_sites":
-                    airnow_sites_source(catalog, source, allow_downloads)
-                elif adapter == "deployment_history_csv":
-                    deployment_history_source(catalog, source, allow_downloads)
-                else:
-                    raise RuntimeError(f"unsupported source adapter {adapter!r}")
+                print(
+                    f"building pack={pack_id} source={source_id} adapter={adapter}",
+                    flush=True,
+                )
+                try:
+                    if adapter.startswith("eccc_") or adapter == "geojson":
+                        ogc_source(catalog, source, allow_downloads)
+                    elif adapter == "shapefile":
+                        shapefile_source(catalog, source, allow_downloads)
+                    elif adapter in {"csv", "delimited"}:
+                        delimited_source(catalog, source, allow_downloads)
+                    elif adapter == "statcan_csd_population":
+                        statcan_csd_population_source(catalog, source, allow_downloads)
+                    elif adapter == "ndbc_active":
+                        ndbc_source(catalog, source, allow_downloads)
+                    elif adapter == "ndbc_metadata":
+                        ndbc_metadata_source(catalog, source, allow_downloads)
+                    elif adapter == "epa_aqs_sites":
+                        epa_aqs_sites_source(catalog, source, allow_downloads)
+                    elif adapter == "airnow_sites":
+                        airnow_sites_source(catalog, source, allow_downloads)
+                    elif adapter == "deployment_history_csv":
+                        deployment_history_source(catalog, source, allow_downloads)
+                    else:
+                        raise RuntimeError(f"unsupported source adapter {adapter!r}")
+                except Exception as error:
+                    raise RuntimeError(
+                        f"pack {pack_id} source {source_id} failed: {error}"
+                    ) from error
             catalog.finish(expected_counts)
         finally:
             catalog.close()

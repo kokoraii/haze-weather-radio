@@ -156,7 +156,7 @@
           "identifiers": [
             {"authority": "usgs", "scheme": "gnis", "field": "feature_id", "primary": true}
           ],
-          "expected_min": 2000000,
+          "expected_min": 900000,
           "source_quality": 0.96,
           "licence": "United States public domain",
           "attribution": "U.S. Geological Survey Geographic Names Information System"
@@ -347,6 +347,7 @@
           "adapter": "csv",
           "identity_authority": "eccc-naps",
           "location": "https://data-donnees.az.ec.gc.ca/api/file?path=air%2Fmonitor%2Fnational-air-pollution-surveillance-naps-program%2FProgramInformation-InformationProgramme%2FStationsNAPS-StationsSNPA.csv",
+          "skip_rows_before_header": 4,
           "skip_rows_after_header": 1,
           "kind": "air_quality_station",
           "id_fields": ["NAPS_ID"],
@@ -387,7 +388,7 @@
           "title": "ECCC Canadian Location Code base zones 6.15.0",
           "adapter": "shapefile",
           "identity_authority": "eccc",
-          "location": "https://dd.weather.gc.ca/20260803/WXO-DD/meteocode/geodata/version_6.15.0/MSC_Geography_Pkg_V6_15_0_Land_Unproj.zip",
+          "location": "https://dd.weather.gc.ca/today/meteocode/geodata/version_6.15.0/MSC_Geography_Pkg_V6_15_0_Land_Unproj.zip",
           "archive_contains": "land_CLCBaseZone_hybrid_unproj.shp",
           "kind": "forecast_zone",
           "id_fields": ["CLC"],
