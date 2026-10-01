@@ -67,6 +67,7 @@ jobs:
             mingw-w64-clang-x86_64-libunwind
             mingw-w64-clang-x86_64-opus
             mingw-w64-clang-x86_64-opusfile
+            mingw-w64-clang-x86_64-pkg-config
             mingw-w64-clang-x86_64-pkgconf
 
       - name: Configure Windows native build environment
@@ -250,6 +251,7 @@ jobs:
             mingw-w64-clang-x86_64-libunwind
             mingw-w64-clang-x86_64-opus
             mingw-w64-clang-x86_64-opusfile
+            mingw-w64-clang-x86_64-pkg-config
             mingw-w64-clang-x86_64-pkgconf
 
       - name: Set up Go
