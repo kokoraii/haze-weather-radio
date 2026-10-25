@@ -1,0 +1,13 @@
+version: v2
+modules:
+  - path: contracts
+lint:
+  use:
+    - STANDARD
+  except:
+    # Contracts are grouped by domain (contracts/bridge/v1, contracts/media/v1)
+    # next to the existing JSON contracts, not by the dotted package path.
+    - PACKAGE_DIRECTORY_MATCH
+breaking:
+  use:
+    - FILE

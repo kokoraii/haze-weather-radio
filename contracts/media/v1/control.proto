@@ -1,0 +1,72 @@
+// haze-media control contract.
+//
+// The gRPC form of the three HTTP routes haze-web calls on haze-media
+// (/health, /api/v1/feed/audio, /api/v1/webrtc/offer). haze-web remains the
+// HTTP and WebRTC edge for browsers; it translates between those and this
+// service. See Phase 1 of docs/grpc-migration-plan.md.
+syntax = "proto3";
+
+package haze.media.v1;
+
+option go_package = "github.com/meowraii/haze-weather-radio/services/go/internal/gen/media/v1;mediav1";
+
+service MediaControlService {
+  // Health returns the status document served at /api/v1/health.
+  rpc Health(HealthRequest) returns (HealthResponse);
+
+  // StreamFeedAudio streams one feed's audio in the requested codec until the
+  // client cancels. It replaces the chunked body of /api/v1/feed/audio. The
+  // call fails with NOT_FOUND for an unconfigured feed, INVALID_ARGUMENT for a
+  // bad feed id, UNIMPLEMENTED for an unsupported codec, and UNAVAILABLE when
+  // the encoder backend is missing, matching the HTTP 404, 400, 415, and 503.
+  rpc StreamFeedAudio(StreamFeedAudioRequest) returns (stream StreamFeedAudioResponse);
+
+  // WebRtcOffer answers a listener's SDP offer. It replaces
+  // /api/v1/webrtc/offer. A second listener from the same IP on the same feed
+  // fails with RESOURCE_EXHAUSTED, matching the HTTP 429.
+  rpc WebRtcOffer(WebRtcOfferRequest) returns (WebRtcOfferResponse);
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  // The health document as JSON. It is large and still evolving, so it is not
+  // modelled field by field yet.
+  bytes status_json = 1;
+}
+
+message StreamFeedAudioRequest {
+  string feed_id = 1;
+  // Codec id as accepted today: pcm16 (the default, also wav), opus, aac.
+  string codec = 2;
+}
+
+message StreamFeedAudioResponse {
+  // Set on the first chunk only, for example "audio/wav" or "application/ogg".
+  string content_type = 1;
+  bytes data = 2;
+}
+
+message WebRtcOfferRequest {
+  string feed_id = 1;
+  string sdp = 2;
+  string sdp_type = 3;
+  string preferred_codec = 4;
+  string codec = 5;
+  bool require_opus = 6;
+  bool disable_g722 = 7;
+  // The listener's address as seen by haze-web, used for the duplicate-listener
+  // check and for ICE candidate selection.
+  string client_ip = 8;
+  string remote_addr = 9;
+}
+
+message WebRtcOfferResponse {
+  string feed_id = 1;
+  string sdp = 2;
+  string sdp_type = 3;
+  string codec = 4;
+  uint32 payload_type = 5;
+  // True when the feed received input in the last five seconds.
+  bool media_recent = 6;
+}
