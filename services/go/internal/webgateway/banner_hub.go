@@ -1,17 +1,16 @@
 package webgateway
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log"
-	"net"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/meowraii/haze-weather-radio/services/go/internal/alertmodel"
+	"github.com/meowraii/haze-weather-radio/services/go/internal/bridgeclient"
 )
 
 const bannerBridgeReconnectDelay = 750 * time.Millisecond
@@ -50,30 +49,17 @@ func NewBannerHub(configPath string, addr string) *BannerHub {
 }
 
 func (h *BannerHub) run(ctx context.Context) {
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		conn, err := net.DialTimeout("tcp", h.addr, 3*time.Second)
-		if err != nil {
-			sleepBanner(ctx, bannerBridgeReconnectDelay)
-			continue
-		}
-		h.readBridge(ctx, conn)
-		_ = conn.Close()
-		sleepBanner(ctx, bannerBridgeReconnectDelay)
-	}
+	bridgeclient.Reconnect(ctx, bridgeclient.Options{Addr: h.addr}, bannerBridgeReconnectDelay, h.readBridge)
 }
 
-func (h *BannerHub) readBridge(ctx context.Context, conn net.Conn) {
-	scanner := bufio.NewScanner(conn)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-	for scanner.Scan() {
+func (h *BannerHub) readBridge(ctx context.Context, conn *bridgeclient.Conn) {
+	_ = conn.Scan(func(line []byte) bool {
 		if ctx.Err() != nil {
-			return
+			return false
 		}
-		h.handleEvent(scanner.Bytes(), time.Now().UTC())
-	}
+		h.handleEvent(line, time.Now().UTC())
+		return true
+	})
 }
 
 func (h *BannerHub) handleEvent(raw []byte, now time.Time) {
@@ -320,15 +306,6 @@ func bannerQueueItemEndsAlert(item sameQueueItem, queueID string) bool {
 		strings.Contains(queueID, "same_eom") ||
 		strings.Contains(itemType, "full") ||
 		strings.Contains(queueID, "same_full")
-}
-
-func sleepBanner(ctx context.Context, duration time.Duration) {
-	timer := time.NewTimer(duration)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-	case <-timer.C:
-	}
 }
 
 func logBannerEventDebug(message string) {

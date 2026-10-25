@@ -6,6 +6,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/meowraii/haze-weather-radio/services/go/internal/bridgeclient"
 )
 
 func TestHostBridgePublisherPublishesJSONL(t *testing.T) {
@@ -96,7 +98,7 @@ func TestHostBridgePublisherWriteDeadlineBoundsBlockedConnection(t *testing.T) {
 	}()
 
 	publisher := NewHostBridgePublisher(addr)
-	publisher.conn = clientConn
+	publisher.conn = bridgeclient.Wrap(clientConn, bridgeclient.Options{WriteTimeout: 25 * time.Millisecond})
 	publisher.dialTimeout = 25 * time.Millisecond
 	publisher.writeTimeout = 25 * time.Millisecond
 

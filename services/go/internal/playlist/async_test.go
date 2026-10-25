@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/meowraii/haze-weather-radio/services/go/internal/bridgeclient"
 )
 
 func TestPriorityPreparationReturnsPromptlyAndCancellationDiscardsResult(t *testing.T) {
@@ -376,7 +378,7 @@ func TestPrepareProductSegmentsStartsIndependentSynthesisConcurrently(t *testing
 		_ = clientConn.Close()
 	})
 	bridge := &bridgeClient{
-		conn:            clientConn,
+		bridge:          bridgeclient.Wrap(clientConn, bridgeclient.Options{}),
 		events:          make(chan map[string]any, 4),
 		pendingProducts: map[string]chan productResult{},
 		pendingSynth:    map[string]chan synthResult{},
@@ -511,7 +513,7 @@ func TestCommitPriorityAlertAtomicallyInstallsPreparedAudio(t *testing.T) {
 	}()
 	planner := &feedPlanner{
 		cfg:    loadedConfig{BaseDir: dir},
-		bridge: &bridgeClient{conn: clientConn},
+		bridge: &bridgeClient{bridge: bridgeclient.Wrap(clientConn, bridgeclient.Options{})},
 		feed:   feedXML{ID: "feed-1"},
 	}
 	queueID := safeID("001_feed-1_test_cap")
@@ -803,7 +805,7 @@ func TestBridgeSynthesizePropagatesRoutineAndAlertPriorities(t *testing.T) {
 		_ = clientConn.Close()
 	})
 	bridge := &bridgeClient{
-		conn:            clientConn,
+		bridge:          bridgeclient.Wrap(clientConn, bridgeclient.Options{}),
 		pendingProducts: map[string]chan productResult{},
 		pendingSynth:    map[string]chan synthResult{},
 	}
@@ -853,7 +855,7 @@ func TestBridgeSynthesizePropagatesRequestDeadline(t *testing.T) {
 		_ = clientConn.Close()
 	})
 	bridge := &bridgeClient{
-		conn:            clientConn,
+		bridge:          bridgeclient.Wrap(clientConn, bridgeclient.Options{}),
 		pendingProducts: map[string]chan productResult{},
 		pendingSynth:    map[string]chan synthResult{},
 	}
@@ -901,7 +903,7 @@ func TestBridgeSynthesizePropagatesVoiceRouteKey(t *testing.T) {
 		_ = clientConn.Close()
 	})
 	bridge := &bridgeClient{
-		conn:            clientConn,
+		bridge:          bridgeclient.Wrap(clientConn, bridgeclient.Options{}),
 		pendingProducts: map[string]chan productResult{},
 		pendingSynth:    map[string]chan synthResult{},
 	}

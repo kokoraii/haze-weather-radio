@@ -5,12 +5,14 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/meowraii/haze-weather-radio/services/go/internal/bridgeclient"
 )
 
 func TestBridgeRetainsCAPAlertWhenBoundedQueueIsFull(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	bridge := &bridgeClient{
-		conn:   clientConn,
+		bridge: bridgeclient.Wrap(clientConn, bridgeclient.Options{}),
 		done:   make(chan struct{}),
 		events: make(chan map[string]any, 1),
 	}
@@ -62,7 +64,7 @@ func TestBridgeRetainsRenderRequestsAndIgnoresUnrelatedTraffic(t *testing.T) {
 	for _, eventType := range []string{"product.render.request", "wx.on_demand.request", "system.shutdown"} {
 		t.Run(eventType, func(t *testing.T) {
 			server, client := net.Pipe()
-			bridge := &bridgeClient{conn: client, done: make(chan struct{}), events: make(chan map[string]any, 1)}
+			bridge := &bridgeClient{bridge: bridgeclient.Wrap(client, bridgeclient.Options{}), done: make(chan struct{}), events: make(chan map[string]any, 1)}
 			defer func() {
 				if err := server.Close(); err != nil {
 					t.Error(err)

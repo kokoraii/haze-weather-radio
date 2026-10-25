@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -23,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/meowraii/haze-weather-radio/services/go/internal/bridgeclient"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/events"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/processguard"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/tts"
@@ -282,7 +281,7 @@ func runService(ctx context.Context, cfg serviceConfig) error {
 	defer stopPruner()
 
 	for ctx.Err() == nil {
-		conn, err := net.DialTimeout("tcp", cfg.BridgeAddr, 3*time.Second)
+		conn, err := bridgeclient.Dial(ctx, bridgeclient.Options{Addr: cfg.BridgeAddr})
 		if err != nil {
 			sleepOrDone(ctx, time.Second)
 			continue
@@ -372,28 +371,29 @@ func startRuntimePruner(ctx context.Context, providers map[string]tts.Provider, 
 	}
 }
 
-func runServiceConnection(ctx context.Context, conn net.Conn, state *serviceState) error {
+func runServiceConnection(ctx context.Context, conn *bridgeclient.Conn, state *serviceState) error {
 	queue := newSynthesisQueue(ctx, conn, state, maxInt(1, state.cfg.Workers))
 	defer queue.Close()
-	scanner := bufio.NewScanner(conn)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-	for scanner.Scan() {
+	var stopped error
+	scanErr := conn.Scan(func(raw []byte) bool {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			stopped = ctx.Err()
+			return false
 		}
-		line := strings.TrimPrefix(strings.TrimSpace(scanner.Text()), "\ufeff")
+		line := strings.TrimPrefix(strings.TrimSpace(string(raw)), "\ufeff")
 		if line == "" {
-			continue
+			return true
 		}
 		var message map[string]any
 		if err := json.Unmarshal([]byte(line), &message); err != nil {
-			continue
+			return true
 		}
 		if stringValue(message, "type") == "system.shutdown" {
-			return errSystemShutdown
+			stopped = errSystemShutdown
+			return false
 		}
 		if stringValue(message, "type") != "tts.synthesize" {
-			continue
+			return true
 		}
 		if !queue.Enqueue(ctx, message) {
 			jobID := firstText(message, objectValue(message, "data"), "job_id", "id", "subject")
@@ -402,12 +402,16 @@ func runServiceConnection(ctx context.Context, conn net.Conn, state *serviceStat
 			}
 			state.publishTTSError(conn, jobID, "tts queue is full")
 		}
+		return true
+	})
+	if stopped != nil {
+		return stopped
 	}
-	return scanner.Err()
+	return scanErr
 }
 
 type synthesisQueue struct {
-	conn   net.Conn
+	conn   *bridgeclient.Conn
 	state  *serviceState
 	high   chan map[string]any
 	normal chan map[string]any
@@ -416,7 +420,7 @@ type synthesisQueue struct {
 	wg     sync.WaitGroup
 }
 
-func newSynthesisQueue(ctx context.Context, conn net.Conn, state *serviceState, workers int) *synthesisQueue {
+func newSynthesisQueue(ctx context.Context, conn *bridgeclient.Conn, state *serviceState, workers int) *synthesisQueue {
 	queueCtx, cancel := context.WithCancel(ctx)
 	q := &synthesisQueue{
 		conn:   conn,
@@ -784,7 +788,7 @@ func synthesisKey(providerID string, readerID string, targetSampleRate int, targ
 	return key
 }
 
-func handleSynthesisJob(ctx context.Context, conn net.Conn, state *serviceState, message map[string]any) {
+func handleSynthesisJob(ctx context.Context, conn *bridgeclient.Conn, state *serviceState, message map[string]any) {
 	cfg := state.cfg
 	data := objectValue(message, "data")
 	jobID := firstText(message, data, "job_id", "id", "subject")
@@ -1141,21 +1145,21 @@ func serviceReader(path string, readerID string, language string) (tts.Reader, b
 	return reader, true, nil
 }
 
-func (s *serviceState) publishTTSError(conn net.Conn, jobID string, detail string) {
+func (s *serviceState) publishTTSError(conn *bridgeclient.Conn, jobID string, detail string) {
 	_ = s.publishServiceEvent(conn, "tts.failed", jobID, map[string]any{
 		"job_id": jobID,
 		"error":  detail,
 	})
 }
 
-func (s *serviceState) publishServiceEvent(conn net.Conn, eventType string, subject string, data map[string]any) error {
+func (s *serviceState) publishServiceEvent(conn *bridgeclient.Conn, eventType string, subject string, data map[string]any) error {
 	s.publishMu.Lock()
 	defer s.publishMu.Unlock()
 	return publishServiceEvent(conn, eventType, subject, data)
 }
 
-func publishServiceEvent(conn net.Conn, eventType string, subject string, data map[string]any) error {
-	return json.NewEncoder(conn).Encode(events.Event{
+func publishServiceEvent(conn *bridgeclient.Conn, eventType string, subject string, data map[string]any) error {
+	return conn.PublishValue(events.Event{
 		Type:      eventType,
 		Source:    serviceID,
 		Timestamp: time.Now().UTC(),

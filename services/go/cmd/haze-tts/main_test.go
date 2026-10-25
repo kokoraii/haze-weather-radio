@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/meowraii/haze-weather-radio/services/go/internal/bridgeclient"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/tts"
 )
 
@@ -101,7 +102,7 @@ func TestHandleSynthesisJobDefaultsToWAV(t *testing.T) {
 	defer peer.Close()
 	outputPath := filepath.Join(t.TempDir(), "out.wav")
 
-	go handleSynthesisJob(context.Background(), conn, state, map[string]any{
+	go handleSynthesisJob(context.Background(), bridgeclient.Wrap(conn, bridgeclient.Options{}), state, map[string]any{
 		"type": "tts.synthesize",
 		"data": map[string]any{
 			"job_id":      "job-1",
@@ -147,7 +148,7 @@ func TestHandleSynthesisJobPublishesPCMMetadata(t *testing.T) {
 	defer peer.Close()
 	outputPath := filepath.Join(t.TempDir(), "out.pcm16")
 
-	go handleSynthesisJob(context.Background(), conn, state, map[string]any{
+	go handleSynthesisJob(context.Background(), bridgeclient.Wrap(conn, bridgeclient.Options{}), state, map[string]any{
 		"type": "tts.synthesize",
 		"data": map[string]any{
 			"job_id":        "job-2",
@@ -186,7 +187,7 @@ func TestHandleSynthesisJobDropsExpiredQueuedRequest(t *testing.T) {
 	defer peer.Close()
 	outputPath := filepath.Join(t.TempDir(), "expired.wav")
 
-	go handleSynthesisJob(context.Background(), conn, state, map[string]any{
+	go handleSynthesisJob(context.Background(), bridgeclient.Wrap(conn, bridgeclient.Options{}), state, map[string]any{
 		"type": "tts.synthesize",
 		"data": map[string]any{
 			"job_id":      "expired-job",
@@ -354,7 +355,7 @@ func TestHandleSynthesisJobRoutesUnavailableSpeakyAPIToFallbackBeforeSynthesis(t
 	defer peer.Close()
 	outputPath := filepath.Join(t.TempDir(), "fallback.wav")
 
-	go handleSynthesisJob(context.Background(), conn, state, map[string]any{
+	go handleSynthesisJob(context.Background(), bridgeclient.Wrap(conn, bridgeclient.Options{}), state, map[string]any{
 		"type": "tts.synthesize",
 		"data": map[string]any{
 			"job_id":          "fallback-job",
@@ -405,7 +406,7 @@ func TestHandleSynthesisJobFallsBackWhenHealthySpeakyAPIFailsDuringSynthesis(t *
 	defer peer.Close()
 	outputPath := filepath.Join(t.TempDir(), "fallback.wav")
 
-	go handleSynthesisJob(context.Background(), conn, state, map[string]any{
+	go handleSynthesisJob(context.Background(), bridgeclient.Wrap(conn, bridgeclient.Options{}), state, map[string]any{
 		"type": "tts.synthesize",
 		"data": map[string]any{
 			"job_id":          "healthy-probe-fallback-job",
@@ -492,7 +493,7 @@ func TestHandleSynthesisJobReusesIdenticalCompletedAudio(t *testing.T) {
 		conn, peer := net.Pipe()
 		defer conn.Close()
 		defer peer.Close()
-		go handleSynthesisJob(context.Background(), conn, state, map[string]any{
+		go handleSynthesisJob(context.Background(), bridgeclient.Wrap(conn, bridgeclient.Options{}), state, map[string]any{
 			"type": "tts.synthesize",
 			"data": map[string]any{
 				"job_id":      jobID,
@@ -543,7 +544,7 @@ func TestHandleSynthesisJobReusesPersistentCacheAfterRestart(t *testing.T) {
 		conn, peer := net.Pipe()
 		defer conn.Close()
 		defer peer.Close()
-		go handleSynthesisJob(context.Background(), conn, state, map[string]any{
+		go handleSynthesisJob(context.Background(), bridgeclient.Wrap(conn, bridgeclient.Options{}), state, map[string]any{
 			"type": "tts.synthesize",
 			"data": map[string]any{
 				"job_id":      jobID,
@@ -640,5 +641,169 @@ func TestProviderCandidatesSelectsSpeakyAPIExplicitly(t *testing.T) {
 	}
 	if len(candidates) != 1 || candidates[0].ID() != "speakyapi" {
 		t.Fatalf("candidates = %#v", candidates)
+	}
+}
+
+func newLoopTestState(provider tts.Provider) *serviceState {
+	return &serviceState{
+		cfg:          serviceConfig{Timeout: time.Second, Workers: 1},
+		providers:    map[string]tts.Provider{"piper": provider},
+		dictionaries: map[string]dictionaryResult{},
+	}
+}
+
+func writePeerLine(t *testing.T, peer net.Conn, line string) {
+	t.Helper()
+	if _, err := peer.Write([]byte(line + "\n")); err != nil {
+		t.Errorf("write to the service connection: %v", err)
+	}
+}
+
+func TestRunServiceConnectionSynthesizesJobsAndStopsOnShutdown(t *testing.T) {
+	provider := &fakeProvider{id: "piper", audio: tts.Audio{Format: tts.FormatWAV, Data: []byte("wav")}}
+	state := newLoopTestState(provider)
+	conn, peer := net.Pipe()
+	defer conn.Close()
+	defer peer.Close()
+	outputPath := filepath.Join(t.TempDir(), "loop.wav")
+
+	finished := make(chan error, 1)
+	go func() {
+		finished <- runServiceConnection(context.Background(), bridgeclient.Wrap(conn, bridgeclient.Options{}), state)
+	}()
+
+	go func() {
+		writePeerLine(t, peer, "")
+		writePeerLine(t, peer, "not json")
+		writePeerLine(t, peer, `{"type":"service.ready","source":"somebody"}`)
+		job, _ := json.Marshal(map[string]any{
+			"type": "tts.synthesize",
+			"data": map[string]any{"job_id": "loop-1", "provider": "piper", "text": "hello", "output_path": outputPath},
+		})
+		// A byte order mark in front of the JSON is tolerated.
+		writePeerLine(t, peer, "\ufeff"+string(job))
+	}()
+
+	var event map[string]any
+	if err := json.NewDecoder(peer).Decode(&event); err != nil {
+		t.Fatal(err)
+	}
+	if event["type"] != "tts.synthesized" || event["subject"] != "loop-1" || event["source"] != serviceID {
+		t.Fatalf("event = %#v", event)
+	}
+	if event["timestamp"] == nil || event["timestamp"] == "" {
+		t.Fatalf("event has no timestamp: %#v", event)
+	}
+	if raw, err := os.ReadFile(outputPath); err != nil || string(raw) != "wav" {
+		t.Fatalf("output = %q err=%v", raw, err)
+	}
+
+	writePeerLine(t, peer, `{"type":"system.shutdown"}`)
+	select {
+	case err := <-finished:
+		if !errors.Is(err, errSystemShutdown) {
+			t.Fatalf("error = %v, want errSystemShutdown", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the loop did not stop on system.shutdown")
+	}
+	if provider.requestCount() != 1 {
+		t.Fatalf("provider requests = %d, want only the one synthesize job", provider.requestCount())
+	}
+}
+
+func TestRunServiceConnectionEndsCleanlyWhenTheBridgeCloses(t *testing.T) {
+	state := newLoopTestState(&fakeProvider{id: "piper"})
+	conn, peer := net.Pipe()
+	defer conn.Close()
+
+	finished := make(chan error, 1)
+	go func() {
+		finished <- runServiceConnection(context.Background(), bridgeclient.Wrap(conn, bridgeclient.Options{}), state)
+	}()
+	_ = peer.Close()
+	select {
+	case err := <-finished:
+		if err != nil {
+			t.Fatalf("error = %v, want nil on a clean close", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the loop did not notice the bridge closing")
+	}
+}
+
+func TestRunServiceConnectionStopsWhenTheContextIsCancelled(t *testing.T) {
+	state := newLoopTestState(&fakeProvider{id: "piper"})
+	conn, peer := net.Pipe()
+	defer conn.Close()
+	defer peer.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	finished := make(chan error, 1)
+	go func() {
+		finished <- runServiceConnection(ctx, bridgeclient.Wrap(conn, bridgeclient.Options{}), state)
+	}()
+	cancel()
+	go writePeerLine(t, peer, `{"type":"service.ready"}`)
+	select {
+	case err := <-finished:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the loop ignored the cancelled context")
+	}
+}
+
+func TestRunServiceConnectionReportsAFullQueue(t *testing.T) {
+	provider := &fakeProvider{id: "piper", waitForCancellation: true}
+	state := newLoopTestState(provider)
+	conn, peer := net.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	finished := make(chan error, 1)
+	go func() {
+		finished <- runServiceConnection(ctx, bridgeclient.Wrap(conn, bridgeclient.Options{}), state)
+	}()
+	outputPath := filepath.Join(t.TempDir(), "x.wav")
+	stopWriter := make(chan struct{})
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		// The single worker is stuck on the first job, so the normal queue fills up.
+		for index := 0; index < synthesisNormalQueueSize+10; index++ {
+			select {
+			case <-stopWriter:
+				return
+			default:
+			}
+			job, _ := json.Marshal(map[string]any{
+				"type": "tts.synthesize",
+				"data": map[string]any{"job_id": fmt.Sprintf("flood-%d", index), "provider": "piper", "text": "x", "output_path": outputPath},
+			})
+			if _, err := peer.Write(append(job, '\n')); err != nil {
+				return
+			}
+		}
+	}()
+	defer func() {
+		close(stopWriter)
+		cancel()
+		_ = peer.Close()
+		_ = conn.Close()
+		<-writerDone
+		select {
+		case <-finished:
+		case <-time.After(5 * time.Second):
+			t.Error("the loop did not stop after cleanup")
+		}
+	}()
+
+	var event map[string]any
+	if err := json.NewDecoder(peer).Decode(&event); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := event["data"].(map[string]any)
+	if event["type"] != "tts.failed" || data["error"] != "tts queue is full" {
+		t.Fatalf("event = %#v, want a queue-full failure", event)
 	}
 }
