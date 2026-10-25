@@ -289,40 +289,28 @@ impl AudioRegistry {
 }
 
 struct BridgeClient {
-    writer: Mutex<tokio::net::tcp::OwnedWriteHalf>,
-    reader: Mutex<BufReader<tokio::net::tcp::OwnedReadHalf>>,
+    writer: haze_bridge_client::BridgeWriter,
+    reader: Mutex<haze_bridge_client::BridgeReader>,
 }
 
 impl BridgeClient {
     async fn connect(addr: &str) -> Result<Self> {
-        let stream = TcpStream::connect(addr)
-            .await
-            .with_context(|| format!("failed to connect to host bridge at {addr}"))?;
-        let (reader, writer) = stream.into_split();
+        let (reader, writer) =
+            haze_bridge_client::connect(addr, &haze_bridge_client::Options::default(), None)
+                .await?;
         Ok(Self {
-            writer: Mutex::new(writer),
-            reader: Mutex::new(BufReader::new(reader)),
+            writer,
+            reader: Mutex::new(reader),
         })
     }
 
     async fn publish(&self, event: Value) -> Result<()> {
-        let mut raw = serde_json::to_vec(&event).context("serialize bridge event")?;
-        raw.push(b'\n');
-        let mut writer = self.writer.lock().await;
-        writer.write_all(&raw).await?;
-        writer.flush().await?;
-        Ok(())
+        self.writer.send(&event).await
     }
 
     async fn read_event(&self) -> Result<Option<Value>> {
-        let mut line = String::new();
         let mut reader = self.reader.lock().await;
-        let read = reader.read_line(&mut line).await?;
-        if read == 0 {
-            return Ok(None);
-        }
-        let value: Value = serde_json::from_str(line.trim()).context("parse bridge event")?;
-        Ok(Some(value))
+        Ok(reader.next_event().await?)
     }
 }
 

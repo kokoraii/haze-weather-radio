@@ -639,6 +639,9 @@ fn prune_replay(replay: &mut VecDeque<(Instant, Vec<u8>)>) {
 }
 
 #[cfg(test)]
+mod conformance;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;

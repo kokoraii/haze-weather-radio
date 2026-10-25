@@ -1,16 +1,12 @@
 //! Event bridge adapter for the location query and overlay contracts.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use haze_bridge_client::{BridgeReader, Options, Registration};
 use serde::Serialize;
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::tcp::OwnedWriteHalf;
-use tokio::net::TcpStream;
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -27,9 +23,13 @@ const SUBSCRIPTIONS: &[&str] = &[
     "location.catalog.rollback.request",
 ];
 
+/// Largest bridge line the location service accepts. Overlay and reload
+/// requests can carry whole catalog descriptions.
+const MAX_BRIDGE_LINE_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Clone)]
 struct BridgeWriter {
-    inner: Arc<Mutex<OwnedWriteHalf>>,
+    inner: haze_bridge_client::BridgeWriter,
 }
 
 impl BridgeWriter {
@@ -51,13 +51,15 @@ impl BridgeWriter {
         if let Some(target) = target.filter(|value| !value.trim().is_empty()) {
             event["target"] = Value::String(target.to_string());
         }
-        let mut raw = serde_json::to_vec(&event).context("failed to serialize location event")?;
-        raw.push(b'\n');
-        let mut writer = self.inner.lock().await;
-        writer.write_all(&raw).await?;
-        writer.flush().await?;
-        Ok(())
+        self.inner
+            .send(&event)
+            .await
+            .context("failed to write location event")
     }
+}
+
+fn registration() -> Registration {
+    Registration::subscriber(CLIENT_ID, SUBSCRIPTIONS).with_source(CLIENT_ID)
 }
 
 pub async fn run(
@@ -73,14 +75,19 @@ pub async fn run(
         if shutdown.is_cancelled() {
             return Ok(());
         }
-        match TcpStream::connect(bridge_addr).await {
-            Ok(stream) => {
+        let options = Options {
+            max_line_bytes: MAX_BRIDGE_LINE_BYTES,
+            ..Options::default()
+        };
+        match haze_bridge_client::connect(bridge_addr, &options, Some(&registration())).await {
+            Ok((reader, writer)) => {
                 info!(
                     bridge = bridge_addr,
                     "location service connected to host bridge"
                 );
                 let result = serve_connection(
-                    stream,
+                    reader,
+                    BridgeWriter { inner: writer },
                     &root_config,
                     locations_config.as_deref(),
                     &manager,
@@ -110,48 +117,22 @@ pub async fn run(
 }
 
 async fn serve_connection(
-    stream: TcpStream,
+    mut reader: BridgeReader,
+    writer: BridgeWriter,
     root_config: &Path,
     locations_config: Option<&Path>,
     manager: &CatalogManager,
     engine: &QueryEngine,
     shutdown: &CancellationToken,
 ) -> Result<()> {
-    let (read, write) = stream.into_split();
-    let writer = BridgeWriter {
-        inner: Arc::new(Mutex::new(write)),
-    };
-    writer
-        .publish(
-            "bridge.client",
-            None,
-            None,
-            &json!({
-                "client_id": CLIENT_ID,
-                "receive_events": true,
-                "subscriptions": SUBSCRIPTIONS,
-            }),
-        )
-        .await?;
     publish_catalog_event(&writer, "location.catalog.ready", manager).await?;
 
-    let mut lines = BufReader::new(read).lines();
     loop {
         tokio::select! {
             () = shutdown.cancelled() => return Ok(()),
-            line = lines.next_line() => {
-                let Some(line) = line? else {
+            event = reader.next_event() => {
+                let Some(event) = event? else {
                     anyhow::bail!("host bridge closed the connection");
-                };
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let event: Value = match serde_json::from_str(&line) {
-                    Ok(value) => value,
-                    Err(err) => {
-                        warn!("location service ignored invalid bridge JSON: {err}");
-                        continue;
-                    }
                 };
                 handle_event(
                     event,

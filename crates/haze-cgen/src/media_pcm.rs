@@ -1,15 +1,13 @@
 use std::collections::{HashMap, VecDeque};
-use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use base64::Engine;
+use haze_bridge_client::{BridgeReader, BridgeWriter, Options, ReadLine, Registration};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio::time::sleep;
 
@@ -380,8 +378,10 @@ pub(crate) async fn run_bridge(
             .stats
             .connection_attempts
             .fetch_add(1, Ordering::Relaxed);
+        let registration = Registration::anonymous_subscriber(&[]).with_source("haze-cgen");
+        let options = bridge_options();
         let connection = tokio::select! {
-            result = TcpStream::connect(&addr) => result,
+            result = haze_bridge_client::connect(&addr, &options, Some(&registration)) => result,
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
                     hub.set_connected(false);
@@ -391,7 +391,7 @@ pub(crate) async fn run_bridge(
             }
         };
         match connection {
-            Ok(stream) => {
+            Ok((reader, writer)) => {
                 if connected_once {
                     hub.inner.stats.reconnects.fetch_add(1, Ordering::Relaxed);
                 }
@@ -399,7 +399,7 @@ pub(crate) async fn run_bridge(
                 hub.set_connected(true);
                 tracing::info!("haze-cgen connected to the media bridge");
                 let connected_at = Instant::now();
-                if let Err(err) = run_connection(stream, &hub, &mut shutdown_rx).await {
+                if let Err(err) = run_connection(reader, writer, &hub, &mut shutdown_rx).await {
                     if !*shutdown_rx.borrow() {
                         tracing::warn!("haze-cgen media bridge disconnected: {err:#}");
                     }
@@ -411,7 +411,7 @@ pub(crate) async fn run_bridge(
             }
             Err(err) => {
                 hub.set_connected(false);
-                tracing::warn!("haze-cgen waiting for media bridge: {err}");
+                tracing::warn!("haze-cgen waiting for media bridge: {err:#}");
             }
         }
         tokio::select! {
@@ -426,28 +426,25 @@ pub(crate) async fn run_bridge(
     }
 }
 
+fn bridge_options() -> Options {
+    Options {
+        max_line_bytes: MAX_BRIDGE_LINE_BYTES,
+        ..Options::default()
+    }
+}
+
+/// Reads PCM events until the bridge closes or shutdown is requested. The
+/// writer is held for the life of the connection: dropping it would close the
+/// socket's write side and the broker would drop this consumer.
 async fn run_connection(
-    stream: TcpStream,
+    mut reader: BridgeReader,
+    _writer: BridgeWriter,
     hub: &MediaPcmHub,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> Result<()> {
-    let (reader, mut writer) = stream.into_split();
-    let mut hello = serde_json::to_vec(&json!({
-        "type": "bridge.client",
-        "source": "haze-cgen",
-        "data": { "receive_events": true },
-    }))?;
-    hello.push(b'\n');
-    writer
-        .write_all(&hello)
-        .await
-        .context("failed to register CGEN media bridge consumer")?;
-
-    let mut reader = BufReader::new(reader);
-    let mut line = Vec::with_capacity(32 * 1024);
     loop {
         let result = tokio::select! {
-            result = read_bounded_line(&mut reader, &mut line) => result,
+            result = reader.next_line() => result,
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
                     return Ok(());
@@ -463,66 +460,7 @@ async fn run_connection(
                     .oversized_lines
                     .fetch_add(1, Ordering::Relaxed);
             }
-            ReadLine::Data => hub.ingest_raw(&line),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReadLine {
-    Data,
-    Oversized,
-    Eof,
-}
-
-async fn read_bounded_line<R>(reader: &mut R, line: &mut Vec<u8>) -> io::Result<ReadLine>
-where
-    R: AsyncBufRead + Unpin,
-{
-    line.clear();
-    let mut oversized = false;
-    loop {
-        let (take, found_newline, eof) = {
-            let available = reader.fill_buf().await?;
-            if available.is_empty() {
-                (0, false, true)
-            } else if let Some(index) = available.iter().position(|byte| *byte == b'\n') {
-                (index + 1, true, false)
-            } else {
-                (available.len(), false, false)
-            }
-        };
-        if eof {
-            return if line.is_empty() && !oversized {
-                Ok(ReadLine::Eof)
-            } else if oversized {
-                Ok(ReadLine::Oversized)
-            } else {
-                Ok(ReadLine::Data)
-            };
-        }
-        if !oversized {
-            let available = reader.fill_buf().await?;
-            if line.len().saturating_add(take) > MAX_BRIDGE_LINE_BYTES {
-                oversized = true;
-                line.clear();
-            } else {
-                line.extend_from_slice(&available[..take]);
-            }
-        }
-        reader.consume(take);
-        if found_newline {
-            if line.last() == Some(&b'\n') {
-                line.pop();
-            }
-            if line.last() == Some(&b'\r') {
-                line.pop();
-            }
-            return if oversized {
-                Ok(ReadLine::Oversized)
-            } else {
-                Ok(ReadLine::Data)
-            };
+            ReadLine::Data => hub.ingest_raw(reader.line()),
         }
     }
 }

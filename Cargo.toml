@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/haze",
+    "crates/haze-bridge-client",
     "crates/haze-cap",
     "crates/haze-cgen",
     "crates/haze-easnet",

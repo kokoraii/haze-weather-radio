@@ -2207,6 +2207,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "haze-bridge-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "haze-media-protocol",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "haze-cap"
 version = "0.1.0"
 dependencies = [
@@ -2214,6 +2226,7 @@ dependencies = [
  "chrono",
  "clap",
  "futures",
+ "haze-bridge-client",
  "quick-xml",
  "reqwest",
  "serde",
@@ -2241,6 +2254,7 @@ dependencies = [
  "gstreamer-app",
  "gstreamer-audio",
  "gstreamer-video",
+ "haze-bridge-client",
  "jpeg-encoder",
  "msdfgen",
  "pollster",
@@ -2265,6 +2279,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "haze-bridge-client",
  "quick-xml",
  "russh",
  "serde",
@@ -2283,6 +2298,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossbeam-channel",
+ "haze-bridge-client",
  "quick-xml",
  "roxmltree",
  "rusqlite",
@@ -2341,6 +2357,7 @@ dependencies = [
  "clap",
  "cpal",
  "dunce",
+ "haze-bridge-client",
  "haze-cap",
  "haze-media",
  "haze-media-protocol",
