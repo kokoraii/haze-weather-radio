@@ -117,6 +117,11 @@ type Config struct {
 				Addr    string `yaml:"addr"`
 				Listen  string `yaml:"listen"`
 				Backend string `yaml:"backend"`
+				// GRPCAddr is haze-media's loopback gRPC control listener.
+				GRPCAddr string `yaml:"grpc_addr"`
+				// ControlTransport selects how haze-web calls haze-media: http (the
+				// default) or grpc.
+				ControlTransport string `yaml:"control_transport"`
 			} `yaml:"media"`
 		} `yaml:"rust"`
 	} `yaml:"services"`

@@ -399,16 +399,16 @@ func (m *ReceiverManager) HandleWebSocket(writer http.ResponseWriter, request *h
 				})
 				continue
 			}
-			mediaServiceURL := mediaServiceBaseURL(m.config)
+			mediaControl := mediaServiceControl(m.config)
 			legacyMediaAvailable := m.media != nil && m.media.Available()
-			if !legacyMediaAvailable && mediaServiceURL == "" {
+			if !legacyMediaAvailable && mediaControl == nil {
 				_ = writeReceiverWS(ctx, connection, map[string]any{
 					"type":   "webrtc_error",
 					"detail": "receiver media bridge is not available",
 				})
 				continue
 			}
-			mediaResult := mediaServiceWebRTCAnswerResultFromBase(ctx, mediaServiceURL, map[string]any{
+			mediaResult := mediaServiceWebRTCAnswerResultWith(ctx, mediaControl, map[string]any{
 				"feed_id":         feedID,
 				"sdp":             offerSDP,
 				"disable_g722":    boolValue(message, "disable_g722"),
@@ -437,7 +437,7 @@ func (m *ReceiverManager) HandleWebSocket(writer http.ResponseWriter, request *h
 			}
 			if !legacyMediaAvailable {
 				detail := "receiver media bridge is not available"
-				if mediaServiceURL != "" {
+				if mediaControl != nil {
 					detail = "haze-media WebRTC service is unavailable and legacy media bridge is not available"
 				}
 				_ = writeReceiverWS(ctx, connection, map[string]any{

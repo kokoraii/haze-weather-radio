@@ -65,10 +65,9 @@ func NewServerWithConfigPath(config Config, configPath string, webroot string) *
 // NewServerWithSurface creates a gateway server constrained to one HTTP surface.
 func NewServerWithSurface(config Config, configPath string, webroot string, surface string) *Server {
 	hostBridgeAddr := os.Getenv("HAZE_HOST_BRIDGE_ADDR")
-	mediaServiceURL := mediaServiceBaseURL(config)
 	mediaBridgeAddr := mediaHubBridgeAddr(config, os.Getenv("HAZE_MEDIA_BRIDGE_ADDR"), hostBridgeAddr)
 	mediaHub := NewMediaHub(mediaBridgeAddr)
-	mediaHub.SetHTTPSource(mediaServiceURL)
+	mediaHub.SetAudioSource(mediaServiceControl(config))
 	bannerHub := NewBannerHub(configPath, hostBridgeAddr)
 	server := &Server{
 		startedAt:           time.Now().UTC(),

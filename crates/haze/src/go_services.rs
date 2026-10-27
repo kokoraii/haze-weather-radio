@@ -66,6 +66,7 @@ struct RustMediaConfig {
     executable: Option<PathBuf>,
     addr: Option<String>,
     listen: Option<String>,
+    grpc_addr: Option<String>,
     backend: Option<String>,
     scheduler: Option<ServiceSchedulerConfig>,
 }
@@ -1383,6 +1384,13 @@ fn service_specs(root: &RootConfig, host: &ServiceHostConfig) -> Vec<ServiceSpec
             .filter(|value| !value.trim().is_empty())
         {
             args.extend(["--listen".to_string(), addr.to_string()]);
+        }
+        if let Some(addr) = media
+            .grpc_addr
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            args.extend(["--grpc-listen".to_string(), addr.to_string()]);
         }
         if let Some(backend) = media
             .backend
@@ -3092,6 +3100,48 @@ services:
         assert!(specs[0].args.contains(&"--bridge".to_string()));
         assert!(specs[0].args.contains(&"--media-bridge".to_string()));
         assert!(specs[0].args.contains(&"127.0.0.1:8097".to_string()));
+        assert!(
+            !specs[0].args.contains(&"--grpc-listen".to_string()),
+            "the gRPC listener stays off unless it is configured"
+        );
+    }
+
+    #[test]
+    fn rust_media_service_passes_the_grpc_listener_address() {
+        let root: RootConfig = serde_yaml::from_str(
+            r#"
+services:
+  rust:
+    media:
+      enabled: true
+      addr: 127.0.0.1:8097
+      grpc_addr: 127.0.0.1:8098
+      control_transport: grpc
+"#,
+        )
+        .expect("config");
+
+        let specs = service_specs(&root, &test_host());
+
+        let args = &specs[0].args;
+        let position = args
+            .iter()
+            .position(|arg| arg == "--grpc-listen")
+            .expect("--grpc-listen is passed");
+        assert_eq!(args[position + 1], "127.0.0.1:8098");
+        let blank: RootConfig = serde_yaml::from_str(
+            r#"
+services:
+  rust:
+    media:
+      enabled: true
+      grpc_addr: "  "
+"#,
+        )
+        .expect("config");
+        assert!(!service_specs(&blank, &test_host())[0]
+            .args
+            .contains(&"--grpc-listen".to_string()));
     }
 
     #[test]

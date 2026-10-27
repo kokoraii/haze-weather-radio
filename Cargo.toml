@@ -4,6 +4,7 @@ members = [
     "crates/haze-bridge-client",
     "crates/haze-cap",
     "crates/haze-cgen",
+    "crates/haze-contracts",
     "crates/haze-easnet",
     "crates/haze-location",
     "crates/haze-media",

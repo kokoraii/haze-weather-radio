@@ -29,6 +29,8 @@ clap = { version = "4", features = ["derive", "env"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 quick-xml = { version = "0.38", features = ["serialize"] }
 hound = "3.5"
+haze-bridge-client = { path = "../haze-bridge-client" }
+haze-contracts = { path = "../haze-contracts" }
 haze-media-protocol = { path = "../haze-media-protocol" }
 libloading = { version = "0.8", optional = true }
 serde = { version = "1", features = ["derive"] }
@@ -37,6 +39,8 @@ serde_yaml = "0.9"
 str0m = { version = "0.21", default-features = false, features = ["aws-lc-rs"] }
 thiserror = "2.0"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.14", default-features = false, features = ["codegen", "router", "transport"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 gstreamer = { version = "0.25.3", optional = true }

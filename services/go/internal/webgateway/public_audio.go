@@ -8,7 +8,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -144,32 +143,16 @@ func writeHTTPAudioHeaders(writer http.ResponseWriter, format httpAudioFormat) {
 }
 
 func (s *Server) proxyMediaServiceAudio(writer http.ResponseWriter, request *http.Request, feedID string, codec string) bool {
-	baseURL := mediaServiceBaseURL(s.config)
-	if baseURL == "" {
+	control := mediaServiceControl(s.config)
+	if control == nil {
 		return false
 	}
-	endpoint, err := url.Parse(baseURL + "/api/v1/feed/audio")
+	response, err := control.FeedAudio(request.Context(), feedID, codec)
 	if err != nil {
-		return false
-	}
-	query := endpoint.Query()
-	query.Set("feed", feedID)
-	query.Set("codec", codec)
-	endpoint.RawQuery = query.Encode()
-	proxyRequest, err := http.NewRequestWithContext(request.Context(), http.MethodGet, endpoint.String(), nil)
-	if err != nil {
-		return false
-	}
-	response, err := http.DefaultClient.Do(proxyRequest)
-	if err != nil {
-		log.Printf("haze-media HTTP audio unavailable: %v", err)
+		log.Printf("haze-media audio unavailable: %v", err)
 		return false
 	}
 	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		log.Printf("haze-media HTTP audio returned %s", response.Status)
-		return false
-	}
 	for key, values := range response.Header {
 		if !proxyAudioResponseHeader(key) {
 			continue

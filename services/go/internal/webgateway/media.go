@@ -1,7 +1,6 @@
 package webgateway
 
 import (
-	"bufio"
 	"context"
 	cryptorand "crypto/rand"
 	"encoding/base64"
@@ -11,9 +10,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
-	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -24,6 +20,8 @@ import (
 	"github.com/pion/interceptor"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
+
+	"github.com/meowraii/haze-weather-radio/services/go/internal/bridgeclient"
 )
 
 const (
@@ -173,7 +171,7 @@ type PCMChunk struct {
 
 type MediaHub struct {
 	addr          string
-	sourceBaseURL string
+	sourceControl mediaControl
 	sourceFeeds   map[string]context.CancelFunc
 	mu            sync.Mutex
 	peerStatsMu   sync.Mutex
@@ -207,16 +205,33 @@ func NewMediaHub(addr string) *MediaHub {
 }
 
 func (h *MediaHub) Available() bool {
-	return h != nil && (h.addr != "" || h.sourceBaseURL != "")
+	if h == nil {
+		return false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.addr != "" || h.sourceControl != nil
 }
 
+// SetHTTPSource sources paced PCM from haze-media's HTTP audio route. An empty
+// URL clears the source.
 func (h *MediaHub) SetHTTPSource(baseURL string) {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if baseURL == "" {
+		h.SetAudioSource(nil)
+		return
+	}
+	h.SetAudioSource(httpMediaControl{baseURL: baseURL})
+}
+
+// SetAudioSource sources paced PCM from haze-media over the given control
+// client. Nil clears the source.
+func (h *MediaHub) SetAudioSource(control mediaControl) {
 	if h == nil {
 		return
 	}
-	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	h.mu.Lock()
-	h.sourceBaseURL = baseURL
+	h.sourceControl = control
 	if h.sourceFeeds == nil {
 		h.sourceFeeds = map[string]context.CancelFunc{}
 	}
@@ -235,8 +250,8 @@ func (h *MediaHub) ensureHTTPSource(feedID string) {
 		return
 	}
 	h.mu.Lock()
-	baseURL := h.sourceBaseURL
-	if baseURL == "" {
+	control := h.sourceControl
+	if control == nil {
 		h.mu.Unlock()
 		return
 	}
@@ -250,37 +265,17 @@ func (h *MediaHub) ensureHTTPSource(feedID string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	h.sourceFeeds[feedID] = cancel
 	h.mu.Unlock()
-	go h.runHTTPPCMSource(ctx, baseURL, feedID)
+	go h.runPCMSource(ctx, control, feedID)
 }
 
-func (h *MediaHub) runHTTPPCMSource(ctx context.Context, baseURL string, feedID string) {
-	endpoint, err := url.Parse(baseURL + "/api/v1/feed/audio")
-	if err != nil {
-		log.Printf("haze-media PCM source disabled for feed %s: %v", feedID, err)
-		return
-	}
-	query := endpoint.Query()
-	query.Set("feed", feedID)
-	query.Set("codec", "raw")
-	endpoint.RawQuery = query.Encode()
-	client := &http.Client{Timeout: 0}
+func (h *MediaHub) runPCMSource(ctx context.Context, control mediaControl, feedID string) {
 	frameBytes := opusFrameSamples * webrtcChannels * 2
 	if frameBytes <= 0 {
 		frameBytes = 1920
 	}
 	for ctx.Err() == nil {
-		request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+		response, err := control.FeedAudio(ctx, feedID, "raw")
 		if err != nil {
-			log.Printf("haze-media PCM source request failed for feed %s: %v", feedID, err)
-			return
-		}
-		response, err := client.Do(request)
-		if err != nil {
-			sleepMedia(ctx, bridgeReconnectDelay)
-			continue
-		}
-		if response.StatusCode < 200 || response.StatusCode >= 300 {
-			_ = response.Body.Close()
 			sleepMedia(ctx, bridgeReconnectDelay)
 			continue
 		}
@@ -831,34 +826,19 @@ func codecPreferences(codec webRTCAudioCodec, payloadType uint8) []webrtc.RTPCod
 }
 
 func (h *MediaHub) run(ctx context.Context) {
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		conn, err := net.DialTimeout("tcp", h.addr, 3*time.Second)
-		if err != nil {
-			sleepMedia(ctx, bridgeReconnectDelay)
-			continue
-		}
-		h.readBridge(ctx, conn)
-		_ = conn.Close()
-		sleepMedia(ctx, bridgeReconnectDelay)
-	}
+	bridgeclient.Reconnect(ctx, bridgeclient.Options{Addr: h.addr}, bridgeReconnectDelay, h.readBridge)
 }
 
-func (h *MediaHub) readBridge(ctx context.Context, conn net.Conn) {
-	scanner := bufio.NewScanner(conn)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-	for scanner.Scan() {
+func (h *MediaHub) readBridge(ctx context.Context, conn *bridgeclient.Conn) {
+	_ = conn.Scan(func(line []byte) bool {
 		if ctx.Err() != nil {
-			return
+			return false
 		}
-		chunk, ok := decodePCMBridgeEvent(scanner.Bytes())
-		if !ok {
-			continue
+		if chunk, ok := decodePCMBridgeEvent(line); ok {
+			h.publish(chunk)
 		}
-		h.publish(chunk)
-	}
+		return true
+	})
 }
 
 func decodePCMBridgeEvent(raw []byte) (PCMChunk, bool) {

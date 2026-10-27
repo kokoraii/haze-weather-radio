@@ -1,4 +1,4 @@
-version: 26.10.01
+version: 26.10.25
 daemon_settings_file: runtime/state/daemonSettings.json
 
 storage:
@@ -31,6 +31,8 @@ services:
     media:
       enabled: true
       addr: "127.0.0.1:8097"
+      grpc_addr: "127.0.0.1:8098" # Loopback gRPC control listener next to the HTTP routes. Blank disables it.
+      control_transport: "http" # How haze-web calls haze-media: http or grpc. Both listeners stay up.
       backend: "auto" # auto, gstreamer, or legacy
       webrtc:
         public_ip: "" # Public IPv4 address advertised to internet listeners behind NAT.
