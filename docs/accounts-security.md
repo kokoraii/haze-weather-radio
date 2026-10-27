@@ -90,6 +90,20 @@ sudo systemctl start haze-weather-radio.service
 
 Do not expose this command through the web panel or a remote shell wrapper. Filesystem access to the runtime and its secret environment is the recovery authority.
 
+### Resetting a forgotten password
+
+`--reset-password` replaces the password of every account whose username matches a name or a case-insensitive wildcard (`*` for any run of characters, `?` for one character). Each match gets a new random 24 character password, printed once to the terminal. The command also clears the account lockout and failure window, advances the authentication version, revokes every session for the account, and writes requested and completed audit events. The audit events never contain the password. The command fails without changing anything when no account matches.
+
+Quote the pattern so the shell does not expand it, and stop the service first, as with `--unlock-account`.
+
+```bash
+sudo -u rai ./bin/haze-web --config ./config.yaml --reset-password admin
+sudo -u rai ./bin/haze-web --config ./config.yaml --reset-password 'ops.*'
+sudo -u rai ./bin/haze-web --config ./config.yaml --reset-password '*'
+```
+
+The new password is not marked as expired, so sign in with it and change it from the profile page. Copy the printed password immediately because Haze stores only its Argon2id hash.
+
 ## Audit integrity
 
 Audit files are written under `logs/access`, `logs/alerts`, and `logs/webpanel`. Every account log is an HMAC-SHA256 chain. Each category also has an HMAC-signed `integrity.sig` checkpoint. Haze verifies existing chains and checkpoints at startup and before append, then fails closed when it detects a mismatch.

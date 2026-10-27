@@ -39,6 +39,7 @@ func run() error {
 	checkCodecs := flag.Bool("check-codecs", false, "print WebRTC codec capabilities and exit")
 	requireOpus := flag.Bool("require-opus", false, "fail --check-codecs unless native Opus is available")
 	unlockAccount := flag.String("unlock-account", "", "locally unlock an account, revoke its sessions, audit the recovery, and exit")
+	resetPassword := flag.String("reset-password", "", "locally reset the password of every account matching a name or wildcard (* and ?) to a random value, print the new passwords, revoke sessions, audit the reset, and exit")
 	flag.Parse()
 
 	if *checkCodecs {
@@ -71,6 +72,24 @@ func run() error {
 	config, err := webgateway.LoadConfig(*configPath)
 	if err != nil {
 		return err
+	}
+	if pattern := strings.TrimSpace(*resetPassword); pattern != "" {
+		if strings.TrimSpace(*unlockAccount) != "" {
+			return fmt.Errorf("--reset-password and --unlock-account cannot be combined")
+		}
+		auth := webgateway.NewAuthManagerWithPath(config, *configPath)
+		defer auth.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		resets, err := auth.ResetAccountPasswords(ctx, pattern)
+		for _, reset := range resets {
+			fmt.Printf("haze-web: account %q new password: %s\n", reset.Username, reset.Password)
+		}
+		if err != nil {
+			return fmt.Errorf("reset passwords matching %q: %w", pattern, err)
+		}
+		log.Printf("haze-web: reset %d account password(s) and revoked all sessions for them", len(resets))
+		return nil
 	}
 	if username := strings.TrimSpace(*unlockAccount); username != "" {
 		auth := webgateway.NewAuthManagerWithPath(config, *configPath)
