@@ -265,3 +265,6 @@ Account mode fails closed if Redis or a required key is unavailable. Generate ea
 - `services/go/`: web panel, TTS, product renderer, playlist, IVR, and webhooks.
 - `bundle/`: portable runtime assets and operator-managed defaults.
 - `scripts/`: build, packaging, and service helpers.
+
+## LLM Assistance Disclaimer
+Haze was programmed with the assistance of a Large Language Model (LLM). If you do not like this, then do not use the program... or do. Whatever you want, because I don't really care.
