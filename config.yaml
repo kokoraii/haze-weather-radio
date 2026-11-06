@@ -1,4 +1,4 @@
-version: 26.10.25
+version: 26.11.06
 daemon_settings_file: runtime/state/daemonSettings.json
 
 storage:

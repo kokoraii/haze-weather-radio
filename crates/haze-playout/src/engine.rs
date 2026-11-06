@@ -26,6 +26,11 @@ use crate::sinks::{sinks_for_feed, Sink};
 use haze_media::{decode_wav, normalize_pcm, silence_chunk, Pcm};
 use memmap2::{Mmap, MmapOptions};
 
+mod lag_stats;
+mod readahead;
+
+use readahead::{FeedReadahead, PcmReadahead};
+
 const SOURCE_ID: &str = "haze-playout";
 const ALERT_QUEUE_DIR: &str = "runtime/queues/alerts";
 // Keep playout's audio and alert timing at 20 ms. The bridge combines these into
@@ -688,6 +693,7 @@ pub(crate) async fn run(options: Options) -> Result<()> {
     if options.bridge_addr.trim().is_empty() {
         anyhow::bail!("missing host event bridge address");
     }
+    let pcm_readahead = PcmReadahead::spawn()?;
 
     loop {
         let cfg = Arc::new(crate::config::load_config(&options.config_path)?);
@@ -697,7 +703,15 @@ pub(crate) async fn run(options: Options) -> Result<()> {
         } else {
             options.media_bridge_addr.trim()
         };
-        match run_connected(Arc::clone(&cfg), connection, media_bridge_addr, &options).await {
+        match run_connected(
+            Arc::clone(&cfg),
+            connection,
+            media_bridge_addr,
+            &options,
+            &pcm_readahead,
+        )
+        .await
+        {
             ConnectedOutcome::Shutdown => return Ok(()),
             ConnectedOutcome::Reconnect => {
                 tracing::warn!("host event bridge disconnected; reconnecting playout service");
@@ -711,6 +725,7 @@ async fn run_connected(
     connection: bridge::BridgeConnection,
     media_bridge_addr: &str,
     options: &Options,
+    pcm_readahead: &PcmReadahead,
 ) -> ConnectedOutcome {
     let bridge::BridgeConnection {
         client,
@@ -738,6 +753,7 @@ async fn run_connected(
         session_tasks.cancellation.clone(),
     ));
     spawn_audio_cache_maintenance(&session_tasks, &audio_cache);
+    session_tasks.spawn(lag_stats::run_summary(cfg.enabled_feeds().count()));
     for feed in cfg.enabled_feeds().cloned() {
         let media_client = match bridge::connect_publish_only_retry(media_bridge_addr).await {
             Ok(client) => client,
@@ -756,6 +772,7 @@ async fn run_connected(
             media_client.clone(),
             feed,
             Arc::clone(&audio_cache),
+            pcm_readahead.clone(),
             Arc::clone(&routine_preparation),
             Arc::clone(&priority_preparation),
             &session_tasks,
@@ -1852,6 +1869,7 @@ impl FeedHandle {
         media_client: BridgeClient,
         feed: FeedConfig,
         audio_cache: Arc<AudioCache>,
+        pcm_readahead: PcmReadahead,
         routine_preparation: Arc<Semaphore>,
         priority_preparation: Arc<Semaphore>,
         tasks: &SessionTasks,
@@ -1921,6 +1939,7 @@ impl FeedHandle {
                 after_current_action: None,
                 paused: false,
                 tasks: tasks.clone(),
+                pcm_readahead,
             }
             .run(tasks.cancellation.clone()),
         );
@@ -1956,6 +1975,7 @@ struct FeedRunner {
     after_current_action: Option<AfterCurrentAction>,
     paused: bool,
     tasks: SessionTasks,
+    pcm_readahead: PcmReadahead,
 }
 
 impl FeedRunner {
@@ -2027,6 +2047,7 @@ impl FeedRunner {
         let mut out = vec![0u8; chunk.len()];
         let mut position = 0usize;
         let mut gap_until = Instant::now();
+        let mut readahead = FeedReadahead::new(self.pcm_readahead.clone(), sample_rate, channels);
 
         loop {
             tokio::select! {
@@ -2255,18 +2276,20 @@ impl FeedRunner {
                             duration_sample_frames(dropped_backlog, sample_rate),
                         );
                         publish_builder.mark_discontinuity();
-                    }
-                    if dropped_backlog > Duration::ZERO
-                        && dropped_backlog >= realtime_lag_warn_backlog()
-                        && last_lag_log.elapsed() >= Duration::from_secs(10)
-                    {
-                        tracing::warn!(
-                            feed_id = self.feed.id,
-                            elapsed_ms = elapsed.as_millis(),
-                            backlog_ms = dropped_backlog.as_millis(),
-                            "playout tick lagged; dropping missed realtime audio instead of bursting stale chunks"
-                        );
-                        last_lag_log = Instant::now();
+                        let thread_major_faults =
+                            lag_stats::record_tick_lag(elapsed, dropped_backlog);
+                        if dropped_backlog >= realtime_lag_warn_backlog()
+                            && last_lag_log.elapsed() >= Duration::from_secs(10)
+                        {
+                            tracing::warn!(
+                                feed_id = self.feed.id,
+                                elapsed_ms = elapsed.as_millis(),
+                                backlog_ms = dropped_backlog.as_millis(),
+                                thread_major_faults,
+                                "playout tick lagged; dropping missed realtime audio instead of bursting stale chunks"
+                            );
+                            last_lag_log = Instant::now();
+                        }
                     }
 
                     debug_assert_eq!(chunks_due, 1);
@@ -2403,12 +2426,15 @@ impl FeedRunner {
                                 }
                             }
                         }
+                        let pending_primed =
+                            readahead.prime_pending(pending.as_ref(), &segment_groups, tick_now);
                         let pending_can_start = pending
                             .as_ref()
                             .is_some_and(|item| item_can_start(item, self.paused));
                         if live_breakin.is_none()
                             && current.is_none()
                             && pending_can_start
+                            && pending_primed
                             && tick_now >= gap_until
                         {
                             if let Some(item) = pending.as_ref() {
@@ -2427,6 +2453,13 @@ impl FeedRunner {
                                 }
                             }
                         }
+                        readahead.refresh(
+                            current.as_ref(),
+                            position,
+                            pending.as_ref(),
+                            &segment_groups,
+                            tick_now,
+                        );
 
                         out.fill(0);
                         let mut breakin_drained = false;
@@ -6070,7 +6103,7 @@ mod tests {
         test_audio_item_with_pcm(id, title, vec![1; 16])
     }
 
-    fn test_audio_item_with_pcm(id: &str, title: &str, pcm: Vec<u8>) -> AudioItem {
+    pub(super) fn test_audio_item_with_pcm(id: &str, title: &str, pcm: Vec<u8>) -> AudioItem {
         AudioItem {
             id: id.to_string(),
             package_id: "forecast".to_string(),
@@ -6110,7 +6143,7 @@ mod tests {
         }
     }
 
-    fn pcm16(samples: &[i16]) -> Vec<u8> {
+    pub(super) fn pcm16(samples: &[i16]) -> Vec<u8> {
         samples
             .iter()
             .flat_map(|sample| sample.to_le_bytes())
@@ -6135,7 +6168,7 @@ mod tests {
         }
     }
 
-    fn test_group_segment(
+    pub(super) fn test_group_segment(
         index: usize,
         samples: &[i16],
         pause_after_ms: u64,
@@ -6149,7 +6182,7 @@ mod tests {
         }
     }
 
-    fn test_group_revision(
+    pub(super) fn test_group_revision(
         queue_id: &str,
         revision: u64,
         expected_segments: usize,
@@ -6163,7 +6196,7 @@ mod tests {
         }
     }
 
-    fn test_group_item(group: Arc<SegmentGroup>) -> AudioItem {
+    pub(super) fn test_group_item(group: Arc<SegmentGroup>) -> AudioItem {
         AudioItem {
             id: group.queue_id.clone(),
             package_id: group.package_id.clone(),
