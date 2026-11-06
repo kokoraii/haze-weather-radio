@@ -123,6 +123,12 @@ type Config struct {
 				// default) or grpc.
 				ControlTransport string `yaml:"control_transport"`
 			} `yaml:"media"`
+			// NetAlert is haze-netalert's WebSocket listener, proxied at
+			// /api/v1/netalert and /api/public/v1/netalert.
+			NetAlert struct {
+				Enabled bool   `yaml:"enabled"`
+				Addr    string `yaml:"addr"`
+			} `yaml:"netalert"`
 		} `yaml:"rust"`
 	} `yaml:"services"`
 }

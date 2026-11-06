@@ -546,7 +546,9 @@ async function changeOwnPassword() {
     try {
         await apiCommand('profile.password.change', { current_password: current, new_password: next });
         setStatus('Password changed. Sign in again with the new password.', 'ok');
-        window.setTimeout(() => { window.location.href = '/login?next=%2Fadmin%23%2Faccounts'; }, 900);
+        // Land on the panel home: for non-admin accounts the Accounts view is just
+        // this password form, which reads as the change prompt still being active.
+        window.setTimeout(() => { window.location.href = '/login?next=%2Fadmin'; }, 900);
     } catch (error) {
         setStatus(error.message || 'Unable to change password.', 'err');
     }

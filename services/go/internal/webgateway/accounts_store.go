@@ -67,6 +67,9 @@ type Account struct {
 	mfaLastStep                int64
 	authVersion                int64
 	failedLoginWindowStartedAt time.Time
+	// passwordChangeForced is set by a CLI recovery reset so the generated
+	// password must be replaced at the next sign-in.
+	passwordChangeForced bool
 }
 
 type accountStore struct {
@@ -103,6 +106,7 @@ CREATE TABLE IF NOT EXISTS users (
 	mfa_last_used_step INTEGER NOT NULL DEFAULT 0,
 	auth_version INTEGER NOT NULL DEFAULT 1,
 	is_admin INTEGER NOT NULL DEFAULT 0,
+	password_change_forced INTEGER NOT NULL DEFAULT 0,
     cidr_whitelist TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -153,6 +157,7 @@ CREATE TABLE IF NOT EXISTS users (
 	mfa_last_used_step bigint NOT NULL DEFAULT 0,
 	auth_version bigint NOT NULL DEFAULT 1,
 	is_admin boolean NOT NULL DEFAULT false,
+	password_change_forced boolean NOT NULL DEFAULT false,
     cidr_whitelist jsonb NOT NULL DEFAULT '[]'::jsonb,
     created_at text NOT NULL,
     updated_at text NOT NULL
@@ -267,7 +272,8 @@ func ensureAccountSecurityColumns(ctx context.Context, db *sql.DB, dialect strin
 		if _, err := db.ExecContext(ctx, `
 ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_version bigint NOT NULL DEFAULT 1;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_login_window_started_at text;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS blocked_event_codes jsonb NOT NULL DEFAULT '[]'::jsonb;`); err != nil {
+ALTER TABLE users ADD COLUMN IF NOT EXISTS blocked_event_codes jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password_change_forced boolean NOT NULL DEFAULT false;`); err != nil {
 			return fmt.Errorf("migrate account security columns: %w", err)
 		}
 		return nil
@@ -305,6 +311,11 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS blocked_event_codes jsonb NOT NULL DE
 	if !found["blocked_event_codes"] {
 		if _, err := db.ExecContext(ctx, `ALTER TABLE users ADD COLUMN blocked_event_codes TEXT NOT NULL DEFAULT '[]'`); err != nil {
 			return fmt.Errorf("migrate account blocked event codes: %w", err)
+		}
+	}
+	if !found["password_change_forced"] {
+		if _, err := db.ExecContext(ctx, `ALTER TABLE users ADD COLUMN password_change_forced INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("migrate account forced password change: %w", err)
 		}
 	}
 	return nil
@@ -442,7 +453,7 @@ id, username, password_hash, sender_id, force_sender_id, last_ip, last_login_at,
 password_changed_at, allow_origination, allowed_originators, blocked_event_codes, force_originator_name,
 originator_name_text, include_ip_in_brackets, can_view_logs, allow_persistent_sessions,
 password_expiry_days, allow_user_pw_change, logging_enabled, account_locked,
-failed_login_attempts, failed_login_window_started_at, mfa_secret, mfa_enabled, mfa_last_used_step, auth_version, is_admin, cidr_whitelist, created_at, updated_at`
+failed_login_attempts, failed_login_window_started_at, mfa_secret, mfa_enabled, mfa_last_used_step, auth_version, is_admin, password_change_forced, cidr_whitelist, created_at, updated_at`
 
 type rowScanner interface {
 	Scan(dest ...any) error
@@ -465,7 +476,7 @@ func scanAccount(row rowScanner) (Account, error) {
 		&account.CanViewLogs, &account.AllowPersistentSessions, &account.PasswordExpiryDays,
 		&account.AllowUserPasswordChange, &account.LoggingEnabled, &account.AccountLocked,
 		&account.FailedLoginAttempts, &failedWindow, &mfaSecret, &account.MFAEnabled, &account.mfaLastStep, &account.authVersion, &account.IsAdmin,
-		&cidrsJSON, &created, &updated,
+		&account.passwordChangeForced, &cidrsJSON, &created, &updated,
 	)
 	if err != nil {
 		return Account{}, err
@@ -569,11 +580,13 @@ WHERE id=?`), account.Username, nullText(account.SenderID), account.ForceSenderI
 	return nil
 }
 
-func (s *accountStore) SetPassword(ctx context.Context, accountID string, passwordHash string) error {
+// SetPassword replaces an account's password on an administrator's behalf.
+// forceChange makes the account pick its own password at the next sign-in.
+func (s *accountStore) SetPassword(ctx context.Context, accountID string, passwordHash string, forceChange bool) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
 	result, err := s.db.ExecContext(ctx, s.bind(`
-UPDATE users SET password_hash=?, password_changed_at=?, failed_login_attempts=0,
-	failed_login_window_started_at=NULL, account_locked=false, auth_version=auth_version+1, updated_at=? WHERE id=?`), passwordHash, time.Now().UTC().Format(time.RFC3339Nano),
-		time.Now().UTC().Format(time.RFC3339Nano), accountID)
+UPDATE users SET password_hash=?, password_changed_at=?, password_change_forced=?, failed_login_attempts=0,
+	failed_login_window_started_at=NULL, account_locked=false, auth_version=auth_version+1, updated_at=? WHERE id=?`), passwordHash, now, forceChange, now, accountID)
 	if err != nil {
 		return fmt.Errorf("set account password: %w", err)
 	}
@@ -586,7 +599,7 @@ func (s *accountStore) SetPasswordIfAuthVersion(ctx context.Context, accountID s
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	result, err := s.db.ExecContext(ctx, s.bind(`
-UPDATE users SET password_hash=?, password_changed_at=?, failed_login_attempts=0,
+UPDATE users SET password_hash=?, password_changed_at=?, password_change_forced=false, failed_login_attempts=0,
 	failed_login_window_started_at=NULL, account_locked=false, auth_version=auth_version+1, updated_at=?
 WHERE id=? AND auth_version=? AND account_locked=false AND allow_user_pw_change=true`), passwordHash, now, now, accountID, expectedVersion)
 	if err != nil {

@@ -106,7 +106,7 @@ func newService(cfg loadedConfig, bridge *bridgeClient, options Options) *Servic
 		feeds:              feeds,
 		preparations:       newPreparationCoordinator(0, 0),
 		preparationStates:  make(map[string]*feedPreparationState, len(feeds)),
-		maxPriorityPending: priorityPreparationBacklog,
+		maxPriorityPending: priorityPreparationBacklogFor(len(feeds)),
 	}
 }
 
@@ -223,6 +223,7 @@ func (s *Service) handleEvent(ctx context.Context, event map[string]any) {
 				continue
 			}
 			if err := s.enqueuePriorityPreparation(ctx, planner, data); err != nil {
+				log.Printf("playlist %s rejected priority alert from %s: %v", planner.feed.ID, stringAt(event, "source"), err)
 				planner.publishAutomationDispatchStatus(data, "failed", err.Error())
 				continue
 			}
@@ -288,12 +289,25 @@ func (s *Service) handleEvent(ctx context.Context, event map[string]any) {
 	}
 }
 
+// shouldDeferCAPPlayoutToRust reports whether Rust playout owns a priority
+// alert event. Rust playout routes CAP alerts itself, so CAP-derived dispatches
+// and cancellations are left to it. Operator originations (scheduled
+// automations and web panel alerts) have no Rust consumer and stay here.
 func shouldDeferCAPPlayoutToRust(rustPlayoutEnabled bool, event map[string]any) bool {
 	if !rustPlayoutEnabled {
 		return false
 	}
 	switch stringAt(event, "type") {
 	case "cap.alert.broadcast.requested", "cap.alert.cancelled":
+		return !operatorOriginatedAlert(event)
+	default:
+		return false
+	}
+}
+
+func operatorOriginatedAlert(event map[string]any) bool {
+	switch stringAt(event, "source") {
+	case "automation", "haze-web":
 		return true
 	default:
 		return false

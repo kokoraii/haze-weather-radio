@@ -153,7 +153,7 @@ func (s *wsSession) accountCommand(command string, payload map[string]any) (any,
 		if err := s.auditWebpanel(actor, "PASSWORD_RESET_REQUESTED_BY_ADMIN", account, nil); err != nil {
 			return nil, err
 		}
-		if err := s.auth.accounts.store.SetPassword(ctx, account.ID, hash); err != nil {
+		if err := s.auth.accounts.store.SetPassword(ctx, account.ID, hash, false); err != nil {
 			return nil, err
 		}
 		s.auth.accounts.ResetLoginLimits(ctx, account.Username, account.LastIP)

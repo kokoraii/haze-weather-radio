@@ -670,7 +670,7 @@ func (h *accountAuth) Login(ctx context.Context, input LoginInput) (LoginResult,
 	if persistent {
 		expiresAt = now.Add(h.persistentTTL)
 	}
-	passwordChangeRequired := passwordExpired(account, now)
+	passwordChangeRequired := mustChangePassword(account, now)
 	if passwordChangeRequired && !account.AllowUserPasswordChange {
 		_ = h.audit.Append("access", AuditEvent{
 			Event: "PASSWORD_RESET_REQUIRED", ActorID: account.ID, ActorUsername: account.Username,
@@ -892,7 +892,7 @@ func (h *accountAuth) Authenticate(request *http.Request) (Identity, error) {
 		_ = h.sessions.Delete(ctx, rawSessionID)
 		return Identity{}, &AuthError{Code: "session_revoked", Detail: "The account credentials or session policy changed.", HTTPStatus: http.StatusUnauthorized}
 	}
-	passwordChangeRequired = passwordExpired(account, now)
+	passwordChangeRequired = mustChangePassword(account, now)
 	if now.Sub(session.LastSeenAt) >= 30*time.Second {
 		if err := h.sessions.Touch(ctx, rawSessionID, now); err != nil {
 			return Identity{}, &AuthError{Code: "session_unavailable", Detail: "The session registry is unavailable.", HTTPStatus: http.StatusServiceUnavailable}
@@ -1466,6 +1466,12 @@ func cleanUserAgent(request *http.Request) string {
 		value = value[:512]
 	}
 	return value
+}
+
+// mustChangePassword reports whether a signed-in account is limited to
+// choosing a new password, either after a recovery reset or on expiry.
+func mustChangePassword(account Account, now time.Time) bool {
+	return account.passwordChangeForced || passwordExpired(account, now)
 }
 
 func passwordExpired(account Account, now time.Time) bool {

@@ -166,8 +166,40 @@ type Options struct {
 
 // Presentation contains rendered, cacheable views derived from the packet.
 type Presentation struct {
-	SpeechText string `json:"speech_text,omitempty"`
-	BannerText string `json:"banner_text,omitempty"`
+	SpeechText string      `json:"speech_text,omitempty"`
+	BannerText string      `json:"banner_text,omitempty"`
+	Banner     *BannerView `json:"banner,omitempty"`
+}
+
+// BannerView is the pre-rendered on-air banner card for one feed. Product
+// render fills it once so haze-netalert, the banner page, and CGEN relay the
+// same text, timing, and colors instead of rebuilding them.
+type BannerView struct {
+	Identifier         string              `json:"identifier"`
+	FeedID             string              `json:"feed_id,omitempty"`
+	FeedName           string              `json:"feed_name,omitempty"`
+	DisplayID          string              `json:"display_id,omitempty"`
+	Headline           string              `json:"headline"`
+	Issuer             string              `json:"issuer"`
+	Event              string              `json:"event"`
+	Severity           string              `json:"severity"`
+	Urgency            string              `json:"urgency,omitempty"`
+	Certainty          string              `json:"certainty,omitempty"`
+	Areas              []string            `json:"areas"`
+	AreaText           string              `json:"area_text"`
+	CanonicalLocations []LocationReference `json:"canonical_locations,omitempty"`
+	ReceivedAt         string              `json:"received_at,omitempty"`
+	EffectiveAt        string              `json:"effective_at,omitempty"`
+	OnsetAt            string              `json:"onset_at,omitempty"`
+	ExpiresAt          string              `json:"expires_at,omitempty"`
+	OnsetDisplay       string              `json:"onset_display,omitempty"`
+	ExpiresDisplay     string              `json:"expires_display,omitempty"`
+	Description        string              `json:"description,omitempty"`
+	Instruction        string              `json:"instruction,omitempty"`
+	Message            string              `json:"message"`
+	SourceKind         string              `json:"source_kind,omitempty"`
+	BackgroundColor    string              `json:"background_color"`
+	BackgroundGradient []string            `json:"background_gradient"`
 }
 
 // Normalize returns a copy with stable defaults and compact repeated values.

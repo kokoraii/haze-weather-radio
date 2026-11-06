@@ -57,7 +57,7 @@ func (c *bridgeClient) readLoop() {
 	defer close(c.events)
 	_ = c.bridge.ReadMessages(func(message map[string]any) bool {
 		switch stringAt(message, "type") {
-		case "cap.alert.received", "product.render.request", "wx.on_demand.request", "lead.config.updated", "system.shutdown":
+		case "cap.alert.received", "product.render.request", "wx.on_demand.request", alertSpeechRequestEvent, "lead.config.updated", "system.shutdown":
 		default:
 			return true
 		}

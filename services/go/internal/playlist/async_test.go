@@ -688,6 +688,16 @@ func TestPriorityPreparationBacklogIsBoundedAndReportsDrop(t *testing.T) {
 	}
 }
 
+func TestPriorityPreparationBacklogFitsNetworkWideAlert(t *testing.T) {
+	if got := priorityPreparationBacklogFor(10); got != priorityPreparationBacklog {
+		t.Fatalf("small network backlog = %d, want floor %d", got, priorityPreparationBacklog)
+	}
+	// 76 feeds is the live CWRS network; one RWT targets every feed at once.
+	if got := priorityPreparationBacklogFor(76); got < 76 {
+		t.Fatalf("backlog %d cannot hold one alert for 76 feeds", got)
+	}
+}
+
 func TestPriorityPreparationIsOrderedPerFeed(t *testing.T) {
 	service, planner := newAsyncTestService(t, []string{"sk-0001"}, 1, 1)
 	started := make(chan string, 2)

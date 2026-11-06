@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -45,6 +46,14 @@ const (
 
 var errSystemShutdown = errors.New("system shutdown requested")
 
+// serviceRegistration limits bridge delivery to the two events the service
+// loop handles, which also keeps a remote link free of unrelated traffic.
+var serviceRegistration = bridgeclient.Registration{
+	ClientID:      serviceID,
+	ReceiveEvents: true,
+	Subscriptions: []string{"tts.synthesize", "system.shutdown"},
+}
+
 func main() {
 	log.SetOutput(os.Stdout)
 	log.SetFlags(0)
@@ -77,6 +86,7 @@ func run() error {
 	listVoices := flag.Bool("list-voices", false, "list provider voices as JSON")
 	service := flag.Bool("service", false, "run as a host-bridge TTS service")
 	bridge := flag.String("bridge", os.Getenv("HAZE_HOST_BRIDGE_ADDR"), "host bridge address")
+	listen := flag.String("listen", "", "with --service, wait for a remote Haze daemon on this host:port instead of dialing --bridge")
 	outDir := flag.String("out-dir", filepath.Join("managed", "audio", "tts"), "default service output directory")
 	cacheDir := flag.String("cache-dir", "", "persistent synthesis cache directory; empty disables the persistent cache")
 	cacheMaxBytes := flag.Int64("cache-max-bytes", 0, "maximum persistent synthesis cache size in bytes; 0 is unlimited")
@@ -98,7 +108,7 @@ func run() error {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 		defer stop()
 		ctx = processguard.WithParent(ctx)
-		return runService(ctx, serviceConfig{
+		cfg := serviceConfig{
 			BridgeAddr:      *bridge,
 			Readers:         *readersPath,
 			Dictionary:      *dictionaryPath,
@@ -113,7 +123,11 @@ func run() error {
 			Workers:         maxInt(1, *workers),
 			SpeakyAPIURL:    *speakyAPIURL,
 			RuntimeIdle:     *runtimeIdleTimeout,
-		})
+		}
+		if strings.TrimSpace(*listen) != "" {
+			return runListener(ctx, cfg, *listen)
+		}
+		return runService(ctx, cfg)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
@@ -191,11 +205,17 @@ type serviceConfig struct {
 }
 
 type serviceState struct {
-	ctx            context.Context
-	cfg            serviceConfig
-	providers      map[string]tts.Provider
-	readers        []tts.Reader
-	readersErr     error
+	ctx        context.Context
+	cfg        serviceConfig
+	providers  map[string]tts.Provider
+	readers    []tts.Reader
+	readersErr error
+	// pushedDictionary is dictionary.json content sent by a remote Haze
+	// daemon. Nil reads cfg.Dictionary from disk.
+	pushedDictionary []byte
+	// inline returns audio in tts.synthesized as output_b64 instead of writing
+	// output_path, for a daemon that does not share this machine's disk.
+	inline         bool
 	dictionaries   map[string]dictionaryResult
 	synthesisCache map[[sha256.Size]byte]synthesisCacheEntry
 	providerHealth map[string]*providerHealthStatus
@@ -252,26 +272,9 @@ func runService(ctx context.Context, cfg serviceConfig) error {
 	if strings.TrimSpace(cfg.BridgeAddr) == "" {
 		return errors.New("missing host bridge address")
 	}
-	if strings.TrimSpace(cfg.Language) == "" {
-		cfg.Language = "en-US"
-	}
-	if cfg.Timeout <= 0 {
-		cfg.Timeout = 60 * time.Second
-	}
-	if strings.TrimSpace(cfg.Timezone) == "" {
-		cfg.Timezone = "Local"
-	}
-	if cfg.CacheMaxBytes < 0 {
-		return errors.New("cache max bytes cannot be negative")
-	}
-	if cfg.CacheMaxEntries < 0 {
-		return errors.New("cache max entries cannot be negative")
-	}
-	if strings.TrimSpace(cfg.CacheDir) != "" {
-		cfg.CacheDir = filepath.Clean(cfg.CacheDir)
-		if err := os.MkdirAll(cfg.CacheDir, 0o755); err != nil {
-			return fmt.Errorf("create synthesis cache directory: %w", err)
-		}
+	cfg, err := prepareServiceConfig(cfg)
+	if err != nil {
+		return err
 	}
 	state, err := newServiceState(ctx, cfg)
 	if err != nil {
@@ -281,7 +284,7 @@ func runService(ctx context.Context, cfg serviceConfig) error {
 	defer stopPruner()
 
 	for ctx.Err() == nil {
-		conn, err := bridgeclient.Dial(ctx, bridgeclient.Options{Addr: cfg.BridgeAddr})
+		conn, err := bridgeclient.Dial(ctx, bridgeclient.Options{Addr: cfg.BridgeAddr, Register: &serviceRegistration})
 		if err != nil {
 			sleepOrDone(ctx, time.Second)
 			continue
@@ -316,6 +319,32 @@ func runService(ctx context.Context, cfg serviceConfig) error {
 		sleepOrDone(ctx, time.Second)
 	}
 	return nil
+}
+
+// prepareServiceConfig fills service defaults and creates the cache directory.
+func prepareServiceConfig(cfg serviceConfig) (serviceConfig, error) {
+	if strings.TrimSpace(cfg.Language) == "" {
+		cfg.Language = "en-US"
+	}
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = 60 * time.Second
+	}
+	if strings.TrimSpace(cfg.Timezone) == "" {
+		cfg.Timezone = "Local"
+	}
+	if cfg.CacheMaxBytes < 0 {
+		return cfg, errors.New("cache max bytes cannot be negative")
+	}
+	if cfg.CacheMaxEntries < 0 {
+		return cfg, errors.New("cache max entries cannot be negative")
+	}
+	if strings.TrimSpace(cfg.CacheDir) != "" {
+		cfg.CacheDir = filepath.Clean(cfg.CacheDir)
+		if err := os.MkdirAll(cfg.CacheDir, 0o755); err != nil {
+			return cfg, fmt.Errorf("create synthesis cache directory: %w", err)
+		}
+	}
+	return cfg, nil
 }
 
 func startRuntimePruner(ctx context.Context, providers map[string]tts.Provider, maxIdle time.Duration) func() {
@@ -564,7 +593,13 @@ func (s *serviceState) dictionary(language string) (tts.Dictionary, error) {
 	}
 	s.mu.Unlock()
 
-	dictionary, err := tts.LoadDictionary(s.cfg.Dictionary, language)
+	var dictionary tts.Dictionary
+	var err error
+	if s.pushedDictionary != nil {
+		dictionary, err = tts.ParseDictionary(s.pushedDictionary, language)
+	} else {
+		dictionary, err = tts.LoadDictionary(s.cfg.Dictionary, language)
+	}
 	s.mu.Lock()
 	s.dictionaries[key] = dictionaryResult{Dictionary: dictionary, Err: err}
 	s.mu.Unlock()
@@ -643,23 +678,37 @@ func (s *serviceState) persistSynthesis(key [sha256.Size]byte, entry synthesisCa
 		return entry, nil
 	}
 	audioPath, _ := s.persistentCachePaths(key)
-	if err := writeFileAtomic(audioPath, data, 0o644); err != nil {
+	cacheFilesMu.Lock()
+	err := writeFileAtomic(audioPath, data, 0o644)
+	cacheFilesMu.Unlock()
+	if err != nil {
 		return synthesisCacheEntry{}, err
 	}
 	entry.OutputPath = audioPath
 	entry.LastUsed = time.Now()
 	if err := s.writePersistentMetadata(key, entry); err != nil {
+		cacheFilesMu.Lock()
 		_ = os.Remove(audioPath)
+		cacheFilesMu.Unlock()
 		return synthesisCacheEntry{}, err
 	}
 	s.prunePersistentCache()
 	return entry, nil
 }
 
+// cacheFilesMu serializes access to files in the persistent synthesis cache.
+// Windows refuses to rename over a file another worker has open, so
+// concurrent cache hits on one entry failed with "Access is denied". It is
+// package level because a replaced remote link's state shares the directory
+// with the new one.
+var cacheFilesMu sync.Mutex
+
 func (s *serviceState) loadPersistentSynthesis(key [sha256.Size]byte) (synthesisCacheEntry, bool) {
 	if strings.TrimSpace(s.cfg.CacheDir) == "" {
 		return synthesisCacheEntry{}, false
 	}
+	cacheFilesMu.Lock()
+	defer cacheFilesMu.Unlock()
 	audioPath, metadataPath := s.persistentCachePaths(key)
 	raw, err := os.ReadFile(metadataPath)
 	if err != nil {
@@ -707,6 +756,8 @@ func (s *serviceState) writePersistentMetadata(key [sha256.Size]byte, entry synt
 	if err != nil {
 		return err
 	}
+	cacheFilesMu.Lock()
+	defer cacheFilesMu.Unlock()
 	return writeFileAtomic(metadataPath, raw, 0o644)
 }
 
@@ -726,6 +777,8 @@ func (s *serviceState) prunePersistentCache() {
 	if strings.TrimSpace(s.cfg.CacheDir) == "" || (s.cfg.CacheMaxEntries == 0 && s.cfg.CacheMaxBytes == 0) {
 		return
 	}
+	cacheFilesMu.Lock()
+	defer cacheFilesMu.Unlock()
 	metadataFiles, err := filepath.Glob(filepath.Join(s.cfg.CacheDir, "*.json"))
 	if err != nil {
 		return
@@ -891,31 +944,39 @@ func handleSynthesisJob(ctx context.Context, conn *bridgeclient.Conn, state *ser
 	targetChannels := intValue(message, data, "target_channels", 0)
 	outputPath := firstText(message, data, "output_path", "out")
 	if outputPath == "" {
+		if state.inline {
+			// The daemon link always names the file it will write on its side.
+			state.publishTTSError(conn, jobID, "remote synthesis request has no output_path")
+			return
+		}
 		outputPath = filepath.Join(cfg.OutDir, sanitizeFileName(jobID)+".wav")
 	}
-	if err := os.MkdirAll(filepath.Dir(outputPath), 0o755); err != nil {
-		state.publishTTSError(conn, jobID, err.Error())
-		return
+	if !state.inline {
+		if err := os.MkdirAll(filepath.Dir(outputPath), 0o755); err != nil {
+			state.publishTTSError(conn, jobID, err.Error())
+			return
+		}
 	}
 	cacheKey := synthesisKey(providerID, reader.ID, targetSampleRate, targetChannels, request)
 	if cached, ok := state.cachedSynthesis(cacheKey); ok {
-		if err := materializeCachedAudio(cached.OutputPath, outputPath); err == nil {
+		result := map[string]any{
+			"job_id":             jobID,
+			"output_path":        outputPath,
+			"bytes":              cached.Bytes,
+			"format":             cached.Format,
+			"sample_rate":        cached.SampleRate,
+			"channels":           cached.Channels,
+			"provider":           cached.ProviderID,
+			"reader_id":          cached.ReaderID,
+			"voice_id":           cached.VoiceID,
+			"language":           cached.Language,
+			"cache_hit":          true,
+			"backup_used":        backupUsed,
+			"requested_provider": requestedProviderID,
+		}
+		if err := state.deliverCachedAudio(cached.OutputPath, outputPath, result); err == nil {
 			state.storeSynthesis(cacheKey, cached)
-			_ = state.publishServiceEvent(conn, "tts.synthesized", jobID, map[string]any{
-				"job_id":             jobID,
-				"output_path":        outputPath,
-				"bytes":              cached.Bytes,
-				"format":             cached.Format,
-				"sample_rate":        cached.SampleRate,
-				"channels":           cached.Channels,
-				"provider":           cached.ProviderID,
-				"reader_id":          cached.ReaderID,
-				"voice_id":           cached.VoiceID,
-				"language":           cached.Language,
-				"cache_hit":          true,
-				"backup_used":        backupUsed,
-				"requested_provider": requestedProviderID,
-			})
+			_ = state.publishServiceEvent(conn, "tts.synthesized", jobID, result)
 			return
 		}
 	}
@@ -943,7 +1004,22 @@ func handleSynthesisJob(ctx context.Context, conn *bridgeclient.Conn, state *ser
 		state.publishTTSError(conn, jobID, "synthesis request expired before output was written")
 		return
 	}
-	if err := writeFileAtomic(outputPath, audio.Data, 0o644); err != nil {
+	result := map[string]any{
+		"job_id":             jobID,
+		"output_path":        outputPath,
+		"bytes":              len(audio.Data),
+		"format":             audio.Format,
+		"sample_rate":        audio.SampleRate,
+		"channels":           audio.Channels,
+		"provider":           provider.ID(),
+		"reader_id":          reader.ID,
+		"voice_id":           activeVoiceID,
+		"language":           language,
+		"cache_hit":          false,
+		"backup_used":        backupUsed,
+		"requested_provider": requestedProviderID,
+	}
+	if err := state.deliverAudio(outputPath, audio.Data, result); err != nil {
 		state.publishTTSError(conn, jobID, err.Error())
 		return
 	}
@@ -965,23 +1041,38 @@ func handleSynthesisJob(ctx context.Context, conn *bridgeclient.Conn, state *ser
 		} else {
 			cacheEntry = persisted
 		}
-		state.storeSynthesis(cacheKey, cacheEntry)
+		// Inline audio only exists on this machine once the persistent cache
+		// holds it, since output_path is a path on the daemon's side.
+		if !state.inline || cacheEntry.OutputPath != outputPath {
+			state.storeSynthesis(cacheKey, cacheEntry)
+		}
 	}
-	_ = state.publishServiceEvent(conn, "tts.synthesized", jobID, map[string]any{
-		"job_id":             jobID,
-		"output_path":        outputPath,
-		"bytes":              len(audio.Data),
-		"format":             audio.Format,
-		"sample_rate":        audio.SampleRate,
-		"channels":           audio.Channels,
-		"provider":           provider.ID(),
-		"reader_id":          reader.ID,
-		"voice_id":           activeVoiceID,
-		"language":           language,
-		"cache_hit":          false,
-		"backup_used":        backupUsed,
-		"requested_provider": requestedProviderID,
-	})
+	_ = state.publishServiceEvent(conn, "tts.synthesized", jobID, result)
+}
+
+// deliverAudio hands finished audio to the requester: a file at outputPath
+// when this service shares the daemon's disk, or inline output_b64 otherwise.
+func (s *serviceState) deliverAudio(outputPath string, data []byte, result map[string]any) error {
+	if s.inline {
+		result["output_b64"] = base64.StdEncoding.EncodeToString(data)
+		return nil
+	}
+	return writeFileAtomic(outputPath, data, 0o644)
+}
+
+// deliverCachedAudio is deliverAudio for audio already in the synthesis cache.
+func (s *serviceState) deliverCachedAudio(cachedPath string, outputPath string, result map[string]any) error {
+	cacheFilesMu.Lock()
+	if !s.inline {
+		defer cacheFilesMu.Unlock()
+		return materializeCachedAudio(cachedPath, outputPath)
+	}
+	data, err := os.ReadFile(cachedPath)
+	cacheFilesMu.Unlock()
+	if err != nil {
+		return err
+	}
+	return s.deliverAudio(outputPath, data, result)
 }
 
 func (s *serviceState) resolveVoiceRoute(ctx context.Context, routeKey string, providerID string, voiceID string, backup *tts.ReaderBackup) (voiceRouteDecision, bool, error) {

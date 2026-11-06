@@ -32,6 +32,14 @@ const PLAYOUT_SUBSCRIPTIONS: &[&str] = &[
     "cap.alert.cancelled",
     "playlist.control",
     "operator.breakin.*",
+];
+
+/// Replies the read loop resolves for [`BridgeClient::synthesize`] and
+/// [`BridgeClient::render_product`]. Every consumer connection subscribes to
+/// them on top of its own list: the broker only delivers untargeted events a
+/// client subscribed to, so a connection that makes those requests without
+/// them waits out every reply timeout.
+const REPLY_SUBSCRIPTIONS: &[&str] = &[
     "tts.synthesized",
     "tts.failed",
     "product.rendered",
@@ -200,9 +208,11 @@ impl BridgeClient {
     }
 
     async fn register_consumer(&self, client_id: &str, subscriptions: &[&str]) -> Result<()> {
+        let mut subscriptions = subscriptions.to_vec();
+        subscriptions.extend(REPLY_SUBSCRIPTIONS);
         self.writer
             .register(
-                &Registration::subscriber(client_id, subscriptions).with_source(PLAYOUT_CLIENT_ID),
+                &Registration::subscriber(client_id, &subscriptions).with_source(PLAYOUT_CLIENT_ID),
             )
             .await
     }
@@ -491,7 +501,9 @@ mod tests {
             (registration, request)
         });
 
-        let connection = connect_consumer_retry(&addr, PLAYOUT_CLIENT_ID, PLAYOUT_SUBSCRIPTIONS)
+        // Like the CAP alert router: its own list names no reply types, yet
+        // its feed dispatchers synthesize alert speech on this connection.
+        let connection = connect_consumer_retry(&addr, PLAYOUT_CLIENT_ID, &["cap.alert.received"])
             .await
             .expect("connect to fake broker");
         let output = std::env::temp_dir()
@@ -515,6 +527,13 @@ mod tests {
         assert_eq!(registration["source"], PLAYOUT_CLIENT_ID);
         assert_eq!(registration["data"]["client_id"], PLAYOUT_CLIENT_ID);
         assert_eq!(registration["data"]["receive_events"], true);
+        let subscriptions = registration["data"]["subscriptions"].as_array().unwrap();
+        for reply in REPLY_SUBSCRIPTIONS {
+            assert!(
+                subscriptions.iter().any(|value| value == reply),
+                "consumer must subscribe to {reply}: {subscriptions:?}"
+            );
+        }
         assert_eq!(request["type"], "tts.synthesize");
         assert_eq!(request["data"]["job_id"], "job-1");
         assert!(request["timestamp"].is_string());

@@ -5,7 +5,7 @@ members = [
     "crates/haze-cap",
     "crates/haze-cgen",
     "crates/haze-contracts",
-    "crates/haze-easnet",
+    "crates/haze-netalert",
     "crates/haze-location",
     "crates/haze-media",
     "crates/haze-media-protocol",

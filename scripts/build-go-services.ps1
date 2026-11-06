@@ -108,7 +108,7 @@ function Copy-BundleDirectory {
 
 New-Item -ItemType Directory -Force -Path $OutFull | Out-Null
 New-Item -ItemType Directory -Force -Path $BinFull | Out-Null
-foreach ($File in @("haze-web.exe", "haze-data-ingest.exe", "haze-tts.exe", "haze-sapi5-shim.exe", "haze-product-render.exe", "haze-playlist.exe", "haze-webhook.exe", "haze-asr.exe", "haze-ivr.exe", "whisper-server.exe", "libopus-0.dll", "libopusfile-0.dll", "libogg-0.dll", "libwinpthread-1.dll")) {
+foreach ($File in @("haze-web.exe", "haze-data-ingest.exe", "haze-tts.exe", "haze-sapi5-shim.exe", "haze-sapi5-shim-x64.exe", "haze-product-render.exe", "haze-playlist.exe", "haze-webhook.exe", "haze-asr.exe", "haze-ivr.exe", "whisper-server.exe", "libopus-0.dll", "libopusfile-0.dll", "libogg-0.dll", "libwinpthread-1.dll")) {
     $LegacyTarget = Join-Path $OutFull $File
     if (Test-Path -LiteralPath $LegacyTarget) {
         Remove-Item -LiteralPath $LegacyTarget -Force
@@ -135,56 +135,7 @@ function Test-OpusPkgConfig {
     return $LASTEXITCODE -eq 0
 }
 
-function Copy-SherpaOnnxRuntimeLibraries {
-    param(
-        [Parameter(Mandatory = $true)][string] $DestinationDir
-    )
-
-    $GoOS = (go env GOOS 2>$null).Trim()
-    $GoArch = (go env GOARCH 2>$null).Trim()
-    if ([string]::IsNullOrWhiteSpace($GoOS) -or [string]::IsNullOrWhiteSpace($GoArch)) {
-        return
-    }
-
-    $Module = switch ($GoOS) {
-        "windows" { "github.com/k2-fsa/sherpa-onnx-go-windows" }
-        "linux" { "github.com/k2-fsa/sherpa-onnx-go-linux" }
-        "darwin" { "github.com/k2-fsa/sherpa-onnx-go-macos" }
-        default { "" }
-    }
-    if ([string]::IsNullOrWhiteSpace($Module)) {
-        return
-    }
-
-    $Triple = switch ("$GoOS/$GoArch") {
-        "windows/amd64" { "x86_64-pc-windows-gnu" }
-        "windows/386" { "i686-pc-windows-gnu" }
-        "linux/amd64" { "x86_64-unknown-linux-gnu" }
-        "linux/arm64" { "aarch64-unknown-linux-gnu" }
-        "linux/arm" { "arm-unknown-linux-gnueabihf" }
-        "darwin/amd64" { "x86_64-apple-darwin" }
-        "darwin/arm64" { "aarch64-apple-darwin" }
-        default { "" }
-    }
-    if ([string]::IsNullOrWhiteSpace($Triple)) {
-        return
-    }
-
-    $ModuleDir = (go list -m -f "{{.Dir}}" $Module 2>$null).Trim()
-    if ([string]::IsNullOrWhiteSpace($ModuleDir)) {
-        return
-    }
-    $LibDir = Join-Path $ModuleDir (Join-Path "lib" $Triple)
-    if (-not (Test-Path -LiteralPath $LibDir -PathType Container)) {
-        return
-    }
-
-    Get-ChildItem -LiteralPath $LibDir -File | Where-Object {
-        $_.Extension -in @(".dll", ".so", ".dylib") -or $_.Name -like "*.so.*"
-    } | ForEach-Object {
-        Copy-Item -LiteralPath $_.FullName -Destination $DestinationDir -Force
-    }
-}
+. (Join-Path $ScriptDir "lib/sherpa-onnx-runtime.ps1")
 
 if ($RunningOnWindows -and (Test-Path (Join-Path $Clang64Bin "x86_64-w64-mingw32-clang.exe")) -and (Test-Path (Join-Path $Clang64Bin "pkg-config.exe"))) {
     $env:Path = "$Clang64Bin;$MsysUsrBin;$env:Path"
@@ -232,9 +183,14 @@ try {
         $SavedGoArch = $env:GOARCH
         $SavedCGOEnabled = $env:CGO_ENABLED
         try {
+            # haze-tts runs every SAPI5 job in one of these: x64 first, x86 for
+            # 32-bit-only voices. See internal/tts/sapi5_windows.go.
             $env:GOOS = "windows"
-            $env:GOARCH = "386"
             $env:CGO_ENABLED = "0"
+            $env:GOARCH = "amd64"
+            go build -o (Join-Path $BinFull "haze-sapi5-shim-x64.exe") ./cmd/haze-sapi5-shim
+            Assert-NativeSuccess "haze-sapi5-shim-x64 build"
+            $env:GOARCH = "386"
             go build -o (Join-Path $BinFull "haze-sapi5-shim.exe") ./cmd/haze-sapi5-shim
             Assert-NativeSuccess "haze-sapi5-shim build"
         } finally {

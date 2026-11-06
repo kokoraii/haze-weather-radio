@@ -55,6 +55,57 @@ func TestResetAccountPasswordsMatchesWildcardAndRevokesOldPassword(t *testing.T)
 	}
 }
 
+func TestResetAccountPasswordsForceChangeAtNextSignIn(t *testing.T) {
+	manager, _ := newTestAccountAuthManager(t, false)
+	defer manager.Close()
+	createTestAccount(t, manager, Account{
+		Username: "ops", PasswordExpiryDays: 90, AllowUserPasswordChange: true, LoggingEnabled: true,
+	}, "original password 123")
+	createTestAccount(t, manager, Account{
+		Username: "kiosk", PasswordExpiryDays: 90, AllowUserPasswordChange: false, LoggingEnabled: true,
+	}, "original password 123")
+
+	resets, err := manager.ResetAccountPasswords(context.Background(), "*o*")
+	if err != nil {
+		t.Fatalf("reset: %v", err)
+	}
+	passwords := map[string]string{}
+	for _, reset := range resets {
+		passwords[reset.Username] = reset.Password
+	}
+	login := func(username, password, addr string) LoginResult {
+		t.Helper()
+		result, err := manager.LoginWithRequest(context.Background(), LoginInput{
+			Username: username, Password: password, Request: testLoginRequest(addr),
+		})
+		if err != nil {
+			t.Fatalf("login %s: %v", username, err)
+		}
+		return result
+	}
+	if !login("ops", passwords["ops"], "192.0.2.40:5000").PasswordChangeRequired {
+		t.Fatal("reset password did not require a change")
+	}
+	if login("kiosk", passwords["kiosk"], "192.0.2.41:5000").PasswordChangeRequired {
+		t.Fatal("account barred from self-service changes was forced to change")
+	}
+
+	account, err := manager.accounts.store.ByUsername(context.Background(), "ops")
+	if err != nil {
+		t.Fatalf("load account: %v", err)
+	}
+	hash, err := manager.accounts.hashPassword("chosen password 456")
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+	if err := manager.accounts.store.SetPasswordIfAuthVersion(context.Background(), account.ID, hash, account.authVersion); err != nil {
+		t.Fatalf("self-service change: %v", err)
+	}
+	if login("ops", "chosen password 456", "192.0.2.42:5000").PasswordChangeRequired {
+		t.Fatal("self-chosen password still required a change")
+	}
+}
+
 func TestResetAccountPasswordsWildcardCoversEveryAccount(t *testing.T) {
 	manager, _ := newTestAccountAuthManager(t, false)
 	defer manager.Close()

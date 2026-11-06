@@ -167,32 +167,7 @@ type CAPMessageRequest struct {
 }
 
 // SerializedAlert is a banner/archive friendly alert payload.
-type SerializedAlert struct {
-	Identifier         string                         `json:"identifier"`
-	FeedID             string                         `json:"feed_id,omitempty"`
-	DisplayID          string                         `json:"display_id,omitempty"`
-	Headline           string                         `json:"headline"`
-	Issuer             string                         `json:"issuer"`
-	Event              string                         `json:"event"`
-	Severity           string                         `json:"severity"`
-	Urgency            string                         `json:"urgency,omitempty"`
-	Certainty          string                         `json:"certainty,omitempty"`
-	Areas              []string                       `json:"areas"`
-	AreaText           string                         `json:"area_text"`
-	CanonicalLocations []alertmodel.LocationReference `json:"canonical_locations,omitempty"`
-	ReceivedAt         string                         `json:"received_at,omitempty"`
-	EffectiveAt        string                         `json:"effective_at,omitempty"`
-	OnsetAt            string                         `json:"onset_at,omitempty"`
-	ExpiresAt          string                         `json:"expires_at,omitempty"`
-	OnsetDisplay       string                         `json:"onset_display,omitempty"`
-	ExpiresDisplay     string                         `json:"expires_display,omitempty"`
-	Description        string                         `json:"description,omitempty"`
-	Instruction        string                         `json:"instruction,omitempty"`
-	Message            string                         `json:"message"`
-	SourceKind         string                         `json:"source_kind,omitempty"`
-	BackgroundColor    string                         `json:"background_color"`
-	BackgroundGradient []string                       `json:"background_gradient"`
-}
+type SerializedAlert = alertmodel.BannerView
 
 // CleanFragment compacts whitespace and trims a value for spoken text.
 func CleanFragment(value any) string {
@@ -590,6 +565,45 @@ func LoadLocationLabels(configPath string) map[string]string {
 	loadNWSLocationLabels(resolveConfigPath(configPath, "managed/csv/NWS_ZONE_COUNTY_CORRELATION.csv"), labels)
 	loadNWSMarineLocationLabels(resolveConfigPath(configPath, "managed/csv/NWS_MARINE_ZONES.csv"), labels)
 	return labels
+}
+
+// AreaNames returns the unique CAP area descriptions for an info block. ECCC
+// threat areas describe hazard geometry, not where the alert is in effect, so
+// they are skipped.
+func AreaNames(info capmodel.AlertInfo) []string {
+	out := []string{}
+	for _, area := range info.Areas {
+		if capmodel.IsECCCThreatArea(area) {
+			continue
+		}
+		if text := CleanFragment(area.Description); text != "" {
+			out = append(out, text)
+		}
+	}
+	return unique(out)
+}
+
+// CanonicalLocationNames returns display names for actionable, unambiguous
+// haze-location matches. An empty result means callers keep the raw CAP names.
+func CanonicalLocationNames(locations []alertmodel.LocationReference) []string {
+	out := make([]string, 0, len(locations))
+	seen := map[string]struct{}{}
+	for _, location := range locations {
+		if !location.Actionable || strings.TrimSpace(location.CanonicalID) == "" || location.Ambiguous {
+			continue
+		}
+		name := strings.TrimSpace(location.Name)
+		if name == "" {
+			continue
+		}
+		key := strings.ToLower(name)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, name)
+	}
+	return out
 }
 
 // SerializeCAPAlert builds a Python banner-style public alert payload.

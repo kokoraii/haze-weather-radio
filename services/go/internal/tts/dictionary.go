@@ -1,6 +1,7 @@
 package tts
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"os"
@@ -132,6 +133,15 @@ func LoadDictionary(path string, language string) (Dictionary, error) {
 			return Dictionary{}, nil
 		}
 		return Dictionary{}, err
+	}
+	return ParseDictionary(raw, language)
+}
+
+// ParseDictionary parses dictionary.json content for one language. Empty
+// content is an empty dictionary, like a missing file.
+func ParseDictionary(raw []byte, language string) (Dictionary, error) {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return Dictionary{}, nil
 	}
 	var parsed map[string]map[string]string
 	if err := json.Unmarshal(raw, &parsed); err != nil {

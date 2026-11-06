@@ -8,7 +8,7 @@
 
 use std::cell::RefCell;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -93,6 +93,9 @@ trait Client {
     /// Reads until the broker closes the connection or `limit` passes, and
     /// returns how many deliveries arrived and whether the broker hung up.
     fn drain_until_closed(&mut self, limit: Duration) -> (usize, bool);
+    /// Ends the client's outbound stream, as closing a connection does, while
+    /// leaving its receive side open so the broker's hang-up can be observed.
+    fn close_send(&mut self);
 }
 
 trait Transport {
@@ -326,6 +329,20 @@ mod scenarios {
         );
     }
 
+    /// A client that closes is released at once, including a publish-only one
+    /// the broker never writes to, and what it published first is still routed.
+    pub(super) fn closed_clients_are_released_after_their_last_publish(t: &dyn Transport) {
+        let mut subscriber = t.connect(Join::subscriber("sub", &["*"]));
+        let mut publisher = t.connect(Join::publisher());
+        publisher.publish(event("cap.alert.received"));
+        publisher.close_send();
+
+        let (received, closed) = publisher.drain_until_closed(PATIENCE);
+        assert_eq!(received, 0, "a publish-only client received a delivery");
+        assert!(closed, "the broker kept a closed client's connection open");
+        assert_eq!(types(&mut *subscriber), ["cap.alert.received"]);
+    }
+
     /// Events the daemon publishes itself reach subscribers.
     pub(super) fn host_published_events_reach_subscribers(t: &dyn Transport) {
         let mut subscriber = t.connect(Join::subscriber("sub", &["system.*"]));
@@ -393,6 +410,7 @@ macro_rules! conformance_suite {
                 publish_only_clients_receive_nothing,
                 unregistered_clients_activate_as_legacy_clients,
                 slow_clients_are_dropped_without_blocking_the_router,
+                closed_clients_are_released_after_their_last_publish,
                 cap_alerts_replay_to_late_subscribers,
                 log_records_are_consumed_not_republished,
                 host_consumes_only_control_events,
@@ -550,6 +568,13 @@ impl Client for JsonLinesClient {
                 None => return (received, false),
             }
         }
+    }
+
+    fn close_send(&mut self) {
+        self.wire
+            .stream
+            .shutdown(Shutdown::Write)
+            .expect("close the client's send side");
     }
 }
 

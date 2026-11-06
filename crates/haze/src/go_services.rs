@@ -16,6 +16,9 @@ use serde_json::json;
 use serde_json::Value;
 use tracing::{debug, error, info, warn};
 
+use crate::remote_service::{LinkEnv, LinkStatus, RemoteEndpoint, RemoteLink};
+use crate::remote_tts::TtsLinkSettings;
+use crate::service_placement::{self, Placement, PlacementConfig, RemoteService};
 use crate::ServiceHostConfig;
 
 const DEFAULT_SETTINGS_FILE: &str = "runtime/state/daemonSettings.json";
@@ -49,13 +52,15 @@ struct RustServicesConfig {
     playout: Option<RustPlayoutConfig>,
     cgen: Option<RustCgenConfig>,
     cap_ingest: Option<RustCapIngestConfig>,
-    easnet: Option<RustEasNetConfig>,
+    netalert: Option<RustNetAlertConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct RustLocationConfig {
     enabled: Option<bool>,
     executable: Option<PathBuf>,
+    #[serde(flatten)]
+    placement: PlacementConfig,
     config: Option<PathBuf>,
     scheduler: Option<ServiceSchedulerConfig>,
 }
@@ -64,6 +69,8 @@ struct RustLocationConfig {
 struct RustMediaConfig {
     enabled: Option<bool>,
     executable: Option<PathBuf>,
+    #[serde(flatten)]
+    placement: PlacementConfig,
     addr: Option<String>,
     listen: Option<String>,
     grpc_addr: Option<String>,
@@ -75,6 +82,8 @@ struct RustMediaConfig {
 struct RustPlayoutConfig {
     enabled: Option<bool>,
     executable: Option<PathBuf>,
+    #[serde(flatten)]
+    placement: PlacementConfig,
     alert_poll: Option<String>,
     scheduler: Option<ServiceSchedulerConfig>,
 }
@@ -83,6 +92,8 @@ struct RustPlayoutConfig {
 struct RustCgenConfig {
     enabled: Option<bool>,
     executable: Option<PathBuf>,
+    #[serde(flatten)]
+    placement: PlacementConfig,
     config: Option<PathBuf>,
     scheduler: Option<ServiceSchedulerConfig>,
 }
@@ -91,6 +102,8 @@ struct RustCgenConfig {
 struct RustCapIngestConfig {
     enabled: Option<bool>,
     executable: Option<PathBuf>,
+    #[serde(flatten)]
+    placement: PlacementConfig,
     source_id: Option<String>,
     source: Option<String>,
     url: Option<String>,
@@ -108,10 +121,11 @@ struct RustCapIngestConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct RustEasNetConfig {
+struct RustNetAlertConfig {
     enabled: Option<bool>,
     executable: Option<PathBuf>,
-    config: Option<PathBuf>,
+    #[serde(flatten)]
+    placement: PlacementConfig,
     scheduler: Option<ServiceSchedulerConfig>,
 }
 
@@ -139,6 +153,8 @@ struct GoServicesConfig {
 struct WebGatewayConfig {
     enabled: Option<bool>,
     executable: Option<PathBuf>,
+    #[serde(flatten)]
+    placement: PlacementConfig,
     addr: Option<String>,
 }
 
@@ -177,7 +193,9 @@ struct WebPanelTlsConfig {
     domains: Vec<String>,
 }
 
-fn deserialize_optional_port<'de, D>(deserializer: D) -> std::result::Result<Option<u16>, D::Error>
+pub(crate) fn deserialize_optional_port<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<u16>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -276,6 +294,8 @@ struct NwsCapSourceConfig {
 struct DataIngestConfig {
     enabled: Option<bool>,
     executable: Option<PathBuf>,
+    #[serde(flatten)]
+    placement: PlacementConfig,
     interval: Option<String>,
     timeout: Option<String>,
 }
@@ -284,6 +304,8 @@ struct DataIngestConfig {
 struct TtsConfig {
     enabled: Option<bool>,
     executable: Option<PathBuf>,
+    #[serde(flatten)]
+    placement: PlacementConfig,
     readers: Option<String>,
     dictionary: Option<String>,
     provider: Option<String>,
@@ -305,10 +327,60 @@ struct TtsConfig {
     runtime_idle_timeout: Option<String>,
 }
 
+impl TtsConfig {
+    fn readers(&self) -> &str {
+        self.readers
+            .as_deref()
+            .unwrap_or("managed/configs/readers.xml")
+    }
+
+    fn dictionary(&self) -> &str {
+        self.dictionary
+            .as_deref()
+            .unwrap_or("managed/dictionary.json")
+    }
+
+    fn provider(&self) -> &str {
+        self.provider.as_deref().unwrap_or("auto")
+    }
+
+    fn language(&self) -> &str {
+        self.language.as_deref().unwrap_or("en-CA")
+    }
+
+    fn timezone(&self) -> &str {
+        self.timezone.as_deref().unwrap_or("Local")
+    }
+
+    fn out_dir(&self) -> &str {
+        self.out_dir.as_deref().unwrap_or("runtime/audio/tts")
+    }
+
+    fn timeout(&self) -> &str {
+        self.timeout.as_deref().unwrap_or("60s")
+    }
+
+    /// What a remote haze-tts gets in place of its launch flags. Paths resolve
+    /// against the runtime directory, the working directory of a local launch.
+    fn remote_service(&self, runtime_dir: &Path) -> RemoteService {
+        RemoteService::Tts(TtsLinkSettings {
+            readers: resolve_path(runtime_dir, Path::new(self.readers())),
+            dictionary: resolve_path(runtime_dir, Path::new(self.dictionary())),
+            out_dir: PathBuf::from(self.out_dir()),
+            provider: self.provider().to_string(),
+            language: self.language().to_string(),
+            timezone: self.timezone().to_string(),
+            timeout: self.timeout().to_string(),
+        })
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct ProductRenderConfig {
     enabled: Option<bool>,
     executable: Option<PathBuf>,
+    #[serde(flatten)]
+    placement: PlacementConfig,
     refresh: Option<String>,
 }
 
@@ -316,6 +388,8 @@ struct ProductRenderConfig {
 struct PlaylistConfig {
     enabled: Option<bool>,
     executable: Option<PathBuf>,
+    #[serde(flatten)]
+    placement: PlacementConfig,
     tick: Option<String>,
     lookahead: Option<String>,
     out_dir: Option<String>,
@@ -325,6 +399,8 @@ struct PlaylistConfig {
 struct WebhookConfig {
     enabled: Option<bool>,
     executable: Option<PathBuf>,
+    #[serde(flatten)]
+    placement: PlacementConfig,
     webhooks: Option<String>,
     timeout: Option<String>,
 }
@@ -333,12 +409,16 @@ struct WebhookConfig {
 struct AsrConfig {
     enabled: Option<bool>,
     executable: Option<PathBuf>,
+    #[serde(flatten)]
+    placement: PlacementConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct IvrConfig {
     enabled: Option<bool>,
     executable: Option<PathBuf>,
+    #[serde(flatten)]
+    placement: PlacementConfig,
     http: Option<IvrHttpConfig>,
     sip: Option<IvrSipConfig>,
     cache: Option<IvrCacheConfig>,
@@ -384,13 +464,23 @@ enum WindowsPriorityClass {
     Realtime,
 }
 
-#[derive(Debug)]
 struct ManagedService {
     spec: ServiceSpec,
+    placement: Placement,
     child: Option<Child>,
+    /// The connection to a remote instance, in place of `child`.
+    link: Option<ServiceLink>,
     desired: DesiredState,
     restart_count: u64,
     next_restart: Option<Instant>,
+}
+
+struct ServiceLink {
+    link: RemoteLink,
+    endpoint: RemoteEndpoint,
+    start_reason: String,
+    /// The link status revision last written to the status file.
+    reported: Option<u64>,
 }
 
 /// Owns managed service child processes for the lifetime of the daemon.
@@ -438,8 +528,10 @@ impl GoServiceSupervisor {
             services: specs
                 .into_iter()
                 .map(|spec| ManagedService {
+                    placement: service_placement(&root, host, spec.id),
                     spec,
                     child: None,
+                    link: None,
                     desired: DesiredState::Running,
                     restart_count: 0,
                     next_restart: None,
@@ -460,10 +552,32 @@ impl GoServiceSupervisor {
         let Some(service) = self.services.get(index) else {
             return false;
         };
-        if service.child.is_some() || service.desired != DesiredState::Running {
+        if service.child.is_some()
+            || service.link.is_some()
+            || service.desired != DesiredState::Running
+        {
             return false;
         }
         let spec = service.spec.clone();
+        match service.placement.clone() {
+            Placement::Local => {}
+            Placement::Remote { endpoint, service } => {
+                return self.start_remote(index, endpoint, &service, reason);
+            }
+            Placement::Refused(detail) => {
+                warn!("[{}] not started: {detail}", service_label(spec.id));
+                self.services[index].desired = DesiredState::Stopped;
+                self.set_status(
+                    spec.id,
+                    spec.kind,
+                    "refused",
+                    DesiredState::Stopped,
+                    None,
+                    Some(detail),
+                );
+                return true;
+            }
+        }
         let Some(executable) = resolve_executable(
             &self.host,
             spec.configured_executable.as_deref(),
@@ -565,6 +679,50 @@ impl GoServiceSupervisor {
         }
     }
 
+    /// Connects to a remote instance instead of launching one.
+    fn start_remote(
+        &mut self,
+        index: usize,
+        endpoint: RemoteEndpoint,
+        service: &RemoteService,
+        reason: &str,
+    ) -> bool {
+        let id = self.services[index].spec.id;
+        info!("{} runs on remote {endpoint}", service_label(id));
+        let link = RemoteLink::start(
+            service_label(id),
+            endpoint.clone(),
+            service.adapter(&self.host.runtime_dir),
+            LinkEnv::from_process(),
+        );
+        self.services[index].next_restart = None;
+        self.services[index].link = Some(ServiceLink {
+            link,
+            endpoint,
+            start_reason: reason.to_string(),
+            reported: None,
+        });
+        self.report_link(index);
+        true
+    }
+
+    /// Writes a remote service's link state into its status entry when it
+    /// changed. Returns whether it did.
+    fn report_link(&mut self, index: usize) -> bool {
+        let service = &mut self.services[index];
+        let Some(link) = service.link.as_mut() else {
+            return false;
+        };
+        let status = link.link.status();
+        if link.reported == Some(status.revision) {
+            return false;
+        }
+        link.reported = Some(status.revision);
+        let value = remote_status_value(&service.spec, service.desired, link, &status);
+        self.statuses.insert(service.spec.id.to_string(), value);
+        true
+    }
+
     fn set_status(
         &mut self,
         id: &str,
@@ -662,9 +820,13 @@ impl GoServiceSupervisor {
                 }
             }
         }
+        for index in 0..self.services.len() {
+            changed |= self.report_link(index);
+        }
         let now = Instant::now();
         for index in 0..self.services.len() {
             if self.services[index].child.is_none()
+                && self.services[index].link.is_none()
                 && self.services[index].desired == DesiredState::Running
                 && self.services[index]
                     .next_restart
@@ -724,7 +886,7 @@ impl GoServiceSupervisor {
     fn start_controlled(&mut self, index: usize) -> bool {
         self.services[index].desired = DesiredState::Running;
         self.services[index].next_restart = None;
-        if self.services[index].child.is_some() {
+        if self.services[index].child.is_some() || self.services[index].link.is_some() {
             return false;
         }
         self.start_service(index, "operator_start")
@@ -772,6 +934,27 @@ impl GoServiceSupervisor {
 
     fn stop_service(&mut self, index: usize, final_status: &str, reason: &str) -> bool {
         let spec = self.services[index].spec.clone();
+        if let Some(link) = self.services[index].link.take() {
+            info!(
+                "disconnecting {} from {} ({reason})",
+                service_label(spec.id),
+                link.endpoint
+            );
+            self.statuses.insert(
+                spec.id.to_string(),
+                json!({
+                    "id": spec.id,
+                    "kind": spec.kind,
+                    "status": final_status,
+                    "desired": desired_status(self.services[index].desired),
+                    "pid": None::<u32>,
+                    "remote": link.endpoint.to_string(),
+                    "control_reason": reason,
+                    "stopped_at_unix": unix_now(),
+                }),
+            );
+            return true;
+        }
         let Some(mut child) = self.services[index].child.take() else {
             self.statuses.insert(
                 spec.id.to_string(),
@@ -815,6 +998,11 @@ impl GoServiceSupervisor {
         let mut changed = false;
         for index in 0..self.services.len() {
             self.services[index].desired = DesiredState::Stopped;
+            if self.services[index].link.is_some() {
+                self.stop_service(index, "stopped", "shutdown");
+                changed = true;
+                continue;
+            }
             let spec = self.services[index].spec.clone();
             let Some(mut child) = self.services[index].child.take() else {
                 continue;
@@ -921,6 +1109,67 @@ fn desired_status(desired: DesiredState) -> &'static str {
     }
 }
 
+fn remote_status_value(
+    spec: &ServiceSpec,
+    desired: DesiredState,
+    link: &ServiceLink,
+    status: &LinkStatus,
+) -> Value {
+    json!({
+        "id": spec.id,
+        "kind": spec.kind,
+        "status": if status.connected { "running" } else { "connecting" },
+        "desired": desired_status(desired),
+        "pid": None::<u32>,
+        "remote": link.endpoint.to_string(),
+        "connected": status.connected,
+        "connects": status.connects,
+        "last_error": status.last_error,
+        "start_reason": link.start_reason,
+        "updated_at_unix": unix_now(),
+    })
+}
+
+/// The `host`/`port` section that places a service, by service id.
+fn placement_config<'a>(root: &'a RootConfig, id: &str) -> Option<&'a PlacementConfig> {
+    let services = root.services.as_ref()?;
+    let go = services.go.as_ref();
+    let rust = services.rust.as_ref();
+    match id {
+        "svc:location" => rust?.location.as_ref().map(|config| &config.placement),
+        "svc:data_ingest" => go?.data_ingest.as_ref().map(|config| &config.placement),
+        "aux:tts" => go?.tts.as_ref().map(|config| &config.placement),
+        "svc:product_render" => go?.product_render.as_ref().map(|config| &config.placement),
+        "svc:playlist" => go?.playlist.as_ref().map(|config| &config.placement),
+        "svc:webhook" => go?.webhook.as_ref().map(|config| &config.placement),
+        "svc:asr" => go?.asr.as_ref().map(|config| &config.placement),
+        "svc:ivr" => go?.ivr.as_ref().map(|config| &config.placement),
+        "svc:media" => rust?.media.as_ref().map(|config| &config.placement),
+        "svc:playout" => rust?.playout.as_ref().map(|config| &config.placement),
+        "svc:cgen" => rust?.cgen.as_ref().map(|config| &config.placement),
+        "svc:netalert" => rust?.netalert.as_ref().map(|config| &config.placement),
+        "svc:cap_ingest" | "svc:nws_cap_ingest" => {
+            rust?.cap_ingest.as_ref().map(|config| &config.placement)
+        }
+        id if id.starts_with("go:web") => go?.web_gateway.as_ref().map(|config| &config.placement),
+        _ => None,
+    }
+}
+
+fn service_placement(root: &RootConfig, host: &ServiceHostConfig, id: &str) -> Placement {
+    // Only services with a remote mode name one here.
+    let remote = match id {
+        "aux:tts" => root
+            .services
+            .as_ref()
+            .and_then(|services| services.go.as_ref())
+            .and_then(|go| go.tts.as_ref())
+            .map(|tts| tts.remote_service(&host.runtime_dir)),
+        _ => None,
+    };
+    service_placement::resolve(placement_config(root, id), service_label(id), remote)
+}
+
 fn restart_backoff(restart_count: u64) -> Duration {
     let exponent = restart_count.saturating_sub(1).min(5);
     let seconds = MIN_RESTART_BACKOFF.as_secs().saturating_mul(1 << exponent);
@@ -1021,11 +1270,11 @@ fn service_specs(root: &RootConfig, host: &ServiceHostConfig) -> Vec<ServiceSpec
         .as_ref()
         .and_then(|services| services.rust.as_ref())
         .and_then(|services| services.cap_ingest.as_ref());
-    let rust_easnet = root
+    let rust_netalert = root
         .services
         .as_ref()
         .and_then(|services| services.rust.as_ref())
-        .and_then(|services| services.easnet.as_ref());
+        .and_then(|services| services.netalert.as_ref());
     let mut specs = Vec::new();
     let mut deferred_cap_specs = Vec::new();
 
@@ -1105,25 +1354,19 @@ fn service_specs(root: &RootConfig, host: &ServiceHostConfig) -> Vec<ServiceSpec
                     "--bridge".to_string(),
                     std::env::var("HAZE_HOST_BRIDGE_ADDR").unwrap_or_default(),
                     "--readers".to_string(),
-                    tts.readers
-                        .clone()
-                        .unwrap_or_else(|| "managed/configs/readers.xml".to_string()),
+                    tts.readers().to_string(),
                     "--dictionary".to_string(),
-                    tts.dictionary
-                        .clone()
-                        .unwrap_or_else(|| "managed/dictionary.json".to_string()),
+                    tts.dictionary().to_string(),
                     "--provider".to_string(),
-                    tts.provider.clone().unwrap_or_else(|| "auto".to_string()),
+                    tts.provider().to_string(),
                     "--lang".to_string(),
-                    tts.language.clone().unwrap_or_else(|| "en-CA".to_string()),
+                    tts.language().to_string(),
                     "--timezone".to_string(),
-                    tts.timezone.clone().unwrap_or_else(|| "Local".to_string()),
+                    tts.timezone().to_string(),
                     "--out-dir".to_string(),
-                    tts.out_dir
-                        .clone()
-                        .unwrap_or_else(|| "runtime/audio/tts".to_string()),
+                    tts.out_dir().to_string(),
                     "--timeout".to_string(),
-                    tts.timeout.clone().unwrap_or_else(|| "60s".to_string()),
+                    tts.timeout().to_string(),
                 ];
                 if let Some(voices_dir) = tts
                     .piper_voices_dir
@@ -1466,27 +1709,21 @@ fn service_specs(root: &RootConfig, host: &ServiceHostConfig) -> Vec<ServiceSpec
     if let Some(cap) = rust_cap.filter(|cap| cap.enabled.unwrap_or(false)) {
         deferred_cap_specs.extend(rust_cap_ingest_specs(cap, root));
     }
-    if let Some(easnet) = rust_easnet.filter(|easnet| easnet.enabled.unwrap_or(false)) {
+    // haze-netalert reads its listener and EAS NET settings from config.yaml.
+    if let Some(netalert) = rust_netalert.filter(|netalert| netalert.enabled.unwrap_or(false)) {
         specs.push(ServiceSpec {
-            id: "svc:easnet",
+            id: "svc:netalert",
             kind: "managed",
-            binary: executable_name("haze-easnet"),
-            configured_executable: easnet.executable.clone(),
+            binary: executable_name("haze-netalert"),
+            configured_executable: netalert.executable.clone(),
             args: vec![
                 "--config".to_string(),
                 host.config_path.to_string_lossy().into_owned(),
-                "--easnet".to_string(),
-                easnet
-                    .config
-                    .clone()
-                    .unwrap_or_else(|| PathBuf::from("managed/configs/easnet.xml"))
-                    .to_string_lossy()
-                    .into_owned(),
                 "--bridge".to_string(),
                 std::env::var("HAZE_HOST_BRIDGE_ADDR").unwrap_or_default(),
             ],
             scheduler: ProcessScheduler::from_config(
-                easnet.scheduler.as_ref(),
+                netalert.scheduler.as_ref(),
                 ProcessScheduler::default(),
             ),
         });
@@ -1914,7 +2151,7 @@ fn executable_name(base: &'static str) -> &'static str {
             "haze-web" => "haze-web.exe",
             "haze-data-ingest" => "haze-data-ingest.exe",
             "haze-cap-ingest" => "haze-cap-ingest.exe",
-            "haze-easnet" => "haze-easnet.exe",
+            "haze-netalert" => "haze-netalert.exe",
             "haze-tts" => "haze-tts.exe",
             "haze-product-render" => "haze-product-render.exe",
             "haze-playlist" => "haze-playlist.exe",
@@ -2097,7 +2334,7 @@ fn is_known_managed_executable(path: &str) -> bool {
         executable_name("haze-playout-rs"),
         executable_name("haze-cgen"),
         executable_name("haze-media"),
-        executable_name("haze-easnet"),
+        executable_name("haze-netalert"),
     ]
     .into_iter()
     .any(|known| known.eq_ignore_ascii_case(&file_name))
@@ -2523,7 +2760,7 @@ fn service_label(service_id: &str) -> &str {
         "svc:ivr" => "IVR",
         "svc:playout" => "Playout",
         "svc:cgen" => "CG renderer",
-        "svc:easnet" => "EAS NET",
+        "svc:netalert" => "Network alerts",
         _ => service_id,
     }
 }
@@ -3176,14 +3413,16 @@ services:
     }
 
     #[test]
-    fn rust_easnet_service_uses_managed_xml_config() {
+    fn rust_netalert_service_reads_config_yaml() {
         let root: RootConfig = serde_yaml::from_str(
             r#"
 services:
   rust:
-    easnet:
+    netalert:
       enabled: true
-      config: managed/configs/easnet.xml
+      addr: "0.0.0.0:41802"
+      easnet:
+        enabled: false
 "#,
         )
         .expect("config");
@@ -3191,12 +3430,55 @@ services:
         let specs = service_specs(&root, &test_host());
 
         assert_eq!(specs.len(), 1);
-        assert_eq!(specs[0].id, "svc:easnet");
-        assert_eq!(specs[0].binary, executable_name("haze-easnet"));
-        assert!(specs[0].args.contains(&"--easnet".to_string()));
-        assert!(specs[0]
-            .args
-            .contains(&"managed/configs/easnet.xml".to_string()));
+        assert_eq!(specs[0].id, "svc:netalert");
+        assert_eq!(specs[0].binary, executable_name("haze-netalert"));
+        assert!(specs[0].args.contains(&"--config".to_string()));
+        assert!(!specs[0].args.contains(&"--easnet".to_string()));
+    }
+
+    #[test]
+    fn service_host_and_port_place_services() {
+        let root: RootConfig = serde_yaml::from_str(
+            r#"
+services:
+  go:
+    enabled: true
+    tts:
+      enabled: true
+      host: "192.0.2.22"
+      port: "41810"
+      readers: "managed/configs/readers.xml"
+    playlist:
+      enabled: true
+      host: "192.0.2.22"
+      port: 41811
+    webhook:
+      enabled: true
+      host: "127.0.0.1"
+      port: 41812
+"#,
+        )
+        .expect("config");
+        let host = test_host();
+
+        let Placement::Remote { endpoint, service } = service_placement(&root, &host, "aux:tts")
+        else {
+            panic!("a remote TTS host connects to the remote instance");
+        };
+        assert_eq!(endpoint.to_string(), "192.0.2.22:41810");
+        let RemoteService::Tts(settings) = service;
+        assert_eq!(
+            settings.readers,
+            host.runtime_dir.join("managed/configs/readers.xml")
+        );
+        assert!(matches!(
+            service_placement(&root, &host, "svc:playlist"),
+            Placement::Refused(reason) if reason == "Playlist cannot run on a remote host yet"
+        ));
+        assert!(matches!(
+            service_placement(&root, &host, "svc:webhook"),
+            Placement::Local
+        ));
     }
 
     #[test]

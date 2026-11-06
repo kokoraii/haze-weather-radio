@@ -142,6 +142,9 @@ func (s *Service) handleEvent(event map[string]any) {
 	case "wx.on_demand.request":
 		s.handleWxOnDemand(event)
 		return
+	case alertSpeechRequestEvent:
+		s.handleAlertSpeech(event)
+		return
 	case "product.render.request":
 	default:
 		return

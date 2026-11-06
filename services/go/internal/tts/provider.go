@@ -22,6 +22,9 @@ type Voice struct {
 	Name     string   `json:"name,omitempty"`
 	Provider string   `json:"provider"`
 	Language []string `json:"language,omitempty"`
+	// Arch is the process architecture the voice loads in, for providers
+	// where it matters (SAPI5: "x64" in haze-tts, "x86" through the shim).
+	Arch string `json:"arch,omitempty"`
 }
 
 // Request describes a synthesis request.

@@ -28,7 +28,6 @@ type Server struct {
 	auth                *AuthManager
 	receiver            *ReceiverManager
 	media               *MediaHub
-	bannerHub           *BannerHub
 	breakIn             *OperatorBreakInManager
 	listeners           *ListenerTracker
 	feedMapResolveSlots chan struct{}
@@ -68,8 +67,7 @@ func NewServerWithSurface(config Config, configPath string, webroot string, surf
 	mediaBridgeAddr := mediaHubBridgeAddr(config, os.Getenv("HAZE_MEDIA_BRIDGE_ADDR"), hostBridgeAddr)
 	mediaHub := NewMediaHub(mediaBridgeAddr)
 	mediaHub.SetAudioSource(mediaServiceControl(config))
-	bannerHub := NewBannerHub(configPath, hostBridgeAddr)
-	server := &Server{
+	return &Server{
 		startedAt:           time.Now().UTC(),
 		config:              config,
 		configPath:          filepath.Clean(configPath),
@@ -78,15 +76,10 @@ func NewServerWithSurface(config Config, configPath string, webroot string, surf
 		auth:                NewAuthManagerWithPath(config, configPath),
 		receiver:            NewReceiverManager(config, configPath, mediaHub),
 		media:               mediaHub,
-		bannerHub:           bannerHub,
 		breakIn:             NewOperatorBreakInManager(),
 		listeners:           NewListenerTracker(),
 		feedMapResolveSlots: make(chan struct{}, publicFeedMapResolveConcurrency),
 	}
-	if server.surface.allowsAdmin() {
-		server.startBannerStatePublisher(hostBridgeAddr)
-	}
-	return server
 }
 
 // mediaHubBridgeAddr retains the bridge only when the paced Rust media service
@@ -116,6 +109,7 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc("/api/public/v1/map/basemap", s.publicBasemap)
 		mux.HandleFunc("/api/public/v1/feed/webrtc/offer", s.publicFeedWebRTCOffer)
 		mux.HandleFunc("/api/public/v1/alerts/archive/cap.xml", s.publicAlertsArchiveCAPXML)
+		mux.HandleFunc("/api/public/v1/netalert", s.netAlertProxy)
 	}
 	if s.surface.allowsAdmin() {
 		if !s.surface.allowsPublic() {
@@ -123,9 +117,7 @@ func (s *Server) Handler() http.Handler {
 		}
 		mux.HandleFunc("/admin", s.admin)
 		mux.HandleFunc("/banner", s.banner)
-		mux.HandleFunc("/api/v1/banner/current", s.bannerCurrent)
-		mux.HandleFunc("/api/v1/banner/stream", s.bannerStream)
-		mux.HandleFunc("/api/v1/banner/audio", s.bannerAudio)
+		mux.HandleFunc("/api/v1/netalert", s.netAlertProxy)
 		mux.HandleFunc("/api/v1/banner/webrtc/offer", s.bannerWebRTCOffer)
 		mux.HandleFunc("/api/v1/cgen/preview", s.cgenPreview)
 		mux.HandleFunc("/api/v1/cgen/fonts/", s.cgenFontAsset)

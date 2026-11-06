@@ -1,7 +1,6 @@
 package webgateway
 
 import (
-	"bufio"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -11,10 +10,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -339,8 +336,8 @@ const generatedPasswordAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuv
 
 // ResetAccountPasswords performs a local, audited password reset for every
 // account whose username matches pattern (case-insensitive, with * and ?
-// wildcards). Each match gets a new random password, its lockout state is
-// cleared, and its sessions are revoked. Resets completed before an error are
+// wildcards). Each match gets a new random password that must be changed at
+// the next sign-in, its lockout state is cleared, and its sessions are revoked. Resets completed before an error are
 // still returned so the caller can report them. It is intended for the
 // haze-web CLI running with the service's private keys.
 func (a *AuthManager) ResetAccountPasswords(ctx context.Context, pattern string) ([]PasswordReset, error) {
@@ -381,7 +378,10 @@ func (a *AuthManager) ResetAccountPasswords(ctx context.Context, pattern string)
 		if err := a.accounts.audit.Append("webpanel", event); err != nil {
 			return resets, fmt.Errorf("write password reset audit request: %w", err)
 		}
-		if err := a.accounts.store.SetPassword(ctx, account.ID, hash); err != nil {
+		// The printed password is single use: the account must replace it at the
+		// next sign-in. Accounts barred from self-service changes keep it, since
+		// forcing a change they cannot make would lock them out.
+		if err := a.accounts.store.SetPassword(ctx, account.ID, hash, account.AllowUserPasswordChange); err != nil {
 			return resets, fmt.Errorf("reset password for %q: %w", account.Username, err)
 		}
 		a.accounts.ResetLoginLimits(ctx, account.Username, account.LastIP)
@@ -638,78 +638,4 @@ func parseArgon2Params(raw string) (argon2Params, error) {
 
 func decodePHCBase64(value string) ([]byte, error) {
 	return base64.RawStdEncoding.DecodeString(value)
-}
-
-// LoadDotEnv loads simple KEY=VALUE entries without overriding existing env.
-func LoadDotEnv(path string) error {
-	file, err := os.Open(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			if created, createErr := createDotEnvFromExample(path); createErr != nil {
-				return createErr
-			} else if !created {
-				log.Printf("WARN .env file not found: %s", path)
-				return nil
-			}
-			file, err = os.Open(path)
-			if err != nil {
-				return err
-			}
-		} else {
-			return err
-		}
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		key, value, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
-		}
-		key = strings.TrimSpace(key)
-		if key == "" {
-			continue
-		}
-		if _, exists := os.LookupEnv(key); exists {
-			continue
-		}
-		_ = os.Setenv(key, trimEnvValue(value))
-	}
-	return scanner.Err()
-}
-
-func createDotEnvFromExample(path string) (bool, error) {
-	if filepath.Base(path) != ".env" {
-		return false, nil
-	}
-	examplePath := filepath.Join(filepath.Dir(path), ".env.example")
-	raw, err := os.ReadFile(examplePath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			log.Printf("WARN .env file not found and no .env.example is available: %s", path)
-			return false, nil
-		}
-		return false, err
-	}
-	if err := os.WriteFile(path, raw, 0o600); err != nil {
-		return false, err
-	}
-	log.Printf("WARN .env file not found: created %s from %s", path, examplePath)
-	return true, nil
-}
-
-func trimEnvValue(value string) string {
-	value = strings.TrimSpace(value)
-	if len(value) >= 2 {
-		quote := value[0]
-		if (quote == '"' || quote == '\'') && value[len(value)-1] == quote {
-			return value[1 : len(value)-1]
-		}
-	}
-	return value
 }

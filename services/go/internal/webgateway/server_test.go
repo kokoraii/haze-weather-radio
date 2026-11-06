@@ -441,47 +441,38 @@ func TestBannerDoesNotRequireSession(t *testing.T) {
 	}
 }
 
-func TestBannerStreamDoesNotRequireSession(t *testing.T) {
+func TestNetAlertProxyRelaysWebSocketWithoutSession(t *testing.T) {
 	t.Setenv("ADMIN_PASSWD", "secret")
-	dir := t.TempDir()
-	configPath := filepath.Join(dir, "config.yaml")
-	mustWrite(t, configPath, "")
-	server := NewServerWithSurface(authEnabledConfig(), configPath, dir, "admin")
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	request := httptest.NewRequest(http.MethodGet, "/api/v1/banner/stream?feed=CAP-IT-ALL", nil).WithContext(ctx)
-	response := httptest.NewRecorder()
+	backend := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != netAlertWSPath {
+			http.NotFound(writer, request)
+			return
+		}
+		connection, err := websocket.Accept(writer, request, nil)
+		if err != nil {
+			return
+		}
+		defer connection.CloseNow()
+		_ = connection.Write(request.Context(), websocket.MessageText, []byte(`{"type":"hello"}`))
+		_, _, _ = connection.Read(request.Context())
+	}))
+	defer backend.Close()
+	config := authEnabledConfig()
+	config.Services.Rust.NetAlert.Enabled = true
+	config.Services.Rust.NetAlert.Addr = strings.TrimPrefix(backend.URL, "http://")
+	server := httptest.NewServer(NewServerWithSurface(config, "config.yaml", t.TempDir(), "admin").Handler())
+	defer server.Close()
 
-	server.Handler().ServeHTTP(response, request)
-
-	if response.Code == http.StatusUnauthorized || response.Code == http.StatusSeeOther {
-		t.Fatalf("status = %d", response.Code)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	connection, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/api/v1/netalert", nil)
+	if err != nil {
+		t.Fatalf("dial through proxy: %v", err)
 	}
-	if !strings.Contains(response.Body.String(), "event: banner") {
-		t.Fatalf("body = %q", response.Body.String())
-	}
-}
-
-func TestBannerCurrentDoesNotRequireSession(t *testing.T) {
-	t.Setenv("ADMIN_PASSWD", "secret")
-	dir := t.TempDir()
-	configPath := filepath.Join(dir, "config.yaml")
-	mustWrite(t, configPath, "")
-	server := NewServerWithSurface(authEnabledConfig(), configPath, dir, "admin")
-	request := httptest.NewRequest(http.MethodGet, "/api/v1/banner/current?feed=CAP-IT-ALL", nil)
-	response := httptest.NewRecorder()
-
-	server.Handler().ServeHTTP(response, request)
-
-	if response.Code != http.StatusOK {
-		t.Fatalf("status = %d", response.Code)
-	}
-	var payload map[string]any
-	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("body was not JSON: %v body=%q", err, response.Body.String())
-	}
-	if payload["feed_id"] != "CAP-IT-ALL" {
-		t.Fatalf("feed_id = %v body=%q", payload["feed_id"], response.Body.String())
+	defer connection.CloseNow()
+	_, message, err := connection.Read(ctx)
+	if err != nil || string(message) != `{"type":"hello"}` {
+		t.Fatalf("proxied message = %q, %v", message, err)
 	}
 }
 

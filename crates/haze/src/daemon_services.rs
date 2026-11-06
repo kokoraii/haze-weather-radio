@@ -1679,6 +1679,7 @@ fn default_runtime_cleanup_rules() -> Vec<RuntimeCleanupRule> {
         ("runtime/ivr/asr", 5 * MINUTE),
         ("runtime/audio/alerts", 7 * 24 * 60 * MINUTE),
         ("runtime/audio/easnet", 7 * 24 * 60 * MINUTE),
+        ("runtime/audio/netalert", 30 * MINUTE),
     ]
     .into_iter()
     .filter_map(|(path, seconds)| {

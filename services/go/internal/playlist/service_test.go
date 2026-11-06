@@ -32,6 +32,23 @@ func TestRustPlayoutOwnsCAPDispatchEventsWhenEnabled(t *testing.T) {
 	}
 }
 
+// Automations and web panel alerts have no Rust consumer, so the playlist must
+// keep them even with Rust playout enabled. CAP-derived sources stay deferred.
+func TestOperatorOriginatedAlertsStayWithPlaylist(t *testing.T) {
+	for _, eventType := range []string{"cap.alert.broadcast.requested", "cap.alert.cancelled"} {
+		for _, source := range []string{"automation", "haze-web"} {
+			if shouldDeferCAPPlayoutToRust(true, map[string]any{"type": eventType, "source": source}) {
+				t.Errorf("%s from %s was deferred to Rust playout", eventType, source)
+			}
+		}
+		for _, source := range []string{"haze-cap-alert-router", "haze-product-render"} {
+			if !shouldDeferCAPPlayoutToRust(true, map[string]any{"type": eventType, "source": source}) {
+				t.Errorf("%s from %s was not deferred to Rust playout", eventType, source)
+			}
+		}
+	}
+}
+
 func TestPredictedStartRespectsFixedTarget(t *testing.T) {
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
 	timelineEnd := now.Add(10 * time.Second)

@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/meowraii/haze-weather-radio/services/go/internal/dotenv"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/processguard"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/webgateway"
 )
@@ -56,14 +57,14 @@ func run() error {
 	}
 
 	if envFile := os.Getenv("HAZE_ENV_FILE"); envFile != "" {
-		if err := webgateway.LoadDotEnv(envFile); err != nil {
+		if err := dotenv.Load(envFile); err != nil {
 			return err
 		}
 	} else {
-		if err := webgateway.LoadDotEnv(filepath.Join(filepath.Dir(*configPath), ".env")); err != nil {
+		if err := dotenv.Load(filepath.Join(filepath.Dir(*configPath), ".env")); err != nil {
 			return err
 		}
-		if err := webgateway.LoadDotEnv(".env"); err != nil {
+		if err := dotenv.Load(".env"); err != nil {
 			return err
 		}
 	}
@@ -88,7 +89,7 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("reset passwords matching %q: %w", pattern, err)
 		}
-		log.Printf("haze-web: reset %d account password(s) and revoked all sessions for them", len(resets))
+		log.Printf("haze-web: reset %d account password(s) and revoked all sessions for them; each must choose a new password at the next sign-in", len(resets))
 		return nil
 	}
 	if username := strings.TrimSpace(*unlockAccount); username != "" {

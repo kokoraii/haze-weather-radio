@@ -219,8 +219,8 @@ Recorded 2026-10-25. Nothing here is committed. It was deployed together with Ph
 
 | Language | Services |
 | --- | --- |
-| Go | `haze-webhook`, `haze-asr`, `haze-product-render`, `haze-playlist`, `haze-tts` (dial, message loop, and publishers), `haze-ivr` (event and media connections), `haze-web` (weather gateway client, banner hub, media hub, location catalog import), `locationclient`, `events.HostBridgePublisher` (used by `haze-data-ingest`) |
-| Rust | `haze-cap` (durable publisher), `haze-location` (service loop and query client), `haze-playout` (event, consumer, and media publish-only connections), `haze-easnet`, `haze-cgen` (event bridge and media consumer), `haze-media` (status publisher and PCM consumer) |
+| Go | `haze-webhook`, `haze-asr`, `haze-product-render`, `haze-playlist`, `haze-tts` (dial, message loop, and publishers), `haze-ivr` (event and media connections), `haze-web` (weather gateway client, media hub, location catalog import), `locationclient`, `events.HostBridgePublisher` (used by `haze-data-ingest`) |
+| Rust | `haze-cap` (durable publisher), `haze-location` (service loop and query client), `haze-playout` (event, consumer, and media publish-only connections), `haze-netalert` (formerly `haze-easnet`, now also the banner state), `haze-cgen` (event bridge and media consumer), `haze-media` (status publisher and PCM consumer) |
 
 No in-repo bridge client is left. The only remaining `TcpStream::connect` and `net.Dial` calls in the services are for other protocols (NAADS, EAS NET peers, Icecast, and HTTP transports).
 

@@ -6,12 +6,16 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/go-ole/go-ole"
 	"github.com/go-ole/go-ole/oleutil"
@@ -19,7 +23,40 @@ import (
 
 const sapiCreateForWrite = 3
 const sapi5ShimDisabledEnv = "HAZE_SAPI5_SHIM_DISABLED"
-const sapi5ShimPathEnv = "HAZE_SAPI5_SHIM_PATH"
+const createNoWindow = 0x08000000
+
+// sapiShim is a helper executable bundled next to haze-tts that runs one
+// SAPI5 call in its own process. Synthesis goes through shims so a third-party
+// engine that crashes or hangs (Vocalizer Expressive does both when several
+// voices speak in one process) takes down only its own job, and jobs can run
+// in parallel in separate processes.
+type sapiShim struct {
+	arch    string
+	file    string
+	pathEnv string
+}
+
+var (
+	// sapiShimX64 sees the 64-bit registry view, like haze-tts itself.
+	sapiShimX64 = sapiShim{arch: "x64", file: "haze-sapi5-shim-x64.exe", pathEnv: "HAZE_SAPI5_SHIM_X64_PATH"}
+	// sapiShimX86 loads 32-bit-only voices, which need a 32-bit process.
+	sapiShimX86 = sapiShim{arch: "x86", file: "haze-sapi5-shim.exe", pathEnv: "HAZE_SAPI5_SHIM_PATH"}
+)
+
+// sapiNativeSlot lets one in-process SAPI5 call run at a time, since
+// engines like Vocalizer Expressive crash when several SpVoice instances
+// speak at once in one process. It only matters inside a shim, or for a
+// haze-tts without a bundled x64 shim. Waiting callers stay cancelable.
+var sapiNativeSlot = make(chan struct{}, 1)
+
+func acquireSAPINative(ctx context.Context) (func(), error) {
+	select {
+	case sapiNativeSlot <- struct{}{}:
+		return func() { <-sapiNativeSlot }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
 
 // SAPI5Provider uses installed Windows SAPI5 voices.
 type SAPI5Provider struct{}
@@ -31,10 +68,12 @@ func NewSAPI5Provider() *SAPI5Provider {
 
 func (p *SAPI5Provider) ID() string { return "sapi5" }
 
+// ListVoices enumerates voice tokens in this process, which loads no engine,
+// and merges the 32-bit view from the x86 shim.
 func (p *SAPI5Provider) ListVoices(ctx context.Context) ([]Voice, error) {
 	voices, nativeErr := p.listVoicesNative(ctx)
 	if !sapi5ShimDisabled() {
-		if shimVoices, err := listSAPI5ShimVoices(ctx); err == nil {
+		if shimVoices, err := sapiShimX86.listVoices(ctx); err == nil {
 			voices = mergeSAPIVoices(voices, shimVoices)
 		}
 	}
@@ -44,25 +83,70 @@ func (p *SAPI5Provider) ListVoices(ctx context.Context) ([]Voice, error) {
 	return nil, nativeErr
 }
 
+// Synthesize runs the job in the x64 shim, or in this process when no x64
+// shim is bundled, then falls back to the x86 shim. Inside a shim it speaks
+// in-process.
 func (p *SAPI5Provider) Synthesize(ctx context.Context, req Request) (Audio, error) {
 	req.Text = prepareSAPIText(req.Text)
-	audio, nativeErr := p.synthesizeNative(ctx, req)
-	if nativeErr == nil || sapi5ShimDisabled() {
-		return audio, nativeErr
+	if strings.TrimSpace(req.Text) == "" {
+		return Audio{}, fmt.Errorf("empty synthesis text")
 	}
-	if strings.TrimSpace(req.VoiceID) == "" || !sapiVoiceNotFound(nativeErr) {
-		return audio, nativeErr
+	if sapi5ShimDisabled() {
+		return p.synthesizeNative(ctx, req)
 	}
-	if shimAudio, err := synthesizeWithSAPI5Shim(ctx, req); err == nil {
-		return shimAudio, nil
+	var attempts []sapiAttempt
+	if path, ok := sapiShimX64.path(); ok {
+		attempts = append(attempts, sapiAttempt{name: "x64", run: sapiShimX64.synthesizer(path)})
+	} else {
+		attempts = append(attempts, sapiAttempt{name: "in-process", run: p.synthesizeNative})
 	}
-	return audio, nativeErr
+	if path, ok := sapiShimX86.path(); ok {
+		attempts = append(attempts, sapiAttempt{name: "x86", run: sapiShimX86.synthesizer(path)})
+	}
+	return synthesizeSAPIAttempts(ctx, req, attempts)
+}
+
+type sapiSynthesizer func(context.Context, Request) (Audio, error)
+
+type sapiAttempt struct {
+	name string
+	run  sapiSynthesizer
+}
+
+// synthesizeSAPIAttempts tries each attempt in order until one speaks. Any
+// failure moves on, not only a missing voice: a voice token can sit in the
+// 64-bit registry while its engine is installed only as a 32-bit COM server,
+// which fails at Speak with "class not registered". A canceled or expired
+// request stops, since a hung engine has already used up the deadline.
+func synthesizeSAPIAttempts(ctx context.Context, req Request, attempts []sapiAttempt) (Audio, error) {
+	var failures []error
+	for _, attempt := range attempts {
+		audio, err := attempt.run(ctx, req)
+		if err == nil {
+			if len(failures) > 0 {
+				// A recovered job returns no error, so this is the only trace
+				// of an engine that keeps failing in one architecture.
+				log.Printf("SAPI5 voice %q spoke in %s after %v", req.VoiceID, attempt.name, errors.Join(failures...))
+			}
+			return audio, nil
+		}
+		failures = append(failures, fmt.Errorf("%s: %w", attempt.name, err))
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	return Audio{}, errors.Join(failures...)
 }
 
 func (p *SAPI5Provider) listVoicesNative(ctx context.Context) ([]Voice, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	release, err := acquireSAPINative(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	if err := ole.CoInitializeEx(0, ole.COINIT_APARTMENTTHREADED); err != nil {
@@ -111,6 +195,11 @@ func (p *SAPI5Provider) synthesizeNative(ctx context.Context, req Request) (Audi
 	if strings.TrimSpace(req.Text) == "" {
 		return Audio{}, fmt.Errorf("empty synthesis text")
 	}
+	release, err := acquireSAPINative(ctx)
+	if err != nil {
+		return Audio{}, err
+	}
+	defer release()
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	if err := ole.CoInitializeEx(0, ole.COINIT_APARTMENTTHREADED); err != nil {
@@ -197,6 +286,9 @@ type sapi5ShimSynthRequest struct {
 	Rate            int         `json:"rate,omitempty"`
 	Volume          int         `json:"volume,omitempty"`
 	SentenceSilence float64     `json:"sentence_silence,omitempty"`
+	// TimeoutMS is the caller's remaining deadline, so a shim whose parent
+	// died still exits instead of holding a hung engine forever.
+	TimeoutMS int64 `json:"timeout_ms,omitempty"`
 }
 
 type sapi5ShimSynthResponse struct {
@@ -206,23 +298,39 @@ type sapi5ShimSynthResponse struct {
 	DataBase64 string      `json:"data_base64"`
 }
 
-func listSAPI5ShimVoices(ctx context.Context) ([]Voice, error) {
-	shim, err := sapi5ShimPath()
-	if err != nil {
-		return nil, err
+func (s sapiShim) listVoices(ctx context.Context) ([]Voice, error) {
+	path, ok := s.path()
+	if !ok {
+		return nil, fmt.Errorf("%w: %s not bundled", ErrProviderUnavailable, s.file)
 	}
 	var voices []Voice
-	if err := runSAPI5ShimJSON(ctx, shim, "list", nil, &voices); err != nil {
+	if err := runSAPI5ShimJSON(ctx, path, "list", nil, &voices); err != nil {
 		return nil, err
 	}
 	return voices, nil
 }
 
-func synthesizeWithSAPI5Shim(ctx context.Context, req Request) (Audio, error) {
-	shim, err := sapi5ShimPath()
-	if err != nil {
-		return Audio{}, err
+func (s sapiShim) synthesizer(path string) sapiSynthesizer {
+	return func(ctx context.Context, req Request) (Audio, error) {
+		return synthesizeWithSAPI5Shim(ctx, path, req)
 	}
+}
+
+// path finds the shim from its environment override or next to haze-tts.
+func (s sapiShim) path() (string, bool) {
+	path := strings.TrimSpace(os.Getenv(s.pathEnv))
+	if path == "" {
+		exe, err := os.Executable()
+		if err != nil {
+			return "", false
+		}
+		path = filepath.Join(filepath.Dir(exe), s.file)
+	}
+	info, err := os.Stat(path)
+	return path, err == nil && !info.IsDir()
+}
+
+func synthesizeWithSAPI5Shim(ctx context.Context, shim string, req Request) (Audio, error) {
 	payload := sapi5ShimSynthRequest{
 		Text:            req.Text,
 		VoiceID:         req.VoiceID,
@@ -231,6 +339,9 @@ func synthesizeWithSAPI5Shim(ctx context.Context, req Request) (Audio, error) {
 		Rate:            req.Rate,
 		Volume:          req.Volume,
 		SentenceSilence: req.SentenceSilence,
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		payload.TimeoutMS = max(time.Until(deadline).Milliseconds(), 1)
 	}
 	var response sapi5ShimSynthResponse
 	if err := runSAPI5ShimJSON(ctx, shim, "synthesize", payload, &response); err != nil {
@@ -251,6 +362,9 @@ func synthesizeWithSAPI5Shim(ctx context.Context, req Request) (Audio, error) {
 func runSAPI5ShimJSON(ctx context.Context, shim string, command string, input any, output any) error {
 	cmd := exec.CommandContext(ctx, shim, command)
 	cmd.Env = append(os.Environ(), sapi5ShimDisabledEnv+"=1")
+	// The daemon starts haze-tts without a console, and a console child of
+	// a consoleless parent would open a new window on every synthesis.
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindow}
 	if input != nil {
 		stdin, err := cmd.StdinPipe()
 		if err != nil {
@@ -280,24 +394,6 @@ func runSAPI5ShimJSON(ctx context.Context, shim string, command string, input an
 	return nil
 }
 
-func sapi5ShimPath() (string, error) {
-	if raw := strings.TrimSpace(os.Getenv(sapi5ShimPathEnv)); raw != "" {
-		if info, err := os.Stat(raw); err == nil && !info.IsDir() {
-			return raw, nil
-		}
-		return "", fmt.Errorf("%w: SAPI5 compatibility shim not found at %s", ErrProviderUnavailable, raw)
-	}
-	exe, err := os.Executable()
-	if err != nil {
-		return "", err
-	}
-	path := filepath.Join(filepath.Dir(exe), "haze-sapi5-shim.exe")
-	if info, err := os.Stat(path); err == nil && !info.IsDir() {
-		return path, nil
-	}
-	return "", fmt.Errorf("%w: SAPI5 compatibility shim not bundled", ErrProviderUnavailable)
-}
-
 func sapi5ShimDisabled() bool {
 	value := strings.TrimSpace(os.Getenv(sapi5ShimDisabledEnv))
 	return value == "1" || strings.EqualFold(value, "true")
@@ -324,10 +420,6 @@ func mergeSAPIVoices(native []Voice, shim []Voice) []Voice {
 		seen[name] = struct{}{}
 	}
 	return out
-}
-
-func sapiVoiceNotFound(err error) bool {
-	return err != nil && strings.Contains(strings.ToLower(err.Error()), "voice") && strings.Contains(strings.ToLower(err.Error()), "not found")
 }
 
 func createDispatch(progID string) (*ole.IDispatch, func(), error) {
@@ -364,7 +456,21 @@ func sapiVoiceFromToken(token *ole.IDispatch) (Voice, bool) {
 		Name:     descRaw.ToString(),
 		Provider: "sapi5",
 		Language: languages,
+		Arch:     sapiProcessArch(),
 	}, true
+}
+
+// sapiProcessArch names the architecture of this process, which decides the
+// registry view and COM servers SAPI5 can load voices from.
+func sapiProcessArch() string {
+	switch runtime.GOARCH {
+	case "amd64":
+		return "x64"
+	case "386":
+		return "x86"
+	default:
+		return runtime.GOARCH
+	}
 }
 
 func findSAPIVoiceToken(voice *ole.IDispatch, requested string) (*ole.IDispatch, error) {

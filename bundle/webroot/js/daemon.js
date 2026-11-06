@@ -142,6 +142,26 @@ const SECTIONS = [
         ],
     },
     {
+        title: 'Service Hosts',
+        note: 'A host of 127.0.0.1, localhost, or an address of this machine runs the service here. Any other host makes Haze connect to a remote instance at host:port instead. Only TTS can run remotely so far, and both machines need the same HAZE_REMOTE_TOKEN in .env.',
+        placements: [
+            ['services.go.tts', 'TTS'],
+            ['services.go.web_gateway', 'Web panel'],
+            ['services.go.data_ingest', 'Weather data ingest'],
+            ['services.go.product_render', 'Product renderer'],
+            ['services.go.playlist', 'Dynamic playlist'],
+            ['services.go.webhook', 'Webhooks'],
+            ['services.go.asr', 'Speech recognition'],
+            ['services.go.ivr', 'Phone IVR'],
+            ['services.rust.location', 'Locations'],
+            ['services.rust.cap_ingest', 'CAP ingest'],
+            ['services.rust.media', 'Media'],
+            ['services.rust.playout', 'Playout'],
+            ['services.rust.cgen', 'CG renderer'],
+            ['services.rust.netalert', 'Network alerts'],
+        ],
+    },
+    {
         title: 'Optional Workloads',
         items: [
             ['cap.cap_cp.enabled', 'CAP-CP alerts', 'Enable Canadian CAP-CP alert processing.'],
@@ -238,6 +258,8 @@ function renderSettings(payload) {
     formEl.innerHTML = SECTIONS.map((section) => `
         <article class="daemon-group">
             <h2>${escapeHtml(section.title)}</h2>
+            ${section.note ? `<p class="daemon-group-note">${escapeHtml(section.note)}</p>` : ''}
+            ${section.placements?.length ? `<div class="daemon-field-grid">${section.placements.map(([path, label]) => renderField(`${path}.host`, `${label} host`, '127.0.0.1') + renderField(`${path}.port`, `${label} port`, 'remote only')).join('')}</div>` : ''}
             <div class="daemon-toggle-list">
                 ${(section.items || []).map(([path, label, description]) => renderToggle(path, label, description)).join('')}
             </div>
@@ -283,6 +305,8 @@ function renderRuntime(runtime) {
 
 function runtimeDetail(service) {
     const parts = [];
+    if (service.remote) parts.push(`remote ${service.remote}`);
+    if (service.remote && !service.connected && service.last_error) parts.push(service.last_error);
     if (service.pid) parts.push(`pid ${service.pid}`);
     if (service.restart_count) parts.push(`${service.restart_count} restarts`);
     if (service.desired && service.desired !== service.status) parts.push(`desired ${service.desired}`);
@@ -291,11 +315,11 @@ function runtimeDetail(service) {
 }
 
 function serviceRunning(service) {
-    return ['running', 'restarting'].includes(String(service.status || '').toLowerCase());
+    return ['running', 'restarting', 'connecting'].includes(String(service.status || '').toLowerCase());
 }
 
 function serviceStopped(service) {
-    return ['stopped', 'missing'].includes(String(service.status || '').toLowerCase());
+    return ['stopped', 'missing', 'refused'].includes(String(service.status || '').toLowerCase());
 }
 
 async function controlService(serviceID, action, button) {
