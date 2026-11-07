@@ -314,15 +314,8 @@ fn feed_locations(feed: &FeedConfig, filter: &AlertFilterConfig, info: &AlertInf
             codes.into_iter().collect()
         };
     }
-    let coverage = feed
-        .locations
-        .coverage
-        .regions
-        .iter()
-        .map(|region| normalize_location(&region.id))
-        .filter(|code| !code.is_empty())
-        .collect::<HashSet<_>>();
-    if coverage.is_empty() {
+    let coverage = FeedCoverage::from_feed(feed);
+    if coverage.codes.is_empty() {
         return if feed.alert_covers_all_locations() {
             if codes.is_empty() {
                 vec!["*".to_string()]
@@ -333,15 +326,124 @@ fn feed_locations(feed: &FeedConfig, filter: &AlertFilterConfig, info: &AlertInf
             Vec::new()
         };
     }
-    let selected = codes
-        .iter()
-        .filter(|code| coverage.contains(*code))
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    if selected.is_empty() {
-        return Vec::new();
+    codes
+        .into_iter()
+        .filter(|code| coverage.covers(code))
+        .collect()
+}
+
+/// A feed's configured coverage codes. An ECCC forecast region code ending in
+/// "00" (065500) covers itself and every subregion sharing its first four
+/// digits (0655xx). Any other code, including a subregion configured on its
+/// own, covers only itself. NWS FIPS codes are always exact.
+struct FeedCoverage {
+    codes: Vec<CoverageCode>,
+}
+
+struct CoverageCode {
+    code: String,
+    /// The four-digit prefix an ECCC forecast region code covers.
+    region_prefix: Option<String>,
+    /// Subregions listed under this region in the feed config.
+    subregions: Vec<String>,
+}
+
+impl FeedCoverage {
+    fn from_feed(feed: &FeedConfig) -> Self {
+        let codes = feed
+            .locations
+            .coverage
+            .regions
+            .iter()
+            .filter_map(|region| {
+                let code = normalize_location(&region.id);
+                if code.is_empty() {
+                    return None;
+                }
+                let region_prefix = (!region.source.eq_ignore_ascii_case("nws")
+                    && is_same_code(&code)
+                    && code.ends_with("00"))
+                .then(|| code[..4].to_string());
+                let subregions = region
+                    .subregions
+                    .iter()
+                    .map(|subregion| normalize_location(&subregion.id))
+                    .filter(|subregion| !subregion.is_empty())
+                    .collect();
+                Some(CoverageCode {
+                    code,
+                    region_prefix,
+                    subregions,
+                })
+            })
+            .collect();
+        Self { codes }
     }
-    selected.into_iter().collect()
+
+    fn covers(&self, code: &str) -> bool {
+        self.lists(code) || self.region_for(code).is_some()
+    }
+
+    /// Whether `code` is configured itself, as a region or a listed subregion.
+    fn lists(&self, code: &str) -> bool {
+        self.codes
+            .iter()
+            .any(|entry| entry.code == code || entry.subregions.iter().any(|sub| sub == code))
+    }
+
+    /// The configured forecast region whose wildcard contains `code`.
+    fn region_for(&self, code: &str) -> Option<&CoverageCode> {
+        self.codes.iter().find(|entry| {
+            entry
+                .region_prefix
+                .as_deref()
+                .is_some_and(|prefix| is_same_code(code) && code.starts_with(prefix))
+        })
+    }
+}
+
+/// The most location codes one SAME header can carry.
+const SAME_MAX_LOCATIONS: usize = 31;
+
+/// Adds each covering forecast region code to the SAME codes, so radios set to
+/// the region or to one of its subregions both alarm. Regions come first, then
+/// subregions listed in the feed config, then the rest, because a header holds
+/// at most 31 codes and anything past that is dropped.
+fn with_regions_first(feed: &FeedConfig, codes: BTreeSet<String>) -> Vec<String> {
+    let coverage = FeedCoverage::from_feed(feed);
+    let mut regions = BTreeSet::new();
+    let mut configured = BTreeSet::new();
+    let mut rest = BTreeSet::new();
+    for code in codes {
+        if let Some(region) = coverage.region_for(&code) {
+            regions.insert(region.code.clone());
+            if region.code == code {
+                // The whole region is active, so its listed subregions are too.
+                configured.extend(region.subregions.iter().cloned());
+                continue;
+            }
+        }
+        if coverage.lists(&code) {
+            configured.insert(code);
+        } else {
+            rest.insert(code);
+        }
+    }
+    let mut ordered = Vec::new();
+    for code in regions.into_iter().chain(configured).chain(rest) {
+        if !ordered.contains(&code) {
+            ordered.push(code);
+        }
+    }
+    if ordered.len() > SAME_MAX_LOCATIONS {
+        tracing::warn!(
+            feed_id = %feed.id,
+            dropped = ?&ordered[SAME_MAX_LOCATIONS..],
+            "SAME header is limited to 31 location codes; dropping the rest"
+        );
+        ordered.truncate(SAME_MAX_LOCATIONS);
+    }
+    ordered
 }
 
 fn explicit_new_locations(info: &AlertInfo) -> BTreeSet<String> {
@@ -449,7 +551,7 @@ fn same_codes(
             }
         }
     }
-    same.into_iter().take(31).collect()
+    with_regions_first(feed, same)
 }
 
 fn source_enabled(feed: &FeedConfig, alert: &Alert) -> bool {
@@ -590,25 +692,32 @@ fn priority_eligible(alert: &Alert, info: &AlertInfo, same_event: &str) -> bool 
     if is_cancel(alert) || !is_fresh(alert, info, same_event) {
         return false;
     }
-    let explicit = info.parameters.iter().any(|parameter| {
-        let name = parameter.name.to_ascii_lowercase();
-        name.contains("broadcast_immediate")
-            && matches!(
-                parameter.value.trim().to_ascii_lowercase().as_str(),
-                "true" | "yes" | "1"
-            )
-    });
-    explicit
-        || (matches!(
-            info.severity.to_ascii_lowercase().as_str(),
-            "severe" | "extreme"
-        ) && matches!(
-            info.urgency.to_ascii_lowercase().as_str(),
-            "immediate" | "expected"
-        ) && matches!(
-            info.certainty.to_ascii_lowercase().as_str(),
-            "observed" | "likely"
-        ))
+    if parameter_values(info, "broadcast_immediate")
+        .any(|value| matches!(value.as_str(), "true" | "yes" | "1"))
+    {
+        return true;
+    }
+    // Advisories and statements air in the routine loop without tones.
+    if parameter_values(info, "alert_type")
+        .any(|value| matches!(value.as_str(), "advisory" | "statement"))
+    {
+        return false;
+    }
+    // Moderate covers ECCC yellow warnings and watches. ECCC sends most warnings
+    // with urgency "Future", so urgency only rules out ended (Past) products.
+    matches!(
+        info.severity.to_ascii_lowercase().as_str(),
+        "moderate" | "severe" | "extreme"
+    ) && !info.urgency.eq_ignore_ascii_case("past")
+        && !info.certainty.eq_ignore_ascii_case("unlikely")
+}
+
+/// Lowercased values of the info parameters whose name contains `wanted`.
+fn parameter_values<'a>(info: &'a AlertInfo, wanted: &'a str) -> impl Iterator<Item = String> + 'a {
+    info.parameters
+        .iter()
+        .filter(move |parameter| parameter.name.to_ascii_lowercase().contains(wanted))
+        .map(|parameter| parameter.value.trim().to_ascii_lowercase())
 }
 
 fn is_fresh(alert: &Alert, info: &AlertInfo, same_event: &str) -> bool {
@@ -853,6 +962,7 @@ mod tests {
                 coverage: FeedCoverageConfig {
                     regions: vec![FeedCoverageRegionConfig {
                         id: "065200".to_string(),
+                        ..Default::default()
                     }],
                 },
             },
@@ -955,6 +1065,7 @@ mod tests {
             .regions
             .push(FeedCoverageRegionConfig {
                 id: "065201".to_string(),
+                ..Default::default()
             });
         let feeds = vec![covered_feed];
 
@@ -1082,7 +1193,8 @@ mod tests {
 
         let mut update = alert("Update", "Expected", "Severe", "Likely");
         update.references = "cap-pac@canada.ca,alert-1,2026-09-22T12:00:00Z".to_string();
-        update.infos[0].areas[0].geocodes[0].value = "065201".to_string();
+        // 065301 is in another forecast region, outside the feed's 065200.
+        update.infos[0].areas[0].geocodes[0].value = "065301".to_string();
         let decisions = route_document(&update, "delivery-2", "now", &feeds, &mut state);
 
         assert!(decisions.is_empty());
@@ -1127,6 +1239,80 @@ mod tests {
     }
 
     #[test]
+    fn eccc_warnings_and_watches_tone_but_advisories_and_statements_do_not() {
+        // Severity, urgency, certainty, and Alert_Type as ECCC sends them.
+        let cases = [
+            ("Moderate", "Future", "Likely", "warning", true), // yellow warning
+            ("Severe", "Future", "Likely", "warning", true),   // orange warning
+            ("Moderate", "Immediate", "Likely", "warning", true), // yellow blizzard warning
+            ("Moderate", "Future", "Possible", "watch", true),  // watch
+            ("Moderate", "Future", "Likely", "advisory", false), // yellow advisory
+            ("Minor", "Expected", "Possible", "statement", false), // special weather statement
+            ("Minor", "Past", "Observed", "warning", false),    // ended
+        ];
+        for (severity, urgency, certainty, alert_type, tones) in cases {
+            let mut state = RouterState::default();
+            let mut warning = alert("Alert", urgency, severity, certainty);
+            warning.infos[0].parameters.push(haze_cap::model::NameValue {
+                name: "layer:EC-MSC-SMC:1.0:Alert_Type".to_string(),
+                value: alert_type.to_string(),
+            });
+            let decisions = route_document(&warning, "delivery", "now", &[feed()], &mut state);
+            assert_eq!(
+                decisions[0].kind == DispatchKind::Priority,
+                tones,
+                "{severity}/{urgency}/{certainty}/{alert_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn forecast_regions_cover_their_subregions_but_subregions_cover_only_themselves() {
+        // Saskatoon's coverage: two whole regions, one with listed subregions,
+        // plus a subregion configured on its own.
+        let mut feed = feed();
+        feed.locations.coverage.regions = vec![
+            FeedCoverageRegionConfig {
+                id: "065100".to_string(),
+                ..Default::default()
+            },
+            FeedCoverageRegionConfig {
+                id: "065500".to_string(),
+                subregions: vec![crate::config::FeedCoverageSubregionConfig {
+                    id: "065522".to_string(),
+                }],
+                ..Default::default()
+            },
+            FeedCoverageRegionConfig {
+                id: "073110".to_string(),
+                ..Default::default()
+            },
+        ];
+        let mut warning = alert("Alert", "Future", "Moderate", "Likely");
+        warning.infos[0].areas[0].geocodes = ["065100", "065411", "065511", "065522", "073110", "073120"]
+            .into_iter()
+            .map(|code| haze_cap::model::NameValue {
+                name: "layer:EC-MSC-SMC:1.0:CLC".to_string(),
+                value: code.to_string(),
+            })
+            .collect();
+
+        let mut state = RouterState::default();
+        let decisions = route_document(&warning, "delivery", "now", &[feed], &mut state);
+
+        assert_eq!(decisions[0].kind, DispatchKind::Priority);
+        assert_eq!(
+            decisions[0].newly_active_locations,
+            vec!["065100", "065511", "065522", "073110"]
+        );
+        // Regions first, then listed subregions, so a full header keeps them.
+        assert_eq!(
+            decisions[0].same_locations,
+            vec!["065100", "065500", "065522", "073110", "065511"]
+        );
+    }
+
+    #[test]
     fn translations_with_same_hazard_and_scope_are_one_group() {
         let mut alert = alert("Alert", "Immediate", "Extreme", "Observed");
         alert.infos[0].event_codes.push(haze_cap::model::NameValue {
@@ -1155,7 +1341,13 @@ mod tests {
             },
         ];
 
-        let same = same_codes(&alert, &alert.infos[0], &feed(), &["065201".to_string()]);
+        // Covering only the subregion keeps the region's own code out of the header.
+        let mut feed = feed();
+        feed.locations.coverage.regions = vec![FeedCoverageRegionConfig {
+            id: "065201".to_string(),
+            ..Default::default()
+        }];
+        let same = same_codes(&alert, &alert.infos[0], &feed, &["065201".to_string()]);
 
         assert_eq!(same, vec!["065201"]);
     }
@@ -1182,6 +1374,7 @@ mod tests {
             .regions
             .push(FeedCoverageRegionConfig {
                 id: "065201".to_string(),
+                ..Default::default()
             });
         let mut state = RouterState::default();
         let first = alert("Alert", "Expected", "Severe", "Likely");
@@ -1215,7 +1408,8 @@ mod tests {
         let decisions = route_document(&update, "delivery-eccc-update", "now", &[feed], &mut state);
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].newly_active_locations, vec!["065201"]);
-        assert_eq!(decisions[0].same_locations, vec!["065201"]);
+        // The configured forecast region 065200 contains 065201, so it is toned too.
+        assert_eq!(decisions[0].same_locations, vec!["065200", "065201"]);
         assert_eq!(decisions[0].kind, DispatchKind::Priority);
     }
 
@@ -1234,6 +1428,7 @@ mod tests {
         });
         feed.locations.coverage.regions = vec![FeedCoverageRegionConfig {
             id: "SKZ012".to_string(),
+            ..Default::default()
         }];
         let mut alert = alert("Alert", "Immediate", "Extreme", "Observed");
         alert.sender = "w-nws.webmaster@noaa.gov".to_string();
