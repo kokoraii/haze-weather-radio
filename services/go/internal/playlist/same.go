@@ -7,6 +7,7 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -180,15 +181,11 @@ func (p *feedPlanner) sameLocationsForData(data map[string]any) []string {
 	event := strings.ToUpper(fallbackText(firstText(nil, data, "same_event", "event"), "ADR"))
 	locations := sameLocationsFromData(data)
 	if len(locations) == 0 {
-		for _, region := range p.feed.Locations.Coverage.Regions {
-			if code := sameLocationCode(region.ID); code != "" {
-				locations = append(locations, code)
-			}
-			for _, subregion := range region.Subregions {
-				if code := sameLocationCode(subregion.ID); code != "" {
-					locations = append(locations, code)
-				}
-			}
+		// No locations of its own: use the feed's whole coverage.
+		if feed, ok := p.cfg.FeedConfig.Feed(p.feed.ID); ok {
+			locations = feed.FullHeader().Codes
+		} else {
+			log.Printf("playlist feed %s is missing from the feed config; its SAME header has no locations", p.feed.ID)
 		}
 	}
 	if event != "SVR" && event != "TOR" {

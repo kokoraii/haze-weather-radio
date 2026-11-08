@@ -20,6 +20,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/alertmodel"
+	"github.com/meowraii/haze-weather-radio/services/go/internal/feedconfig"
 )
 
 func TestServerIPUsesNonLoopbackLocalAddress(t *testing.T) {
@@ -2642,7 +2643,14 @@ func TestBroadcastAlertDataByFeedUsesEachFeedLocations(t *testing.T) {
 </feeds>`)
 	mustWrite(t, filepath.Join(dir, "managed", "csv", "CLC_Base_Zone.csv"), "CLC,FEATURE_ID,NAME,NOM\n046200,fixture,Manitoba coverage,\n046211,fixture,Manitoba local,\n013200,fixture,New Brunswick coverage,\n013211,fixture,New Brunswick local,\n")
 
-	session := wsSession{configPath: filepath.Join(dir, "config.yaml")}
+	// The snapshot the daemon publishes for these feeds: each region lists one
+	// subregion, so a whole-coverage header is the region plus that subregion.
+	feedConfig := feedconfig.NewStore()
+	feedConfig.Set(&feedconfig.Snapshot{Version: feedconfig.SnapshotVersion, Feeds: []feedconfig.Feed{
+		{FeedID: "mb-0001", Entries: []feedconfig.Entry{{ID: "046200", RegionCode: "046200", Matcher: feedconfig.Matcher{Kind: feedconfig.MatchPrefix, Value: "0462"}, Header: feedconfig.HeaderListed, Subregions: []feedconfig.Matcher{{Kind: feedconfig.MatchExact, Value: "046211"}}}}},
+		{FeedID: "nb-0001", Entries: []feedconfig.Entry{{ID: "013200", RegionCode: "013200", Matcher: feedconfig.Matcher{Kind: feedconfig.MatchPrefix, Value: "0132"}, Header: feedconfig.HeaderListed, Subregions: []feedconfig.Matcher{{Kind: feedconfig.MatchExact, Value: "013211"}}}}},
+	}})
+	session := wsSession{configPath: filepath.Join(dir, "config.yaml"), server: &Server{feedConfig: feedConfig}}
 	dataByFeed, err := session.broadcastAlertDataByFeed(map[string]any{
 		"originator":         "WXR",
 		"event":              "RWT",

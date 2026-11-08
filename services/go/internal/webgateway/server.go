@@ -16,6 +16,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/events"
+	"github.com/meowraii/haze-weather-radio/services/go/internal/feedconfig"
 )
 
 // Server is the first-pass Go HTTP/WebSocket gateway for Haze.
@@ -31,12 +32,21 @@ type Server struct {
 	breakIn             *OperatorBreakInManager
 	listeners           *ListenerTracker
 	feedMapResolveSlots chan struct{}
+	// feedConfig is the daemon's feed config, the source of feed coverage.
+	feedConfig     *feedconfig.Store
+	stopFeedConfig context.CancelFunc
 }
 
 // Close releases long-lived authentication and storage resources.
 func (s *Server) Close() {
-	if s != nil && s.auth != nil {
+	if s == nil {
+		return
+	}
+	if s.auth != nil {
 		s.auth.Close()
+	}
+	if s.stopFeedConfig != nil {
+		s.stopFeedConfig()
 	}
 }
 
@@ -67,6 +77,14 @@ func NewServerWithSurface(config Config, configPath string, webroot string, surf
 	mediaBridgeAddr := mediaHubBridgeAddr(config, os.Getenv("HAZE_MEDIA_BRIDGE_ADDR"), hostBridgeAddr)
 	mediaHub := NewMediaHub(mediaBridgeAddr)
 	mediaHub.SetAudioSource(mediaServiceControl(config))
+	feedConfig := feedconfig.NewStore()
+	feedConfigCtx, stopFeedConfig := context.WithCancel(context.Background())
+	if strings.TrimSpace(hostBridgeAddr) != "" {
+		// Several haze-web processes can run (one per surface), so the client id
+		// carries the process id.
+		clientID := fmt.Sprintf("haze-web-%s-%d-feedconfig", normalizeSurface(surface), os.Getpid())
+		go feedConfig.Run(feedConfigCtx, hostBridgeAddr, clientID)
+	}
 	return &Server{
 		startedAt:           time.Now().UTC(),
 		config:              config,
@@ -79,6 +97,8 @@ func NewServerWithSurface(config Config, configPath string, webroot string, surf
 		breakIn:             NewOperatorBreakInManager(),
 		listeners:           NewListenerTracker(),
 		feedMapResolveSlots: make(chan struct{}, publicFeedMapResolveConcurrency),
+		feedConfig:          feedConfig,
+		stopFeedConfig:      stopFeedConfig,
 	}
 }
 

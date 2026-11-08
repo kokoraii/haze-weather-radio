@@ -5027,7 +5027,9 @@ fn alert_feed_id_targets(feed_id: &str, feed: &FeedConfig) -> bool {
     let feed_id = feed_id.trim();
     feed_id == feed.id
         || feed_id == "*"
-        || (feed.alert_covers_all_locations() && !feed_id.is_empty())
+        || (!feed_id.is_empty()
+            && feed.alert_sources_enabled()
+            && crate::feed_config::has_no_coverage(&feed.id))
 }
 
 fn alert_pending(status: &str) -> bool {
@@ -5545,9 +5547,17 @@ mod tests {
                 },
                 ..Default::default()
             }),
-            locations: crate::config::FeedLocationsConfig::default(),
             ..Default::default()
         };
+        // The daemon's snapshot lists this feed with no coverage.
+        crate::feed_config::set(std::sync::Arc::new(haze_feed_config::FeedConfigSnapshot {
+            version: haze_feed_config::SNAPSHOT_VERSION,
+            generation: "test".to_string(),
+            feeds: vec![haze_feed_config::FeedCoverage {
+                feed_id: "CAP-IT-ALL".to_string(),
+                entries: Vec::new(),
+            }],
+        }));
         let item = AlertQueueItem {
             feed_ids: vec!["sk-0001".to_string()],
             ..Default::default()

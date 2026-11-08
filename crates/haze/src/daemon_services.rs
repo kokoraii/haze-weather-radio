@@ -2283,7 +2283,11 @@ fn publish_scheduled_package(publisher: &Sender<Value>, pkg_id: &str) {
     }));
 }
 
-fn decode_config_with_overlay<T>(path: &Path, app_dir: &Path, runtime_dir: &Path) -> Result<T>
+pub(crate) fn decode_config_with_overlay<T>(
+    path: &Path,
+    app_dir: &Path,
+    runtime_dir: &Path,
+) -> Result<T>
 where
     T: serde::de::DeserializeOwned,
 {
@@ -2381,7 +2385,7 @@ fn expand_env_vars(raw: &str) -> String {
     out
 }
 
-fn resolve_path(base: &Path, path: &Path) -> PathBuf {
+pub(crate) fn resolve_path(base: &Path, path: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
     } else {

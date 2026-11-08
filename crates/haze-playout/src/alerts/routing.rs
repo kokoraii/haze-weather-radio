@@ -1,10 +1,14 @@
 use super::*;
+use haze_feed_config::{FeedConfigSnapshot, FeedCoverage};
 
+/// Routes one CAP document to every enabled feed. Coverage comes from the
+/// daemon's feed config snapshot, never from feed XML.
 pub(crate) fn route_document(
     alert: &Alert,
     delivery_id: &str,
     received_at: &str,
     feeds: &[FeedConfig],
+    coverage: &FeedConfigSnapshot,
     state: &mut RouterState,
 ) -> Vec<AlertDispatch> {
     let mut dispatches = Vec::new();
@@ -26,6 +30,12 @@ pub(crate) fn route_document(
         if !routine_alert_allowed(alert) {
             continue;
         }
+        let Some(feed_coverage) = coverage.feed(&feed.id) else {
+            // Empty coverage means "every location", so a missing feed must not
+            // fall back to it.
+            tracing::warn!(feed_id = %feed.id, "feed is missing from the feed config snapshot; not routing to it");
+            continue;
+        };
 
         let provider = provider_for(feed, alert);
         let groups = info_groups(alert);
@@ -54,7 +64,7 @@ pub(crate) fn route_document(
                 .flat_map(|product| product.locations.iter().cloned())
                 .collect::<BTreeSet<_>>();
             let explicit_new = explicit_new_locations(info);
-            let mut current_locations = feed_locations(feed, &provider.filter, info);
+            let mut current_locations = feed_locations(feed, feed_coverage, &provider.filter, info);
             if current_locations.is_empty()
                 && alert.message_type.eq_ignore_ascii_case("update")
                 && all_location_codes(info).is_empty()
@@ -77,7 +87,7 @@ pub(crate) fn route_document(
                     .collect()
             };
             let same_event = same_event_code(alert, info);
-            let same_locations = same_codes(alert, info, feed, &newly_active_locations);
+            let same_locations = same_codes(alert, info, feed, feed_coverage, &newly_active_locations);
             let priority = !newly_active_locations.is_empty()
                 && priority_eligible(alert, info, &same_event)
                 && feed.same_enabled()
@@ -305,23 +315,26 @@ fn all_location_codes(info: &AlertInfo) -> BTreeSet<String> {
     codes
 }
 
-fn feed_locations(feed: &FeedConfig, filter: &AlertFilterConfig, info: &AlertInfo) -> Vec<String> {
+fn feed_locations(
+    feed: &FeedConfig,
+    coverage: &FeedCoverage,
+    filter: &AlertFilterConfig,
+    info: &AlertInfo,
+) -> Vec<String> {
     let codes = all_location_codes(info);
-    if !xml_bool(filter.use_feed_locations.as_deref(), true) {
-        return if codes.is_empty() {
+    let take_all = |codes: BTreeSet<String>| {
+        if codes.is_empty() {
             vec!["*".to_string()]
         } else {
             codes.into_iter().collect()
-        };
+        }
+    };
+    if !xml_bool(filter.use_feed_locations.as_deref(), true) {
+        return take_all(codes);
     }
-    let coverage = FeedCoverage::from_feed(feed);
-    if coverage.codes.is_empty() {
-        return if feed.alert_covers_all_locations() {
-            if codes.is_empty() {
-                vec!["*".to_string()]
-            } else {
-                codes.into_iter().collect()
-            }
+    if coverage.entries.is_empty() {
+        return if feed.alert_sources_enabled() {
+            take_all(codes)
         } else {
             Vec::new()
         };
@@ -330,120 +343,6 @@ fn feed_locations(feed: &FeedConfig, filter: &AlertFilterConfig, info: &AlertInf
         .into_iter()
         .filter(|code| coverage.covers(code))
         .collect()
-}
-
-/// A feed's configured coverage codes. An ECCC forecast region code ending in
-/// "00" (065500) covers itself and every subregion sharing its first four
-/// digits (0655xx). Any other code, including a subregion configured on its
-/// own, covers only itself. NWS FIPS codes are always exact.
-struct FeedCoverage {
-    codes: Vec<CoverageCode>,
-}
-
-struct CoverageCode {
-    code: String,
-    /// The four-digit prefix an ECCC forecast region code covers.
-    region_prefix: Option<String>,
-    /// Subregions listed under this region in the feed config.
-    subregions: Vec<String>,
-}
-
-impl FeedCoverage {
-    fn from_feed(feed: &FeedConfig) -> Self {
-        let codes = feed
-            .locations
-            .coverage
-            .regions
-            .iter()
-            .filter_map(|region| {
-                let code = normalize_location(&region.id);
-                if code.is_empty() {
-                    return None;
-                }
-                let region_prefix = (!region.source.eq_ignore_ascii_case("nws")
-                    && is_same_code(&code)
-                    && code.ends_with("00"))
-                .then(|| code[..4].to_string());
-                let subregions = region
-                    .subregions
-                    .iter()
-                    .map(|subregion| normalize_location(&subregion.id))
-                    .filter(|subregion| !subregion.is_empty())
-                    .collect();
-                Some(CoverageCode {
-                    code,
-                    region_prefix,
-                    subregions,
-                })
-            })
-            .collect();
-        Self { codes }
-    }
-
-    fn covers(&self, code: &str) -> bool {
-        self.lists(code) || self.region_for(code).is_some()
-    }
-
-    /// Whether `code` is configured itself, as a region or a listed subregion.
-    fn lists(&self, code: &str) -> bool {
-        self.codes
-            .iter()
-            .any(|entry| entry.code == code || entry.subregions.iter().any(|sub| sub == code))
-    }
-
-    /// The configured forecast region whose wildcard contains `code`.
-    fn region_for(&self, code: &str) -> Option<&CoverageCode> {
-        self.codes.iter().find(|entry| {
-            entry
-                .region_prefix
-                .as_deref()
-                .is_some_and(|prefix| is_same_code(code) && code.starts_with(prefix))
-        })
-    }
-}
-
-/// The most location codes one SAME header can carry.
-const SAME_MAX_LOCATIONS: usize = 31;
-
-/// Adds each covering forecast region code to the SAME codes, so radios set to
-/// the region or to one of its subregions both alarm. Regions come first, then
-/// subregions listed in the feed config, then the rest, because a header holds
-/// at most 31 codes and anything past that is dropped.
-fn with_regions_first(feed: &FeedConfig, codes: BTreeSet<String>) -> Vec<String> {
-    let coverage = FeedCoverage::from_feed(feed);
-    let mut regions = BTreeSet::new();
-    let mut configured = BTreeSet::new();
-    let mut rest = BTreeSet::new();
-    for code in codes {
-        if let Some(region) = coverage.region_for(&code) {
-            regions.insert(region.code.clone());
-            if region.code == code {
-                // The whole region is active, so its listed subregions are too.
-                configured.extend(region.subregions.iter().cloned());
-                continue;
-            }
-        }
-        if coverage.lists(&code) {
-            configured.insert(code);
-        } else {
-            rest.insert(code);
-        }
-    }
-    let mut ordered = Vec::new();
-    for code in regions.into_iter().chain(configured).chain(rest) {
-        if !ordered.contains(&code) {
-            ordered.push(code);
-        }
-    }
-    if ordered.len() > SAME_MAX_LOCATIONS {
-        tracing::warn!(
-            feed_id = %feed.id,
-            dropped = ?&ordered[SAME_MAX_LOCATIONS..],
-            "SAME header is limited to 31 location codes; dropping the rest"
-        );
-        ordered.truncate(SAME_MAX_LOCATIONS);
-    }
-    ordered
 }
 
 fn explicit_new_locations(info: &AlertInfo) -> BTreeSet<String> {
@@ -488,6 +387,7 @@ fn same_codes(
     alert: &Alert,
     info: &AlertInfo,
     feed: &FeedConfig,
+    coverage: &FeedCoverage,
     locations: &[String],
 ) -> Vec<String> {
     let mut same = BTreeSet::new();
@@ -537,21 +437,32 @@ fn same_codes(
         }
     }
     if same.is_empty() {
-        for region in &feed.locations.coverage.regions {
-            let code = normalize_location(&region.id);
-            if is_same_code(&code) && locations.contains(&code) {
-                same.insert(code);
+        for entry in &coverage.entries {
+            if is_same_code(&entry.region_code) && locations.contains(&entry.region_code) {
+                same.insert(entry.region_code.clone());
             }
         }
     }
-    if same.is_empty() && feed.alert_covers_all_locations() && alert.infos.len() == 1 {
+    if same.is_empty()
+        && coverage.entries.is_empty()
+        && feed.alert_sources_enabled()
+        && alert.infos.len() == 1
+    {
         for code in locations {
             if is_same_code(code) {
                 same.insert(code.clone());
             }
         }
     }
-    with_regions_first(feed, same)
+    let header = coverage.same_header(same.iter().map(String::as_str));
+    if !header.dropped.is_empty() {
+        tracing::warn!(
+            feed_id = %feed.id,
+            dropped = ?header.dropped,
+            "SAME header is limited to 31 location codes; dropping the rest"
+        );
+    }
+    header.codes
 }
 
 fn source_enabled(feed: &FeedConfig, alert: &Alert) -> bool {
@@ -943,10 +854,7 @@ pub(super) fn first_text<'a>(message: &'a Value, data: &'a Value, keys: &[&str])
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{
-        AlertFilterConfig, FeedAlertProviderConfig, FeedAlertsConfig, FeedCoverageConfig,
-        FeedCoverageRegionConfig, FeedLocationsConfig,
-    };
+    use crate::config::{AlertFilterConfig, FeedAlertProviderConfig, FeedAlertsConfig};
 
     fn feed() -> FeedConfig {
         FeedConfig {
@@ -958,16 +866,27 @@ mod tests {
                 },
                 ..Default::default()
             }),
-            locations: FeedLocationsConfig {
-                coverage: FeedCoverageConfig {
-                    regions: vec![FeedCoverageRegionConfig {
-                        id: "065200".to_string(),
-                        ..Default::default()
-                    }],
-                },
-            },
             ..Default::default()
         }
+    }
+
+    /// The snapshot the daemon would publish for `sk-0001` with these regions.
+    fn coverage(regions: &str) -> FeedConfigSnapshot {
+        let feed = haze_feed_config::compile_feed_xml(
+            "sk-0001",
+            &format!("<feed><locations><coverage>{regions}</coverage></locations></feed>"),
+        )
+        .expect("compile test coverage");
+        FeedConfigSnapshot {
+            version: haze_feed_config::SNAPSHOT_VERSION,
+            generation: "test".to_string(),
+            feeds: vec![feed],
+        }
+    }
+
+    /// The forecast region 065200, covering every 0652xx subregion.
+    fn default_coverage() -> FeedConfigSnapshot {
+        coverage(r#"<region id="065200"/>"#)
     }
 
     fn alert(message_type: &str, urgency: &str, severity: &str, certainty: &str) -> Alert {
@@ -1003,16 +922,17 @@ mod tests {
 
     #[test]
     fn only_new_qualified_locations_receive_priority_and_same() {
+        let cov = default_coverage();
         let mut state = RouterState::default();
         let feeds = vec![feed()];
         let first = alert("Alert", "Expected", "Severe", "Likely");
-        let decisions = route_document(&first, "delivery-1", "now", &feeds, &mut state);
+        let decisions = route_document(&first, "delivery-1", "now", &feeds, &cov, &mut state);
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].kind, DispatchKind::Priority);
         assert!(decisions[0].include_same);
 
         let update = alert("Update", "Expected", "Severe", "Likely");
-        let decisions = route_document(&update, "delivery-2", "now", &feeds, &mut state);
+        let decisions = route_document(&update, "delivery-2", "now", &feeds, &cov, &mut state);
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].kind, DispatchKind::Routine);
         assert!(!decisions[0].include_same);
@@ -1020,30 +940,31 @@ mod tests {
 
     #[test]
     fn root_parent_survives_multiple_updates_and_cancellation() {
+        let cov = default_coverage();
         let mut state = RouterState::default();
         let feeds = vec![feed()];
         let first = alert("Alert", "Expected", "Severe", "Likely");
-        route_document(&first, "delivery-first", "now", &feeds, &mut state);
+        route_document(&first, "delivery-first", "now", &feeds, &cov, &mut state);
 
         let mut update_one = alert("Update", "Expected", "Severe", "Likely");
         update_one.identifier = "update-1".to_string();
         update_one.references = "sender,alert-1,2026-09-22T12:00:00Z".to_string();
         let first_update =
-            route_document(&update_one, "delivery-update-1", "now", &feeds, &mut state);
+            route_document(&update_one, "delivery-update-1", "now", &feeds, &cov, &mut state);
         assert_eq!(first_update[0].parent_alert_id, "alert-1");
 
         let mut update_two = update_one.clone();
         update_two.identifier = "update-2".to_string();
         update_two.references = "sender,update-1,2026-09-22T12:05:00Z".to_string();
         let second_update =
-            route_document(&update_two, "delivery-update-2", "now", &feeds, &mut state);
+            route_document(&update_two, "delivery-update-2", "now", &feeds, &cov, &mut state);
         assert_eq!(second_update[0].parent_alert_id, "alert-1");
         assert_eq!(second_update[0].kind, DispatchKind::Routine);
 
         let mut cancellation = alert("Cancel", "Immediate", "Extreme", "Observed");
         cancellation.identifier = "cancel-1".to_string();
         cancellation.references = "sender,update-1,2026-09-22T12:05:00Z".to_string();
-        let cancelled = route_document(&cancellation, "delivery-cancel", "now", &feeds, &mut state);
+        let cancelled = route_document(&cancellation, "delivery-cancel", "now", &feeds, &cov, &mut state);
 
         assert_eq!(cancelled.len(), 1);
         assert_eq!(cancelled[0].kind, DispatchKind::Cancellation);
@@ -1058,22 +979,14 @@ mod tests {
     async fn urgent_lane_bypasses_routine_and_cancellation_retracts_lineage() {
         let temp = tempfile::tempdir().expect("temporary state directory");
         let pipeline = AlertPipeline::load(temp.path()).expect("load alert pipeline");
-        let mut covered_feed = feed();
-        covered_feed
-            .locations
-            .coverage
-            .regions
-            .push(FeedCoverageRegionConfig {
-                id: "065201".to_string(),
-                ..Default::default()
-            });
-        let feeds = vec![covered_feed];
+        let feeds = vec![feed()];
+        let cov = coverage(r#"<region id="065200"/><region id="065201"/>"#);
 
         let first = alert("Alert", "Future", "Minor", "Possible");
         pipeline
             .route(
                 &json!({"delivery_id":"delivery-first", "data":{"delivery_id":"delivery-first", "alert":first}}),
-                &feeds,
+                &feeds, &cov,
             )
             .await
             .expect("route routine alert");
@@ -1096,7 +1009,7 @@ mod tests {
         pipeline
             .route(
                 &json!({"delivery_id":"delivery-update", "data":{"delivery_id":"delivery-update", "alert":update}}),
-                &feeds,
+                &feeds, &cov,
             )
             .await
             .expect("route urgent update");
@@ -1123,7 +1036,7 @@ mod tests {
         let result = pipeline
             .route(
                 &json!({"delivery_id":"delivery-cancel", "data":{"delivery_id":"delivery-cancel", "alert":cancellation}}),
-                &feeds,
+                &feeds, &cov,
             )
             .await
             .expect("route cancellation");
@@ -1166,16 +1079,17 @@ mod tests {
 
     #[test]
     fn locationless_update_inherits_active_area_and_stays_routine() {
+        let cov = default_coverage();
         let mut state = RouterState::default();
         let feeds = vec![feed()];
         let first = alert("Alert", "Expected", "Severe", "Likely");
-        let initial = route_document(&first, "delivery-1", "now", &feeds, &mut state);
+        let initial = route_document(&first, "delivery-1", "now", &feeds, &cov, &mut state);
         assert_eq!(initial[0].kind, DispatchKind::Priority);
 
         let mut update = alert("Update", "Expected", "Severe", "Likely");
         update.references = "cap-pac@canada.ca,alert-1,2026-09-22T12:00:00Z".to_string();
         update.infos[0].areas.clear();
-        let decisions = route_document(&update, "delivery-2", "now", &feeds, &mut state);
+        let decisions = route_document(&update, "delivery-2", "now", &feeds, &cov, &mut state);
 
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].kind, DispatchKind::Routine);
@@ -1186,16 +1100,17 @@ mod tests {
 
     #[test]
     fn update_with_only_out_of_coverage_locations_does_not_inherit_old_area() {
+        let cov = default_coverage();
         let mut state = RouterState::default();
         let feeds = vec![feed()];
         let first = alert("Alert", "Expected", "Severe", "Likely");
-        route_document(&first, "delivery-1", "now", &feeds, &mut state);
+        route_document(&first, "delivery-1", "now", &feeds, &cov, &mut state);
 
         let mut update = alert("Update", "Expected", "Severe", "Likely");
         update.references = "cap-pac@canada.ca,alert-1,2026-09-22T12:00:00Z".to_string();
         // 065301 is in another forecast region, outside the feed's 065200.
         update.infos[0].areas[0].geocodes[0].value = "065301".to_string();
-        let decisions = route_document(&update, "delivery-2", "now", &feeds, &mut state);
+        let decisions = route_document(&update, "delivery-2", "now", &feeds, &cov, &mut state);
 
         assert!(decisions.is_empty());
         assert!(state.active["sk-0001"].is_empty());
@@ -1203,17 +1118,18 @@ mod tests {
 
     #[test]
     fn expired_active_product_does_not_suppress_new_same() {
+        let cov = default_coverage();
         let mut state = RouterState::default();
         let feeds = vec![feed()];
         let first = alert("Alert", "Expected", "Severe", "Likely");
-        let initial = route_document(&first, "delivery-1", "now", &feeds, &mut state);
+        let initial = route_document(&first, "delivery-1", "now", &feeds, &cov, &mut state);
         assert_eq!(initial[0].kind, DispatchKind::Priority);
         state.active.get_mut("sk-0001").unwrap()[0].expires_at =
             (Utc::now() - Duration::minutes(1)).to_rfc3339();
 
         let mut update = alert("Update", "Expected", "Severe", "Likely");
         update.references = "cap-pac@canada.ca,alert-1,2026-09-22T12:00:00Z".to_string();
-        let decisions = route_document(&update, "delivery-2", "now", &feeds, &mut state);
+        let decisions = route_document(&update, "delivery-2", "now", &feeds, &cov, &mut state);
 
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].kind, DispatchKind::Priority);
@@ -1222,16 +1138,17 @@ mod tests {
 
     #[test]
     fn subthreshold_and_cancelled_messages_never_receive_same() {
+        let cov = default_coverage();
         let mut state = RouterState::default();
         let feeds = vec![feed()];
         let low = alert("Alert", "Future", "Minor", "Possible");
-        let decisions = route_document(&low, "delivery-low", "now", &feeds, &mut state);
+        let decisions = route_document(&low, "delivery-low", "now", &feeds, &cov, &mut state);
         assert_eq!(decisions[0].kind, DispatchKind::Routine);
         assert!(!decisions[0].include_same);
 
         let mut cancelled = alert("Cancel", "Immediate", "Extreme", "Observed");
         cancelled.references = "sender,alert-1,2026-01-01T00:00:00Z".to_string();
-        let decisions = route_document(&cancelled, "delivery-cancel", "now", &feeds, &mut state);
+        let decisions = route_document(&cancelled, "delivery-cancel", "now", &feeds, &cov, &mut state);
         assert!(decisions.iter().all(|decision| !decision.include_same));
         assert!(decisions
             .iter()
@@ -1240,6 +1157,7 @@ mod tests {
 
     #[test]
     fn eccc_warnings_and_watches_tone_but_advisories_and_statements_do_not() {
+        let cov = default_coverage();
         // Severity, urgency, certainty, and Alert_Type as ECCC sends them.
         let cases = [
             ("Moderate", "Future", "Likely", "warning", true), // yellow warning
@@ -1257,7 +1175,7 @@ mod tests {
                 name: "layer:EC-MSC-SMC:1.0:Alert_Type".to_string(),
                 value: alert_type.to_string(),
             });
-            let decisions = route_document(&warning, "delivery", "now", &[feed()], &mut state);
+            let decisions = route_document(&warning, "delivery", "now", &[feed()], &cov, &mut state);
             assert_eq!(
                 decisions[0].kind == DispatchKind::Priority,
                 tones,
@@ -1268,26 +1186,14 @@ mod tests {
 
     #[test]
     fn forecast_regions_cover_their_subregions_but_subregions_cover_only_themselves() {
-        // Saskatoon's coverage: two whole regions, one with listed subregions,
-        // plus a subregion configured on its own.
-        let mut feed = feed();
-        feed.locations.coverage.regions = vec![
-            FeedCoverageRegionConfig {
-                id: "065100".to_string(),
-                ..Default::default()
-            },
-            FeedCoverageRegionConfig {
-                id: "065500".to_string(),
-                subregions: vec![crate::config::FeedCoverageSubregionConfig {
-                    id: "065522".to_string(),
-                }],
-                ..Default::default()
-            },
-            FeedCoverageRegionConfig {
-                id: "073110".to_string(),
-                ..Default::default()
-            },
-        ];
+        // Saskatoon-style coverage: whole regions with and without subregion
+        // lists, plus a subregion configured on its own.
+        let feed = feed();
+        let cov = coverage(
+            r#"<region id="065100" source="eccc"/><region id="065400" source="eccc"/>
+               <region id="065500" source="eccc"><subregion id="065522"/></region>
+               <region id="073110" source="eccc"/>"#,
+        );
         let mut warning = alert("Alert", "Future", "Moderate", "Likely");
         warning.infos[0].areas[0].geocodes = ["065100", "065411", "065511", "065522", "073110", "073120"]
             .into_iter()
@@ -1298,17 +1204,19 @@ mod tests {
             .collect();
 
         let mut state = RouterState::default();
-        let decisions = route_document(&warning, "delivery", "now", &[feed], &mut state);
+        let decisions = route_document(&warning, "delivery", "now", &[feed], &cov, &mut state);
 
         assert_eq!(decisions[0].kind, DispatchKind::Priority);
         assert_eq!(
             decisions[0].newly_active_locations,
-            vec!["065100", "065511", "065522", "073110"]
+            vec!["065100", "065411", "065511", "065522", "073110"]
         );
-        // Regions first, then listed subregions, so a full header keeps them.
+        // 065400 lists no subregions, so its affected 065411 joins the header.
+        // 065511 is covered by 065500 but not in its list, so it tones under the
+        // region code instead of appearing in the header itself.
         assert_eq!(
             decisions[0].same_locations,
-            vec!["065100", "065500", "065522", "073110", "065511"]
+            vec!["065100", "065400", "065500", "065522", "073110", "065411"]
         );
     }
 
@@ -1342,18 +1250,21 @@ mod tests {
         ];
 
         // Covering only the subregion keeps the region's own code out of the header.
-        let mut feed = feed();
-        feed.locations.coverage.regions = vec![FeedCoverageRegionConfig {
-            id: "065201".to_string(),
-            ..Default::default()
-        }];
-        let same = same_codes(&alert, &alert.infos[0], &feed, &["065201".to_string()]);
+        let cov = coverage(r#"<region id="065201"/>"#);
+        let same = same_codes(
+            &alert,
+            &alert.infos[0],
+            &feed(),
+            &cov.feeds[0],
+            &["065201".to_string()],
+        );
 
         assert_eq!(same, vec!["065201"]);
     }
 
     #[test]
     fn distinct_hazards_with_the_same_scope_remain_separate_products() {
+        let cov = default_coverage();
         let mut alert = alert("Alert", "Immediate", "Extreme", "Observed");
         let mut tornado = alert.infos[0].clone();
         tornado.event = "Tornado Warning".to_string();
@@ -1361,28 +1272,22 @@ mod tests {
         alert.infos.push(tornado);
 
         let mut state = RouterState::default();
-        let decisions = route_document(&alert, "delivery-hazards", "now", &[feed()], &mut state);
+        let decisions = route_document(&alert, "delivery-hazards", "now", &[feed()], &cov, &mut state);
         assert_eq!(decisions.len(), 2);
         assert_ne!(decisions[0].info_group_id, decisions[1].info_group_id);
     }
 
     #[test]
     fn eccc_issued_area_tones_only_the_newly_active_location() {
-        let mut feed = feed();
-        feed.locations
-            .coverage
-            .regions
-            .push(FeedCoverageRegionConfig {
-                id: "065201".to_string(),
-                ..Default::default()
-            });
+        let feed = feed();
+        let cov = coverage(r#"<region id="065200"/><region id="065201"/>"#);
         let mut state = RouterState::default();
         let first = alert("Alert", "Expected", "Severe", "Likely");
         route_document(
             &first,
             "delivery-eccc-first",
             "now",
-            &[feed.clone()],
+            &[feed.clone()], &cov,
             &mut state,
         );
 
@@ -1405,7 +1310,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let decisions = route_document(&update, "delivery-eccc-update", "now", &[feed], &mut state);
+        let decisions = route_document(&update, "delivery-eccc-update", "now", &[feed], &cov, &mut state);
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].newly_active_locations, vec!["065201"]);
         // The configured forecast region 065200 contains 065201, so it is toned too.
@@ -1426,10 +1331,7 @@ mod tests {
                 filter: AlertFilterConfig::default(),
             },
         });
-        feed.locations.coverage.regions = vec![FeedCoverageRegionConfig {
-            id: "SKZ012".to_string(),
-            ..Default::default()
-        }];
+        let cov = coverage(r#"<region id="SKZ012" source="nws"/>"#);
         let mut alert = alert("Alert", "Immediate", "Extreme", "Observed");
         alert.sender = "w-nws.webmaster@noaa.gov".to_string();
         alert.infos[0].event = "Tornado Warning".to_string();
@@ -1450,7 +1352,7 @@ mod tests {
         ];
 
         let mut state = RouterState::default();
-        let decisions = route_document(&alert, "delivery-nws", "now", &[feed], &mut state);
+        let decisions = route_document(&alert, "delivery-nws", "now", &[feed], &cov, &mut state);
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].kind, DispatchKind::Priority);
         assert_eq!(decisions[0].same_event, "TOR");
@@ -1459,6 +1361,7 @@ mod tests {
 
     #[tokio::test]
     async fn committed_router_outbox_replays_after_restart_and_dedupes_delivery() {
+        let cov = default_coverage();
         let temp = tempfile::tempdir().expect("temporary state directory");
         let pipeline = AlertPipeline::load(temp.path()).expect("load new router state");
         let alert = alert("Alert", "Expected", "Severe", "Likely");
@@ -1474,7 +1377,7 @@ mod tests {
         let feeds = vec![feed()];
 
         let first = pipeline
-            .route(&event, &feeds)
+            .route(&event, &feeds, &cov)
             .await
             .expect("commit delivery");
         assert!(!first.duplicate);
@@ -1489,7 +1392,7 @@ mod tests {
         assert_eq!(replay.len(), 1);
         assert!(replay[0].ready_sent);
         let duplicate = restarted
-            .route(&event, &feeds)
+            .route(&event, &feeds, &cov)
             .await
             .expect("dedupe redelivery");
         assert!(duplicate.duplicate);
@@ -1499,6 +1402,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_retraction_ack_is_durable_and_unblocks_dispatch() {
+        let cov = default_coverage();
         let temp = tempfile::tempdir().expect("temporary state directory");
         let pipeline =
             std::sync::Arc::new(AlertPipeline::load(temp.path()).expect("load alert pipeline"));
@@ -1511,7 +1415,7 @@ mod tests {
             }
         });
         pipeline
-            .route(&first_event, &[feed()])
+            .route(&first_event, &[feed()], &cov)
             .await
             .expect("route active alert");
 
@@ -1525,7 +1429,7 @@ mod tests {
             }
         });
         let result = pipeline
-            .route(&cancel_event, &[feed()])
+            .route(&cancel_event, &[feed()], &cov)
             .await
             .expect("route cancellation");
         let decision_id = result.dispatches[0].decision_id.clone();

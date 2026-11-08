@@ -1,10 +1,11 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration as StdDuration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Duration, Timelike, Utc};
 use haze_cap::model::{Alert, AlertInfo};
+use haze_feed_config::{FeedConfigSnapshot, SNAPSHOT_VERSION};
 use haze_media::{decode_wav, normalize_pcm};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -21,8 +22,12 @@ use crate::config::{
 const ROUTER_STATE_PATH: &str = "runtime/state/cap-alert-router.json";
 const ALERT_AUDIO_DIR: &str = "runtime/audio/alerts";
 const ALERT_QUEUE_DIR: &str = "runtime/queues/alerts";
+const ROUTER_CLIENT_ID: &str = "haze-cap-alert-router";
+/// How long the router waits for the daemon's feed config before asking again.
+const FEED_CONFIG_REPLY_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 const ROUTER_SUBSCRIPTIONS: &[&str] = &[
     "cap.alert.received",
+    "config.feeds.updated",
     "cap.alert.playlist.dispatch.acknowledged",
     "cap.alert.playlist.dispatch.failed",
     "cap.alert.cancellation.applied",
@@ -137,7 +142,12 @@ impl AlertPipeline {
     }
 
     /// Commits routing decisions and their pending dispatches before intake is acknowledged.
-    pub(crate) async fn route(&self, event: &Value, feeds: &[FeedConfig]) -> Result<RoutingResult> {
+    pub(crate) async fn route(
+        &self,
+        event: &Value,
+        feeds: &[FeedConfig],
+        coverage: &FeedConfigSnapshot,
+    ) -> Result<RoutingResult> {
         let data = event.get("data").unwrap_or(&Value::Null);
         let delivery_id = first_text(event, data, &["delivery_id"]).to_string();
         if delivery_id.is_empty() {
@@ -164,7 +174,7 @@ impl AlertPipeline {
         }
         let mut next_state = state.clone();
         let mut dispatches =
-            route_document(&alert, &delivery_id, &received_at, feeds, &mut next_state);
+            route_document(&alert, &delivery_id, &received_at, feeds, coverage, &mut next_state);
         next_state.processed_delivery_ids.insert(delivery_id);
         for dispatch in &mut dispatches {
             next_state.next_sequence = next_state.next_sequence.saturating_add(1);
@@ -355,7 +365,7 @@ impl AlertPipeline {
 }
 
 pub(crate) async fn connect_alert_router(addr: &str) -> Result<crate::bridge::BridgeConnection> {
-    crate::bridge::connect_consumer_retry(addr, "haze-cap-alert-router", ROUTER_SUBSCRIPTIONS).await
+    crate::bridge::connect_consumer_retry(addr, ROUTER_CLIENT_ID, ROUTER_SUBSCRIPTIONS).await
 }
 
 pub(crate) async fn run_router(
@@ -420,15 +430,40 @@ async fn run_router_session(
         }
     }
 
-    while let Some(event) = events.recv().await {
+    // Routing needs coverage, so wait for the daemon's feed config first. Events
+    // that arrive meanwhile are held and handled in order afterwards.
+    let mut held = VecDeque::new();
+    let Some(snapshot) = request_feed_config(&client, &mut events, &mut held).await else {
+        feed_workers.abort_all();
+        return;
+    };
+    tracing::info!(generation = %snapshot.generation, "CAP router loaded the feed config");
+    let mut feed_config = std::sync::Arc::new(snapshot);
+    crate::feed_config::set(std::sync::Arc::clone(&feed_config));
+
+    loop {
+        let event = match held.pop_front() {
+            Some(event) => event,
+            None => match events.recv().await {
+                Some(event) => event,
+                None => break,
+            },
+        };
         match string_at(&event, "type") {
+            "config.feeds.updated" => {
+                if let Some(snapshot) = decode_feed_config(&event) {
+                    tracing::info!(generation = %snapshot.generation, "CAP router applied a feed config update");
+                    feed_config = std::sync::Arc::new(snapshot);
+                    crate::feed_config::set(std::sync::Arc::clone(&feed_config));
+                }
+            }
             "cap.alert.received" => {
                 let data = event.get("data").unwrap_or(&Value::Null);
                 let delivery_id = first_text(&event, data, &["delivery_id"]);
                 let _ = client
                     .publish(stage_timing_event("receipt", delivery_id, &event, 0))
                     .await;
-                match pipeline.route(&event, &cfg.feeds).await {
+                match pipeline.route(&event, &cfg.feeds, &feed_config).await {
                     Ok(result) => {
                         let source_id = data
                             .get("ingest")
@@ -506,6 +541,64 @@ async fn run_router_session(
         }
     }
     feed_workers.abort_all();
+}
+
+/// Asks the daemon for the feed config snapshot and waits for it, asking again
+/// every few seconds. Other events are held in `held` in arrival order. Returns
+/// `None` when the connection closes first.
+async fn request_feed_config(
+    client: &BridgeClient,
+    events: &mut tokio::sync::mpsc::Receiver<Value>,
+    held: &mut VecDeque<Value>,
+) -> Option<FeedConfigSnapshot> {
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let subject = format!("router-feed-config-{attempt}");
+        let request = json!({
+            "type": "config.feeds.request",
+            "source": ROUTER_CLIENT_ID,
+            "reply_to": ROUTER_CLIENT_ID,
+            "subject": subject,
+        });
+        if client.publish(request).await.is_err() {
+            return None;
+        }
+        let deadline = tokio::time::Instant::now() + FEED_CONFIG_REPLY_TIMEOUT;
+        loop {
+            match tokio::time::timeout_at(deadline, events.recv()).await {
+                Ok(Some(event)) => match string_at(&event, "type") {
+                    "config.feeds.snapshot" | "config.feeds.updated" => {
+                        if let Some(snapshot) = decode_feed_config(&event) {
+                            return Some(snapshot);
+                        }
+                    }
+                    _ => held.push_back(event),
+                },
+                Ok(None) => return None,
+                Err(_) => {
+                    tracing::warn!(attempt, "no feed config from the daemon yet; asking again");
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn decode_feed_config(event: &Value) -> Option<FeedConfigSnapshot> {
+    let data = event.get("data")?.clone();
+    let snapshot: FeedConfigSnapshot = serde_json::from_value(data)
+        .map_err(|err| tracing::error!("unreadable feed config snapshot: {err}"))
+        .ok()?;
+    if snapshot.version != SNAPSHOT_VERSION {
+        tracing::error!(
+            version = snapshot.version,
+            expected = SNAPSHOT_VERSION,
+            "ignoring a feed config snapshot of another version"
+        );
+        return None;
+    }
+    Some(snapshot)
 }
 
 async fn run_feed_dispatcher(

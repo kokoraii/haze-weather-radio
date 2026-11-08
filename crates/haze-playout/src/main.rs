@@ -2,6 +2,7 @@ mod alerts;
 mod bridge;
 mod config;
 mod engine;
+mod feed_config;
 mod sinks;
 
 use std::path::PathBuf;

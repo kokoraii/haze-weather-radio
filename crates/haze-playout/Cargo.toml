@@ -21,6 +21,7 @@ haze-media = { path = "../haze-media" }
 haze-bridge-client = { path = "../haze-bridge-client" }
 haze-media-protocol = { path = "../haze-media-protocol" }
 haze-cap = { path = "../haze-cap" }
+haze-feed-config = { path = "../haze-feed-config" }
 haze-same = { path = "../haze-same" }
 hound = "3.5"
 memmap2 = "0.9"

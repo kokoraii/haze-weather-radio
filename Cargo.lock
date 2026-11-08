@@ -2235,6 +2235,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "dunce",
+ "haze-feed-config",
  "haze-media-protocol",
  "haze-same",
  "ksni",
@@ -2330,6 +2331,18 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+]
+
+[[package]]
+name = "haze-feed-config"
+version = "0.1.0"
+dependencies = [
+ "quick-xml",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2430,6 +2443,7 @@ dependencies = [
  "dunce",
  "haze-bridge-client",
  "haze-cap",
+ "haze-feed-config",
  "haze-media",
  "haze-media-protocol",
  "haze-same",

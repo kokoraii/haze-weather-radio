@@ -656,6 +656,7 @@ fn host_consumes_event(value: &Value) -> bool {
         value.get("type").and_then(Value::as_str),
         Some(
             "service.control"
+                | crate::feed_config::REQUEST_EVENT
                 | "automation.dispatch.accepted"
                 | "automation.dispatch.completed"
                 | "automation.dispatch.failed"

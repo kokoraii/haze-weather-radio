@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/meowraii/haze-weather-radio/services/go/internal/datastore"
+	"github.com/meowraii/haze-weather-radio/services/go/internal/feedconfig"
 )
 
 var errSystemShutdown = errors.New("system shutdown requested")
@@ -32,11 +33,26 @@ func Run(ctx context.Context, options Options) error {
 			store.Close()
 		}
 	}()
+	// Coverage comes from the daemon's feed config, so wait for it before the
+	// first load.
+	feedConfig := feedconfig.NewStore()
+	go feedConfig.Run(ctx, options.BridgeAddr, serviceID+"-feedconfig")
 	for {
+		waitCtx, cancelWait := context.WithTimeout(ctx, 30*time.Second)
+		snapshot, err := feedConfig.Wait(waitCtx)
+		cancelWait()
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			log.Printf("product render waiting for the daemon's feed config: %v", err)
+			continue
+		}
 		cfg, err := loadConfig(options.ConfigPath)
 		if err != nil {
 			return err
 		}
+		cfg = applyFeedConfig(cfg, snapshot)
 		if store == nil {
 			store, err = openStore(ctx, cfg)
 			if err != nil {
@@ -59,6 +75,7 @@ func Run(ctx context.Context, options Options) error {
 			bridge:     bridge,
 			options:    options,
 			lastLoaded: time.Now(),
+			feedConfig: feedConfig,
 		}
 		err = service.runConnected(ctx)
 		_ = bridge.Close()
@@ -78,6 +95,7 @@ type Service struct {
 	bridge     *bridgeClient
 	options    Options
 	lastLoaded time.Time
+	feedConfig *feedconfig.Store
 	tonedMu    sync.Mutex
 	tonedCAP   map[string]struct{}
 }
@@ -247,8 +265,18 @@ func wxOnDemandRequestFromEvent(event map[string]any) wxOnDemandRequest {
 	}
 }
 
+// refreshConfigIfNeeded reloads config on the refresh interval, or at once when
+// the daemon publishes a new feed config. Per-job worker copies have no refresh
+// interval and never reload.
 func (s *Service) refreshConfigIfNeeded() {
-	if s.options.Refresh <= 0 || time.Since(s.lastLoaded) < s.options.Refresh {
+	if s.options.Refresh <= 0 {
+		return
+	}
+	if snapshot, ok := s.feedConfig.Current(); ok && snapshot.Generation != s.cfg.FeedConfigGeneration {
+		s.refreshConfigNow()
+		return
+	}
+	if time.Since(s.lastLoaded) < s.options.Refresh {
 		return
 	}
 	s.refreshConfigNow()
@@ -261,6 +289,8 @@ func (s *Service) refreshConfigNow() {
 		s.lastLoaded = time.Now()
 		return
 	}
+	snapshot, _ := s.feedConfig.Current()
+	cfg = applyFeedConfig(cfg, snapshot)
 	cfg.Store = s.cfg.Store
 	cfg = inheritRenderFeedCanonicalIDs(cfg, s.cfg)
 	s.cfg = cfg

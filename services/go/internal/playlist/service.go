@@ -21,6 +21,7 @@ import (
 	"github.com/meowraii/haze-weather-radio/services/go/internal/alertmodel"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/alerttext"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/datastore"
+	"github.com/meowraii/haze-weather-radio/services/go/internal/feedconfig"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/lead"
 )
 
@@ -46,11 +47,24 @@ func Run(ctx context.Context, options Options) error {
 	if options.Lookahead <= 0 {
 		options.Lookahead = 2 * time.Minute
 	}
+	feedConfig := feedconfig.NewStore()
+	go feedConfig.Run(ctx, options.BridgeAddr, serviceID+"-feedconfig")
 	for {
+		waitCtx, cancelWait := context.WithTimeout(ctx, 30*time.Second)
+		_, err := feedConfig.Wait(waitCtx)
+		cancelWait()
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			log.Printf("playlist waiting for the daemon's feed config: %v", err)
+			continue
+		}
 		cfg, err := loadConfig(options.ConfigPath, options.OutDir)
 		if err != nil {
 			return err
 		}
+		cfg.FeedConfig = feedConfig
 		store, err := datastore.Open(ctx, cfg.Root.Storage, cfg.BaseDir)
 		if err != nil {
 			return err

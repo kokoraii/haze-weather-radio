@@ -1,0 +1,267 @@
+{
+  "description": "Shared coverage cases. crates/haze-feed-config compiles each xml snippet and checks it equals feed; it and services/go/internal/feedconfig both evaluate covers, headers, and full_header against the compiled feed.",
+  "cases": [
+    {
+      "name": "a region without subregions keeps every affected subregion",
+      "xml": "<region id=\"065400\" source=\"eccc\" derive_forecast=\"sk-1\"/>",
+      "feed": {
+        "feed_id": "test",
+        "entries": [
+          {
+            "id": "065400",
+            "source": "eccc",
+            "name": "",
+            "derive_forecast": "sk-1",
+            "region_code": "065400",
+            "matcher": { "kind": "prefix", "value": "0654" },
+            "header": "all",
+            "subregions": []
+          }
+        ]
+      },
+      "covers": { "065400": true, "065411": true, "065511": false, "0654": false },
+      "headers": [
+        { "codes": ["065412", "065411"], "expect": ["065400", "065411", "065412"], "dropped": [] },
+        { "codes": ["065400"], "expect": ["065400"], "dropped": [] },
+        { "codes": ["065511"], "expect": ["065511"], "dropped": [] }
+      ],
+      "full_header": ["065400"]
+    },
+    {
+      "name": "a region with listed subregions keeps only those",
+      "xml": "<region id=\"065500\" source=\"eccc\"><subregion id=\"065512\"/><subregion id=\"065521\"/></region>",
+      "feed": {
+        "feed_id": "test",
+        "entries": [
+          {
+            "id": "065500",
+            "source": "eccc",
+            "name": "",
+            "derive_forecast": "",
+            "region_code": "065500",
+            "matcher": { "kind": "prefix", "value": "0655" },
+            "header": "listed",
+            "subregions": [
+              { "kind": "exact", "value": "065512" },
+              { "kind": "exact", "value": "065521" }
+            ]
+          }
+        ]
+      },
+      "covers": { "065533": true, "065512": true, "065611": false },
+      "headers": [
+        { "codes": ["065512", "065533"], "expect": ["065500", "065512"], "dropped": [] },
+        { "codes": ["065500"], "expect": ["065500", "065512", "065521"], "dropped": [] }
+      ],
+      "full_header": ["065500", "065512", "065521"]
+    },
+    {
+      "name": "a four-digit asterisk adds its region code and keeps every subregion",
+      "xml": "<region id=\"0655*\" source=\"eccc\"><subregion id=\"065512\"/></region>",
+      "feed": {
+        "feed_id": "test",
+        "entries": [
+          {
+            "id": "0655*",
+            "source": "eccc",
+            "name": "",
+            "derive_forecast": "",
+            "region_code": "065500",
+            "matcher": { "kind": "prefix", "value": "0655" },
+            "header": "all",
+            "subregions": [{ "kind": "exact", "value": "065512" }]
+          }
+        ]
+      },
+      "covers": { "065533": true, "065611": false },
+      "headers": [
+        { "codes": ["065533", "065512"], "expect": ["065500", "065512", "065533"], "dropped": [] }
+      ],
+      "full_header": ["065500", "065512"]
+    },
+    {
+      "name": "a five-digit asterisk covers its subregions without a region code",
+      "xml": "<region id=\"06551*\" source=\"eccc\"/>",
+      "feed": {
+        "feed_id": "test",
+        "entries": [
+          {
+            "id": "06551*",
+            "source": "eccc",
+            "name": "",
+            "derive_forecast": "",
+            "region_code": "",
+            "matcher": { "kind": "prefix", "value": "06551" },
+            "header": "all",
+            "subregions": []
+          }
+        ]
+      },
+      "covers": { "065512": true, "065521": false },
+      "headers": [
+        { "codes": ["065515", "065512"], "expect": ["065512", "065515"], "dropped": [] }
+      ],
+      "full_header": []
+    },
+    {
+      "name": "a listed wildcard subregion keeps its matches",
+      "xml": "<region id=\"065500\" source=\"eccc\"><subregion id=\"06551*\"/></region>",
+      "feed": {
+        "feed_id": "test",
+        "entries": [
+          {
+            "id": "065500",
+            "source": "eccc",
+            "name": "",
+            "derive_forecast": "",
+            "region_code": "065500",
+            "matcher": { "kind": "prefix", "value": "0655" },
+            "header": "listed",
+            "subregions": [{ "kind": "prefix", "value": "06551" }]
+          }
+        ]
+      },
+      "covers": { "065521": true },
+      "headers": [
+        { "codes": ["065512", "065521"], "expect": ["065500", "065512"], "dropped": [] }
+      ],
+      "full_header": ["065500"]
+    },
+    {
+      "name": "a subregion configured alone covers only itself",
+      "xml": "<region id=\"073110\" source=\"eccc\" derive_forecast=\"ab-17\"/>",
+      "feed": {
+        "feed_id": "test",
+        "entries": [
+          {
+            "id": "073110",
+            "source": "eccc",
+            "name": "",
+            "derive_forecast": "ab-17",
+            "region_code": "073110",
+            "matcher": { "kind": "exact", "value": "073110" },
+            "header": "all",
+            "subregions": []
+          }
+        ]
+      },
+      "covers": { "073110": true, "073120": false, "073100": false },
+      "headers": [
+        { "codes": ["073110", "073120"], "expect": ["073110", "073120"], "dropped": [] }
+      ],
+      "full_header": ["073110"]
+    },
+    {
+      "name": "NWS codes are always exact",
+      "xml": "<region id=\"038100\" source=\"nws\" name=\"Example, ND\"/><region id=\"NDZ012\" source=\"nws\"/>",
+      "feed": {
+        "feed_id": "test",
+        "entries": [
+          {
+            "id": "038100",
+            "source": "nws",
+            "name": "Example, ND",
+            "derive_forecast": "",
+            "region_code": "038100",
+            "matcher": { "kind": "exact", "value": "038100" },
+            "header": "all",
+            "subregions": []
+          },
+          {
+            "id": "NDZ012",
+            "source": "nws",
+            "name": "",
+            "derive_forecast": "",
+            "region_code": "",
+            "matcher": { "kind": "exact", "value": "NDZ012" },
+            "header": "all",
+            "subregions": []
+          }
+        ]
+      },
+      "covers": { "038100": true, "038101": false, "NDZ012": true },
+      "headers": [
+        { "codes": ["038100"], "expect": ["038100"], "dropped": [] }
+      ],
+      "full_header": ["038100"]
+    },
+    {
+      "name": "a listed subregion outside its region adds that subregion",
+      "xml": "<region id=\"052600\" source=\"eccc\"><subregion id=\"052323\"/></region>",
+      "feed": {
+        "feed_id": "test",
+        "entries": [
+          {
+            "id": "052600",
+            "source": "eccc",
+            "name": "",
+            "derive_forecast": "",
+            "region_code": "052600",
+            "matcher": { "kind": "prefix", "value": "0526" },
+            "header": "listed",
+            "subregions": [{ "kind": "exact", "value": "052323" }]
+          }
+        ]
+      },
+      "covers": { "052323": true, "052310": false, "052611": true },
+      "headers": [
+        { "codes": ["052323", "052611"], "expect": ["052600", "052323"], "dropped": [] }
+      ],
+      "full_header": ["052600", "052323"]
+    },
+    {
+      "name": "the 31-code limit keeps regions and listed subregions first",
+      "xml": "<region id=\"065400\" source=\"eccc\"/><region id=\"065500\" source=\"eccc\"><subregion id=\"065521\"/></region>",
+      "feed": {
+        "feed_id": "test",
+        "entries": [
+          {
+            "id": "065400",
+            "source": "eccc",
+            "name": "",
+            "derive_forecast": "",
+            "region_code": "065400",
+            "matcher": { "kind": "prefix", "value": "0654" },
+            "header": "all",
+            "subregions": []
+          },
+          {
+            "id": "065500",
+            "source": "eccc",
+            "name": "",
+            "derive_forecast": "",
+            "region_code": "065500",
+            "matcher": { "kind": "prefix", "value": "0655" },
+            "header": "listed",
+            "subregions": [{ "kind": "exact", "value": "065521" }]
+          }
+        ]
+      },
+      "covers": {},
+      "headers": [
+        {
+          "codes": [
+            "065533", "065521",
+            "065410", "065411", "065412", "065413", "065414", "065415", "065416", "065417", "065418", "065419",
+            "065420", "065421", "065422", "065423", "065424", "065425", "065426", "065427", "065428", "065429",
+            "065430", "065431", "065432", "065433", "065434", "065435", "065436", "065437", "065438", "065439"
+          ],
+          "expect": [
+            "065400", "065500", "065521",
+            "065410", "065411", "065412", "065413", "065414", "065415", "065416", "065417", "065418", "065419",
+            "065420", "065421", "065422", "065423", "065424", "065425", "065426", "065427", "065428", "065429",
+            "065430", "065431", "065432", "065433", "065434", "065435", "065436", "065437"
+          ],
+          "dropped": ["065438", "065439"]
+        }
+      ],
+      "full_header": ["065400", "065500", "065521"]
+    }
+  ],
+  "invalid": [
+    { "name": "an asterisk in the middle", "xml": "<region id=\"06*5\" source=\"eccc\"/>", "error_contains": "only allowed at the end" },
+    { "name": "a wildcard that is too broad", "xml": "<region id=\"0*\" source=\"eccc\"/>", "error_contains": "two to five digits" },
+    { "name": "an NWS wildcard", "xml": "<region id=\"0381*\" source=\"nws\"/>", "error_contains": "NWS codes cannot use a wildcard" },
+    { "name": "a region with no id", "xml": "<region source=\"eccc\"/>", "error_contains": "no id" }
+  ]
+}

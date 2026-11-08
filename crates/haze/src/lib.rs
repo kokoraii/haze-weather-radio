@@ -1,4 +1,5 @@
 mod daemon_services;
+mod feed_config;
 mod go_services;
 mod host_bridge;
 mod remote_service;
@@ -168,6 +169,9 @@ pub fn run(args: DaemonArgs) -> Result<()> {
     }
     #[cfg(not(windows))]
     signals::install_shutdown_handler()?;
+    // Loaded before any service starts: services ask for this snapshot on
+    // connect, and an invalid feed config stops Haze here.
+    let mut feed_config = feed_config::FeedConfigService::start(&host, host_bridge.publisher())?;
     let mut daemon_services = daemon_services::DaemonServices::start(
         &host,
         host_bridge.publisher(),
@@ -184,6 +188,7 @@ pub fn run(args: DaemonArgs) -> Result<()> {
     let desktop_tray = tray::TrayController::start();
     wait_for_shutdown(
         &host,
+        &mut feed_config,
         &mut daemon_services,
         &mut go_services,
         host_bridge.publisher(),
@@ -195,6 +200,7 @@ pub fn run(args: DaemonArgs) -> Result<()> {
 
 fn wait_for_shutdown(
     host: &ServiceHostConfig,
+    feed_config: &mut feed_config::FeedConfigService,
     daemon_services: &mut daemon_services::DaemonServices,
     go_services: &mut go_services::GoServiceSupervisor,
     publisher: Sender<Value>,
@@ -250,10 +256,12 @@ fn wait_for_shutdown(
                 break;
             }
         };
+        feed_config.poll();
         for event in first_event
             .into_iter()
             .chain(service_events.try_iter().take(255))
         {
+            feed_config.handle_event(&event);
             daemon_services.handle_event(&event);
             if go_services.handle_control_event(&event) {
                 go_services.poll_children();

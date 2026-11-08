@@ -22,7 +22,7 @@ func (s *wsSession) previewAlert(payload map[string]any) (map[string]any, error)
 	includeSame := boolPayload(payload, "include_same", true)
 	allFeedLocations := boolPayload(payload, "all_feed_locations", false)
 	alertID := safeID(fmt.Sprintf("preview-%d", time.Now().UTC().UnixNano()))
-	locationsByFeed, err := alertLocationsByFeed(s.configPath, payload, targets, allFeedLocations)
+	locationsByFeed, err := alertLocationsByFeed(s.server.feedConfig, s.configPath, payload, targets, allFeedLocations)
 	if err != nil {
 		return nil, err
 	}
