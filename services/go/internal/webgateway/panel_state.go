@@ -154,6 +154,7 @@ var BuildGitCommit = "unknown"
 
 type outputFeedXML struct {
 	ID          string        `xml:"id,attr"`
+	HTTP        outputNodeXML `xml:"http"`
 	Stream      outputNodeXML `xml:"stream"`
 	Icecast     outputNodeXML `xml:"icecast"`
 	UDP         outputNodeXML `xml:"udp"`
@@ -938,6 +939,7 @@ func outputLabels(output outputXML) []string {
 		}
 	}
 	addOutput("webrtc", output.WebRTC)
+	addOutput("http", output.HTTP)
 	addOutput("udp", output.UDP)
 	addOutput("rtp", output.RTP)
 	addOutput("icecast", output.Icecast)
@@ -954,8 +956,16 @@ func outputLabels(output outputXML) []string {
 	return items
 }
 
+// outputHTTPStreamEnabled reports whether the web panel serves HTTP audio for a
+// feed. HTTP audio is its own sink (`<http enabled="true"/>`) and is independent
+// of the Icecast push sink. A legacy `<stream>` node still counts as HTTP unless
+// its type marks it as the old Icecast alias.
 func outputHTTPStreamEnabled(output outputXML) bool {
-	return xmlBool(output.Stream.EnabledRaw, false) || xmlBool(output.Icecast.EnabledRaw, false)
+	if xmlBool(output.HTTP.EnabledRaw, false) {
+		return true
+	}
+	legacyIcecast := strings.EqualFold(strings.TrimSpace(output.Stream.Type), "icecast")
+	return !legacyIcecast && xmlBool(output.Stream.EnabledRaw, false)
 }
 
 func coverageRegionPayloads(feed feedXML, forecastNames map[string]string, clcNames map[string]string) []map[string]any {

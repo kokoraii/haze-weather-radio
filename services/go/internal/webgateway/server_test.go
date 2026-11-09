@@ -595,7 +595,7 @@ webpanel:
 `)
 	mustWrite(t, filepath.Join(dir, "managed", "configs", "output.xml"), `<?xml version="1.0" encoding="UTF-8"?>
 <outputs>
-  <feed id="sk-0001"><webrtc enabled="false"/><stream enabled="true"/></feed>
+  <feed id="sk-0001"><webrtc enabled="false"/><http enabled="true"/></feed>
 </outputs>
 `)
 	configPath := filepath.Join(dir, "config.yaml")
@@ -701,7 +701,7 @@ func TestOutputLabelsUseStreamType(t *testing.T) {
 	}
 }
 
-func TestWildcardIcecastOutputEnablesPublicHTTPAudio(t *testing.T) {
+func TestHTTPAudioAndIcecastAreIndependentSinks(t *testing.T) {
 	dir := t.TempDir()
 	mustWrite(t, filepath.Join(dir, "config.yaml"), `version: test
 feeds_file: managed/configs/feeds.xml
@@ -710,14 +710,17 @@ outputs_file: managed/configs/output.xml
 	mustWrite(t, filepath.Join(dir, "managed", "configs", "feeds.xml"), `<?xml version="1.0" encoding="UTF-8"?>
 <feeds>
   <feed id="cwxr-on01" enabled="true" />
-  <feed id="cwxr-sk01" enabled="true" />
+  <feed id="ice-only" enabled="true" />
 </feeds>
 `)
 	mustWrite(t, filepath.Join(dir, "managed", "configs", "output.xml"), `<?xml version="1.0" encoding="UTF-8"?>
 <outputs>
   <feed id="cwxr-*">
-    <webrtc enabled="false"/>
-    <icecast enabled="true"><format>opus</format><acodec>libopus</acodec></icecast>
+    <http enabled="true"/>
+    <icecast enabled="false"/>
+  </feed>
+  <feed id="ice-only">
+    <icecast enabled="true"><format>opus</format></icecast>
   </feed>
 </outputs>
 `)
@@ -726,21 +729,22 @@ outputs_file: managed/configs/output.xml
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(feeds) != 2 {
-		t.Fatalf("feeds = %#v", feeds)
-	}
+	want := map[string]bool{"cwxr-on01": true, "ice-only": false}
 	for _, feed := range feeds {
-		if feed["http_stream_enabled"] != true {
-			t.Fatalf("feed did not inherit wildcard icecast output: %#v", feed)
+		id := stringValue(feed, "id")
+		if feed["http_stream_enabled"] != want[id] {
+			t.Fatalf("%s http_stream_enabled = %v, want %v", id, feed["http_stream_enabled"], want[id])
 		}
 	}
 	outputs, err := loadOutputsXML(filepath.Join(dir, "config.yaml"), map[string]any{"outputs_file": "managed/configs/output.xml"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	labels := outputLabels(outputForFeed(outputs, "cwxr-on01"))
-	if len(labels) != 1 || labels[0] != "icecast" {
-		t.Fatalf("labels = %#v", labels)
+	if labels := outputLabels(outputForFeed(outputs, "cwxr-on01")); len(labels) != 1 || labels[0] != "http" {
+		t.Fatalf("wildcard labels = %#v", labels)
+	}
+	if labels := outputLabels(outputForFeed(outputs, "ice-only")); len(labels) != 1 || labels[0] != "icecast" {
+		t.Fatalf("icecast labels = %#v", labels)
 	}
 }
 
