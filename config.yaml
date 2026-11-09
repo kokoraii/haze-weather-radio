@@ -1,4 +1,4 @@
-version: 26.10.01
+version: 26.11.09
 daemon_settings_file: runtime/state/daemonSettings.json
 
 storage:
@@ -17,9 +17,13 @@ storage:
     app_name: "haze-weather-radio"
 
 services:
+  # Every service section takes host and port. A host of 127.0.0.1, localhost, or an
+  # address of this machine runs the service here. Any other host makes Haze connect
+  # to a remote instance at host:port instead (TTS only so far, see docs/remote-services.md).
   rust:
     location:
       enabled: true
+      host: "127.0.0.1"
       executable: "bin/haze-location"
       config: "managed/configs/locations.xml"
       mode: "legacy" # legacy, shadow, or authoritative
@@ -30,7 +34,10 @@ services:
         nice: 0
     media:
       enabled: true
+      host: "127.0.0.1"
       addr: "127.0.0.1:8097"
+      grpc_addr: "127.0.0.1:8098" # Loopback gRPC control listener next to the HTTP routes. Blank disables it.
+      control_transport: "http" # How haze-web calls haze-media: http or grpc. Both listeners stay up.
       backend: "auto" # auto, gstreamer, or legacy
       webrtc:
         public_ip: "" # Public IPv4 address advertised to internet listeners behind NAT.
@@ -48,6 +55,7 @@ services:
         nice: 0
     playout:
       enabled: true
+      host: "127.0.0.1"
       alert_poll: "500ms"
       ffmpeg: "ffmpeg"
       scheduler:
@@ -55,6 +63,7 @@ services:
         nice: 0
     cgen:
       enabled: false
+      host: "127.0.0.1"
       config: "managed/configs/cgen.xml"
       scheduler:
         # Keep CGEN responsive without letting it starve playout, media, or drivers.
@@ -62,6 +71,7 @@ services:
         nice: -2 # -20 highest priority, 19 lowest
     cap_ingest:
       enabled: true
+      host: "127.0.0.1"
       shadow: false
       source_id: "rust-cap"
       source: "naads"
@@ -74,9 +84,14 @@ services:
       timeout: "15s"
       startup_seed: true
       concurrency: 8
-    easnet:
+    netalert:
       enabled: true
-      config: "managed/configs/easnet.xml"
+      host: "127.0.0.1"
+      addr: "0.0.0.0:41802" # WebSocket for network alert clients and the banner page (path /v1/netalert).
+      max_clients: 512
+      easnet:
+        enabled: false # Legacy DASDEC EAS NET bridge (managed/configs/easnet.xml). The DASDEC peer is retired.
+        config: "managed/configs/easnet.xml"
       scheduler:
         windows_priority: normal
         nice: 0
@@ -84,12 +99,16 @@ services:
     enabled: true
     web_gateway:
       enabled: true
+      host: "127.0.0.1"
     data_ingest:
       enabled: true
+      host: "127.0.0.1"
       interval: "45m"
       timeout: "20s"
     tts:
       enabled: true
+      host: "127.0.0.1"
+      port: 41810 # The remote haze-tts --listen port, used when host is another machine.
       readers: "managed/configs/readers.xml"
       dictionary: "managed/dictionary.json"
       provider: "auto"
@@ -111,6 +130,7 @@ services:
       runtime_idle_timeout: "30s"
     product_render:
       enabled: true
+      host: "127.0.0.1"
       refresh: "5m"
       workers: 4 # Routine render concurrency (1-32); changes take effect on restart.
       cleanup:
@@ -119,6 +139,7 @@ services:
         minute: 0
     playlist:
       enabled: true
+      host: "127.0.0.1"
       tick: "500ms"
       lookahead: "2m"
       max_queued: 3
@@ -127,11 +148,13 @@ services:
       routine_estimate_s: 35
     webhook:
       enabled: true
+      host: "127.0.0.1"
       webhooks: "managed/configs/webhooks.xml"
       listen_base_url: "" # or set HAZE_PUBLIC_BASE_URL in .env for Discord-visible links
       timeout: "15s"
     asr:
       enabled: true
+      host: "127.0.0.1"
       provider: local_whisper
       model: base-q5_1
       model_path: "runtime/models/whisper/ggml-base-q5_1.bin"
@@ -147,6 +170,7 @@ services:
       max_audio_bytes: 614400
     ivr:
       enabled: true
+      host: "127.0.0.1"
       mode: hybrid # hybrid, sip-edge, or provider-webhook
       prompts_file: "managed/configs/ivr.xml"
       extensions:
@@ -323,6 +347,8 @@ services:
           max_age_minutes: 10080
         - path: runtime/audio/easnet
           max_age_minutes: 10080
+        - path: runtime/audio/netalert
+          max_age_minutes: 30
     split_dns:
       enabled: false
       listen: "0.0.0.0:53"

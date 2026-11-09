@@ -1,15 +1,17 @@
 package events
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net"
 	"sync"
 	"time"
+
+	"github.com/meowraii/haze-weather-radio/services/go/internal/bridgeclient"
 )
 
 const hostBridgeTimeout = 3 * time.Second
-const publisherRegistration = "{\"type\":\"bridge.client\",\"data\":{\"receive_events\":false}}\n"
 
 // HostBridgePublisher emits events to the Haze loopback event bridge.
 type HostBridgePublisher struct {
@@ -17,7 +19,7 @@ type HostBridgePublisher struct {
 	dialTimeout  time.Duration
 	writeTimeout time.Duration
 	mu           sync.Mutex
-	conn         net.Conn
+	conn         *bridgeclient.Conn
 }
 
 // NewHostBridgePublisher creates a publisher for the Haze event bridge.
@@ -50,7 +52,6 @@ func (p *HostBridgePublisher) Publish(event Event) error {
 	if err != nil {
 		return err
 	}
-	raw = append(raw, '\n')
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -63,37 +64,21 @@ func (p *HostBridgePublisher) Publish(event Event) error {
 
 func (p *HostBridgePublisher) write(raw []byte) error {
 	if p.conn == nil {
-		conn, err := net.DialTimeout("tcp", p.addr, p.timeout(p.dialTimeout))
+		// A zero Registration is publish-only: the broker will not send this
+		// connection any events.
+		conn, err := bridgeclient.Dial(context.Background(), bridgeclient.Options{
+			Addr:         p.addr,
+			DialTimeout:  p.timeout(p.dialTimeout),
+			WriteTimeout: p.timeout(p.writeTimeout),
+			Register:     &bridgeclient.Registration{},
+		})
 		if err != nil {
-			return err
-		}
-		if err := conn.SetWriteDeadline(time.Now().Add(p.timeout(p.writeTimeout))); err != nil {
-			_ = conn.Close()
-			return err
-		}
-		n, err := io.WriteString(conn, publisherRegistration)
-		if err == nil && n != len(publisherRegistration) {
-			err = io.ErrShortWrite
-		}
-		if err != nil {
-			_ = conn.Close()
 			return err
 		}
 		p.conn = conn
-		go drainBridge(conn)
+		go drainBridge(conn.NetConn())
 	}
-	if err := p.conn.SetWriteDeadline(time.Now().Add(p.timeout(p.writeTimeout))); err != nil {
-		return err
-	}
-	n, err := p.conn.Write(raw)
-	if err != nil {
-		return err
-	}
-	if n != len(raw) {
-		return io.ErrShortWrite
-	}
-	_ = p.conn.SetWriteDeadline(time.Time{})
-	return nil
+	return p.conn.WriteLine(raw)
 }
 
 func (p *HostBridgePublisher) closeLocked() {

@@ -51,6 +51,12 @@ func LoadReaders(path string) ([]Reader, error) {
 	if err != nil {
 		return nil, err
 	}
+	return ParseReaders(raw)
+}
+
+// ParseReaders parses readers.xml content, such as the copy a Haze daemon
+// pushes to a remote haze-tts. Environment references are expanded locally.
+func ParseReaders(raw []byte) ([]Reader, error) {
 	raw = []byte(os.ExpandEnv(string(raw)))
 	var parsed readersXML
 	if err := xml.Unmarshal(raw, &parsed); err != nil {

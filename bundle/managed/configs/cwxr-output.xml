@@ -3,6 +3,7 @@
 <outputs>
   <feed id="cwxr-*">
     <webrtc enabled="true"/>
+    <http enabled="true"/>
 
     <icecast enabled="true">
       <host>${HAZE_ICECAST_HOST}</host>

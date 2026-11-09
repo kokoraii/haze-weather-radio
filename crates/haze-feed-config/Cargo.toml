@@ -1,0 +1,17 @@
+[package]
+name = "haze-feed-config"
+description = "Parses and validates managed feed config into the snapshot the daemon publishes, and evaluates its coverage rules"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+quick-xml = { version = "0.38", features = ["serialize"] }
+serde = { version = "1.0", features = ["derive"] }
+sha2 = "0.10"
+thiserror = "2.0"
+
+[dev-dependencies]
+serde_json = "1.0"
+tempfile = "3.23"

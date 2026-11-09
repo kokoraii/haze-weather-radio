@@ -16,15 +16,12 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use clap::Parser;
+use haze_bridge_client::{BridgeReader, BridgeWriter, Options, Payload, ReadLine, Registration};
 use haze_media::{normalize_pcm, pcm16_samples, push_i16, AudioFormat, Pcm};
-use haze_media_protocol::{
-    decode_pcm_frame, pcm_frame_len_from_prefix, PCM_FRAME_MAGIC, PCM_FRAME_PREFIX_LEN,
-};
+use haze_media_protocol::decode_pcm_frame;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::io::{
-    AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
-};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(feature = "gstreamer-backend")]
 use tokio::net::UdpSocket;
 use tokio::net::{TcpListener, TcpStream};
@@ -37,6 +34,8 @@ use std::io::ErrorKind;
 
 #[cfg(windows)]
 use windows_sys::Win32::Media::{timeBeginPeriod, timeEndPeriod};
+
+mod grpc;
 
 const SOURCE_ID: &str = "haze-media";
 const DEFAULT_CONFIG: &str = "config.yaml";
@@ -116,6 +115,10 @@ struct Args {
     #[arg(long)]
     listen: Option<String>,
 
+    /// Loopback address for the gRPC control listener. Unset or blank disables it.
+    #[arg(long)]
+    grpc_listen: Option<String>,
+
     #[arg(long)]
     outputs: Option<PathBuf>,
 
@@ -176,6 +179,8 @@ struct MediaServiceConfig {
     addr: String,
     #[serde(default)]
     listen: String,
+    #[serde(default)]
+    grpc_addr: String,
     #[serde(default)]
     backend: String,
     #[serde(default)]
@@ -1132,6 +1137,16 @@ async fn main() -> Result<()> {
         run_pcm_bridge_loop(pcm_bridge_addr, pcm_state).await;
     });
 
+    let grpc_listen = first_non_blank(&[
+        args.grpc_listen.as_deref(),
+        Some(root.services.rust.media.grpc_addr.as_str()),
+    ]);
+    if grpc_listen.is_empty() {
+        info!("haze-media gRPC control listener is not configured");
+    } else {
+        tokio::spawn(grpc::run_grpc_server(grpc_listen, state.clone()));
+    }
+
     let server_state = state.clone();
     let server = tokio::spawn(async move { run_http_server(&listen, server_state).await });
 
@@ -1624,6 +1639,13 @@ fn append_normalized_chunk(samples: &mut VecDeque<QueuedSample>, chunk: PcmChunk
     }));
 }
 
+fn media_bridge_options() -> Options {
+    Options {
+        max_line_bytes: MEDIA_BRIDGE_LINE_LIMIT,
+        ..Options::default()
+    }
+}
+
 async fn run_status_bridge_loop(addr: String, state: MediaState) {
     if addr.trim().is_empty() {
         warn!(
@@ -1631,20 +1653,23 @@ async fn run_status_bridge_loop(addr: String, state: MediaState) {
         );
         return;
     }
+    let registration = Registration::publish_only().with_source(SOURCE_ID);
     loop {
-        match TcpStream::connect(addr.trim()).await {
-            Ok(stream) => {
+        match haze_bridge_client::connect(addr.trim(), &media_bridge_options(), Some(&registration))
+            .await
+        {
+            Ok((reader, writer)) => {
                 info!(
                     "haze-media connected to host event bridge at {}",
                     addr.trim()
                 );
-                if let Err(err) = run_status_bridge_connection(stream, &state).await {
+                if let Err(err) = run_status_bridge_connection(reader, writer, &state).await {
                     warn!("haze-media host event bridge disconnected: {err:#}");
                 }
             }
             Err(err) => {
                 warn!(
-                    "haze-media waiting for host event bridge at {}: {err}",
+                    "haze-media waiting for host event bridge at {}: {err:#}",
                     addr.trim()
                 );
             }
@@ -1653,24 +1678,21 @@ async fn run_status_bridge_loop(addr: String, state: MediaState) {
     }
 }
 
-async fn run_status_bridge_connection(stream: TcpStream, state: &MediaState) -> Result<()> {
-    let (reader, mut writer) = stream.into_split();
+async fn run_status_bridge_connection(
+    mut reader: BridgeReader,
+    writer: BridgeWriter,
+    state: &MediaState,
+) -> Result<()> {
+    // Nothing is delivered to a publish-only client. The read half is drained so
+    // the socket keeps being serviced until the bridge closes it.
     tokio::spawn(async move {
-        let mut lines = BufReader::new(reader).lines();
-        while matches!(lines.next_line().await, Ok(Some(_))) {}
+        while matches!(
+            reader.next_line().await,
+            Ok(ReadLine::Data | ReadLine::Oversized)
+        ) {}
     });
-    write_bridge_event(
-        &mut writer,
-        json!({
-            "type": "bridge.client",
-            "source": SOURCE_ID,
-            "data": { "receive_events": false },
-        }),
-    )
-    .await?;
-    write_bridge_event(
-        &mut writer,
-        json!({
+    writer
+        .publish(json!({
             "type": "service.ready",
             "source": SOURCE_ID,
             "data": {
@@ -1678,15 +1700,14 @@ async fn run_status_bridge_connection(stream: TcpStream, state: &MediaState) -> 
                 "backend": state.backend.as_str(),
                 "gstreamer_available": state.gstreamer_available,
             },
-        }),
-    )
-    .await?;
+        }))
+        .await?;
 
     let mut status = interval(STATUS_INTERVAL);
     status.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         status.tick().await;
-        publish_status(&mut writer, state).await?;
+        publish_status(&writer, state).await?;
     }
 }
 
@@ -1695,20 +1716,25 @@ async fn run_pcm_bridge_loop(addr: String, state: MediaState) {
         warn!("haze-media media bridge address is empty; media service will only serve silence");
         return;
     }
+    let registration = Registration::anonymous_subscriber(&[])
+        .with_binary_pcm()
+        .with_source(SOURCE_ID);
     loop {
-        match TcpStream::connect(addr.trim()).await {
-            Ok(stream) => {
+        match haze_bridge_client::connect(addr.trim(), &media_bridge_options(), Some(&registration))
+            .await
+        {
+            Ok((reader, writer)) => {
                 info!(
                     "haze-media connected to host media bridge at {}",
                     addr.trim()
                 );
-                if let Err(err) = run_pcm_bridge_connection(stream, &state).await {
+                if let Err(err) = run_pcm_bridge_connection(reader, writer, &state).await {
                     warn!("haze-media host media bridge disconnected: {err:#}");
                 }
             }
             Err(err) => {
                 warn!(
-                    "haze-media waiting for host media bridge at {}: {err}",
+                    "haze-media waiting for host media bridge at {}: {err:#}",
                     addr.trim()
                 );
             }
@@ -1717,38 +1743,28 @@ async fn run_pcm_bridge_loop(addr: String, state: MediaState) {
     }
 }
 
-async fn run_pcm_bridge_connection(stream: TcpStream, state: &MediaState) -> Result<()> {
-    let (reader, mut writer) = stream.into_split();
-    write_bridge_event(
-        &mut writer,
-        json!({
-            "type": "bridge.client",
-            "source": SOURCE_ID,
-            "data": {
-                "receive_events": true,
-                "binary_pcm": true,
-            },
-        }),
-    )
-    .await?;
-
-    let mut reader = BufReader::new(reader);
-    let mut payload = Vec::with_capacity(16 * 1024);
+/// Reads compact PCM frames, and legacy JSON events from older producers, until
+/// the bridge closes. The writer is held for the life of the connection:
+/// dropping it would close the socket's write side and the broker would drop
+/// this consumer.
+async fn run_pcm_bridge_connection(
+    mut reader: BridgeReader,
+    _writer: BridgeWriter,
+    state: &MediaState,
+) -> Result<()> {
     loop {
-        let Some(is_binary) = read_pcm_bridge_payload(&mut reader, &mut payload).await? else {
-            bail!("host media bridge closed");
-        };
-        if !is_binary && payload.len() > MEDIA_BRIDGE_LINE_LIMIT {
-            warn!(
-                bytes = payload.len(),
-                "dropping oversized media bridge event"
-            );
-            continue;
-        }
-        let chunk = if is_binary {
-            decode_binary_pcm_frame(&payload)
-        } else {
-            decode_pcm_event(&payload)
+        let chunk = match reader
+            .next_payload()
+            .await
+            .context("failed to read host media bridge payload")?
+        {
+            Payload::Eof => bail!("host media bridge closed"),
+            Payload::Oversized => {
+                warn!("dropping oversized media bridge event");
+                continue;
+            }
+            Payload::Pcm => decode_binary_pcm_frame(reader.payload()),
+            Payload::Line => decode_pcm_event(reader.payload()),
         };
         if let Some(chunk) = chunk {
             state.publish_pcm(chunk);
@@ -1756,86 +1772,25 @@ async fn run_pcm_bridge_connection(stream: TcpStream, state: &MediaState) -> Res
     }
 }
 
-/// Reads either a newline-delimited legacy event or one compact PCM frame.
-async fn read_pcm_bridge_payload<R>(reader: &mut R, payload: &mut Vec<u8>) -> Result<Option<bool>>
-where
-    R: AsyncBufRead + Unpin,
-{
-    payload.clear();
-    let mut first = [0u8; 1];
-    let read = reader
-        .read(&mut first)
-        .await
-        .context("failed to read host media bridge payload")?;
-    if read == 0 {
-        return Ok(None);
-    }
-    payload.push(first[0]);
-    if first[0] != PCM_FRAME_MAGIC[0] {
-        reader
-            .read_until(b'\n', payload)
-            .await
-            .context("failed to read host media bridge event")?;
-        return Ok(Some(false));
-    }
-
-    let mut prefix_tail = [0u8; PCM_FRAME_PREFIX_LEN - 1];
-    reader
-        .read_exact(&mut prefix_tail)
-        .await
-        .context("failed to read host media bridge PCM prefix")?;
-    payload.extend_from_slice(&prefix_tail);
-    let frame_len =
-        pcm_frame_len_from_prefix(payload).context("invalid host media bridge PCM prefix")?;
-    payload.resize(frame_len, 0);
-    reader
-        .read_exact(&mut payload[PCM_FRAME_PREFIX_LEN..])
-        .await
-        .context("failed to read host media bridge PCM frame")?;
-    Ok(Some(true))
-}
-
-async fn publish_status<W>(writer: &mut W, state: &MediaState) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    write_bridge_event(
-        writer,
-        json!({
+async fn publish_status(writer: &BridgeWriter, state: &MediaState) -> Result<()> {
+    writer
+        .publish(json!({
             "type": "media.status",
             "source": SOURCE_ID,
             "data": state.health(),
-        }),
-    )
-    .await?;
+        }))
+        .await?;
     for feed in state.snapshots() {
-        write_bridge_event(
-            writer,
-            json!({
+        writer
+            .publish(json!({
                 "type": "media.feed.status",
                 "source": SOURCE_ID,
                 "feed_id": feed.feed_id,
                 "data": feed,
-            }),
-        )
-        .await?;
+            }))
+            .await?;
     }
     Ok(())
-}
-
-async fn write_bridge_event<W>(writer: &mut W, mut value: Value) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    if value.get("timestamp").is_none() {
-        value["timestamp"] = json!(chrono::Utc::now().to_rfc3339());
-    }
-    let mut raw = serde_json::to_vec(&value)?;
-    raw.push(b'\n');
-    writer
-        .write_all(&raw)
-        .await
-        .context("failed to write host bridge event")
 }
 
 fn decode_pcm_event(raw: &[u8]) -> Option<PcmChunk> {
@@ -1954,7 +1909,8 @@ async fn handle_http_connection(mut stream: TcpStream, state: MediaState) -> Res
                 write_text_response(&mut stream, 400, "feed is required\n").await?;
                 return Ok(());
             }
-            stream_feed_audio(&mut stream, &state, &feed_id, &codec).await?;
+            let mut sink = AudioOut::Http(&mut stream);
+            stream_feed_audio(&mut sink, &state, &feed_id, &codec).await?;
         }
         "/api/v1/webrtc/offer" => {
             handle_webrtc_offer(&mut stream, state, request).await?;
@@ -2038,31 +1994,69 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
     })
 }
 
+/// Where a live audio stream is written. The HTTP route writes a response head
+/// and then the raw body. The gRPC route sends one message per write.
+enum AudioOut<'a> {
+    Http(&'a mut TcpStream),
+    Grpc(grpc::AudioSender),
+}
+
+impl AudioOut<'_> {
+    /// Starts the audio body with its content type.
+    async fn start(&mut self, content_type: &str) -> Result<()> {
+        match self {
+            Self::Http(stream) => write_stream_headers(stream, content_type).await,
+            Self::Grpc(sender) => {
+                sender.start(content_type);
+                Ok(())
+            }
+        }
+    }
+
+    /// Writes audio bytes. An error means the listener is gone.
+    async fn write(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        match self {
+            Self::Http(stream) => stream.write_all(bytes).await,
+            Self::Grpc(sender) => sender.write(bytes).await,
+        }
+    }
+
+    /// Refuses the stream before any audio was started. The status follows the
+    /// HTTP route, and the gRPC route maps it to the matching gRPC code.
+    async fn refuse(&mut self, status: u16, detail: &str) -> Result<()> {
+        match self {
+            Self::Http(stream) => write_text_response(stream, status, detail).await,
+            Self::Grpc(sender) => sender.refuse(status, detail).await,
+        }
+    }
+}
+
 async fn stream_feed_audio(
-    stream: &mut TcpStream,
+    sink: &mut AudioOut<'_>,
     state: &MediaState,
     feed_id: &str,
     codec: &str,
 ) -> Result<()> {
     let format = HttpAudioFormat::parse(codec);
     let Some(feed) = state.feed(feed_id) else {
-        write_text_response(stream, 404, "feed is not configured\n").await?;
+        sink.refuse(404, "feed is not configured\n").await?;
         return Ok(());
     };
     let client = state.register_http_client(feed_id, format.id);
     let client_id = client.id();
     match format.kind {
-        HttpAudioKind::Wav => stream_wav(stream, state, client_id, feed).await,
-        HttpAudioKind::Raw => stream_raw_pcm(stream, state, client_id, feed).await,
+        HttpAudioKind::Wav => stream_wav(sink, state, client_id, feed).await,
+        HttpAudioKind::Raw => stream_raw_pcm(sink, state, client_id, feed).await,
         HttpAudioKind::GStreamer => {
             if !state.gstreamer_available {
-                write_text_response(stream, 503, "gstreamer backend is not available\n").await?;
+                sink.refuse(503, "gstreamer backend is not available\n")
+                    .await?;
                 return Ok(());
             }
-            stream_gstreamer_encoded(stream, state, client_id, feed, format).await
+            stream_gstreamer_encoded(sink, state, client_id, feed, format).await
         }
         HttpAudioKind::Unsupported => {
-            write_text_response(stream, 415, "unsupported media codec\n").await?;
+            sink.refuse(415, "unsupported media codec\n").await?;
             Ok(())
         }
     }
@@ -2090,6 +2084,139 @@ struct WebRTCOfferRequest {
     remote_addr: String,
 }
 
+const WEBRTC_BACKEND_UNAVAILABLE: &str = "str0m WebRTC backend is unavailable";
+
+/// Why a WebRTC offer was refused. The status follows the HTTP route, and the
+/// gRPC route maps it to the matching gRPC code.
+struct OfferRefusal {
+    status: u16,
+    body: Value,
+}
+
+impl OfferRefusal {
+    fn new(status: u16, error: impl Into<String>) -> Self {
+        Self {
+            status,
+            body: json!({ "error": error.into() }),
+        }
+    }
+
+    fn message(&self) -> String {
+        self.body
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("WebRTC offer was refused")
+            .to_string()
+    }
+}
+
+/// An answered WebRTC offer. The peer is registered, but its media feeder is
+/// not started until the caller has delivered the answer.
+struct AcceptedOffer {
+    feed_id: String,
+    answer_sdp: String,
+    codec: &'static str,
+    payload_type: u8,
+    media_recent: bool,
+    peer_id: u64,
+    feed: Arc<FeedRuntime>,
+    peer: Str0mWebRTCPeer,
+}
+
+impl AcceptedOffer {
+    fn body(&self) -> Value {
+        json!({
+            "feed_id": self.feed_id,
+            "sdp": self.answer_sdp,
+            "sdp_type": "answer",
+            "codec": self.codec,
+            "payload_type": self.payload_type,
+            "media_recent": self.media_recent,
+        })
+    }
+}
+
+/// Validates a WebRTC offer, builds the peer, and registers the listener. It is
+/// shared by the HTTP and gRPC routes so both apply the same rules.
+async fn prepare_webrtc_offer(
+    state: &MediaState,
+    payload: &WebRTCOfferRequest,
+    stream_peer_addr: Option<SocketAddr>,
+) -> std::result::Result<AcceptedOffer, OfferRefusal> {
+    if !state.webrtc_available {
+        return Err(OfferRefusal::new(503, WEBRTC_BACKEND_UNAVAILABLE));
+    }
+    let feed_id = payload.feed_id.trim().to_string();
+    if !valid_feed_id(&feed_id) {
+        return Err(OfferRefusal::new(400, "feed_id is required"));
+    }
+    let offer_sdp = payload.sdp.trim().to_string();
+    if offer_sdp.is_empty() || offer_sdp.len() > HTTP_BODY_LIMIT {
+        return Err(OfferRefusal::new(400, "sdp is required"));
+    }
+    let preferred_codec = first_non_blank(&[
+        Some(payload.preferred_codec.as_str()),
+        Some(payload.codec.as_str()),
+    ]);
+    let Some(selection) = select_webrtc_audio_codec(
+        &offer_sdp,
+        &state.webrtc_codecs,
+        &preferred_codec,
+        payload.require_opus,
+        payload.disable_g722,
+    ) else {
+        return Err(OfferRefusal {
+            status: 415,
+            body: json!({
+                "error": "the WebRTC offer did not include a codec supported by haze-media",
+                "supported_codecs": state.webrtc_codecs.iter().map(|codec| codec.id()).collect::<Vec<_>>(),
+            }),
+        });
+    };
+
+    let Some(feed) = state.feed(&feed_id) else {
+        return Err(OfferRefusal::new(404, "feed is not configured"));
+    };
+    let media_recent = feed
+        .snapshot()
+        .last_input_age_ms
+        .map(|age| age <= 5_000)
+        .unwrap_or(false);
+    let request_peer_ip =
+        parse_webrtc_request_peer_ip(payload).or_else(|| stream_peer_addr.map(|addr| addr.ip()));
+    let listener_client_id = webrtc_listener_client_id(payload, stream_peer_addr);
+    let setup = build_str0m_webrtc_peer(&offer_sdp, selection, request_peer_ip).await;
+    let peer = match setup {
+        Ok(peer) => peer,
+        Err(err) => {
+            warn!(feed_id, "failed to create str0m WebRTC peer: {err:#}");
+            return Err(OfferRefusal::new(
+                503,
+                format!("failed to create str0m WebRTC peer: {err:#}"),
+            ));
+        }
+    };
+    let answer_sdp = peer.answer_sdp.clone();
+    let Some(peer_id) =
+        state.register_webrtc_peer(&feed_id, selection.codec.id(), &listener_client_id)
+    else {
+        return Err(OfferRefusal::new(
+            429,
+            "listener already active for this IP and feed",
+        ));
+    };
+    Ok(AcceptedOffer {
+        feed_id,
+        answer_sdp,
+        codec: selection.codec.id(),
+        payload_type: selection.payload_type,
+        media_recent,
+        peer_id,
+        feed,
+        peer,
+    })
+}
+
 async fn handle_webrtc_offer(
     stream: &mut TcpStream,
     state: MediaState,
@@ -2104,7 +2231,7 @@ async fn handle_webrtc_offer(
             stream,
             503,
             json!({
-                "error": "str0m WebRTC backend is unavailable",
+                "error": WEBRTC_BACKEND_UNAVAILABLE,
             }),
         )
         .await?;
@@ -2122,98 +2249,24 @@ async fn handle_webrtc_offer(
             return Ok(());
         }
     };
-    let feed_id = payload.feed_id.trim().to_string();
-    if !valid_feed_id(&feed_id) {
-        write_json_response(stream, 400, json!({"error": "feed_id is required"})).await?;
-        return Ok(());
-    }
-    let offer_sdp = payload.sdp.trim().to_string();
-    if offer_sdp.is_empty() || offer_sdp.len() > HTTP_BODY_LIMIT {
-        write_json_response(stream, 400, json!({"error": "sdp is required"})).await?;
-        return Ok(());
-    }
-    let preferred_codec = first_non_blank(&[
-        Some(payload.preferred_codec.as_str()),
-        Some(payload.codec.as_str()),
-    ]);
-    let Some(selection) = select_webrtc_audio_codec(
-        &offer_sdp,
-        &state.webrtc_codecs,
-        &preferred_codec,
-        payload.require_opus,
-        payload.disable_g722,
-    ) else {
-        write_json_response(
-            stream,
-            415,
-            json!({
-                "error": "the WebRTC offer did not include a codec supported by haze-media",
-                "supported_codecs": state.webrtc_codecs.iter().map(|codec| codec.id()).collect::<Vec<_>>(),
-            }),
-        )
-        .await?;
-        return Ok(());
-    };
-
-    let Some(feed) = state.feed(&feed_id) else {
-        write_json_response(stream, 404, json!({"error": "feed is not configured"})).await?;
-        return Ok(());
-    };
-    let media_recent = feed
-        .snapshot()
-        .last_input_age_ms
-        .map(|age| age <= 5_000)
-        .unwrap_or(false);
     let stream_peer_addr = stream.peer_addr().ok();
-    let request_peer_ip =
-        parse_webrtc_request_peer_ip(&payload).or_else(|| stream_peer_addr.map(|addr| addr.ip()));
-    let listener_client_id = webrtc_listener_client_id(&payload, stream_peer_addr);
-    let setup = build_str0m_webrtc_peer(&offer_sdp, selection, request_peer_ip).await;
-    let peer = match setup {
-        Ok(peer) => peer,
-        Err(err) => {
-            warn!(feed_id, "failed to create str0m WebRTC peer: {err:#}");
-            write_json_response(
-                stream,
-                503,
-                json!({"error": format!("failed to create str0m WebRTC peer: {err:#}")}),
-            )
-            .await?;
+    let accepted = match prepare_webrtc_offer(&state, &payload, stream_peer_addr).await {
+        Ok(accepted) => accepted,
+        Err(refusal) => {
+            write_json_response(stream, refusal.status, refusal.body).await?;
             return Ok(());
         }
     };
-    let answer_sdp = peer.answer_sdp.clone();
-    let Some(peer_id) =
-        state.register_webrtc_peer(&feed_id, selection.codec.id(), &listener_client_id)
-    else {
-        write_json_response(
-            stream,
-            429,
-            json!({
-                "error": "listener already active for this IP and feed",
-            }),
-        )
-        .await?;
-        return Ok(());
-    };
-    if let Err(err) = write_json_response(
-        stream,
-        200,
-        json!({
-            "feed_id": feed_id,
-            "sdp": answer_sdp,
-            "sdp_type": "answer",
-            "codec": selection.codec.id(),
-            "payload_type": selection.payload_type,
-            "media_recent": media_recent,
-        }),
-    )
-    .await
-    {
-        state.unregister_webrtc_peer(peer_id);
+    if let Err(err) = write_json_response(stream, 200, accepted.body()).await {
+        state.unregister_webrtc_peer(accepted.peer_id);
         return Err(err);
     }
-    start_webrtc_peer_feeder(state.clone(), peer_id, feed, peer);
+    start_webrtc_peer_feeder(
+        state.clone(),
+        accepted.peer_id,
+        accepted.feed,
+        accepted.peer,
+    );
     Ok(())
 }
 
@@ -3407,29 +3460,29 @@ impl HttpAudioFormat {
 }
 
 async fn stream_wav(
-    stream: &mut TcpStream,
+    sink: &mut AudioOut<'_>,
     state: &MediaState,
     client_id: u64,
     feed: Arc<FeedRuntime>,
 ) -> Result<()> {
-    write_stream_headers(stream, "audio/wav").await?;
-    stream.write_all(&wav_stream_header()).await?;
+    sink.start("audio/wav").await?;
+    sink.write(&wav_stream_header()).await?;
     state.record_http_client_write(client_id, 44);
     let silence = vec![0u8; FRAME_BYTES];
-    stream.write_all(&silence).await?;
+    sink.write(&silence).await?;
     state.record_http_client_write(client_id, silence.len());
     let mut rx = feed.subscribe();
     loop {
         match rx.recv().await {
             Ok(frame) => {
-                stream.write_all(&frame.data).await?;
+                sink.write(&frame.data).await?;
                 state.record_http_client_write(client_id, frame.data.len());
             }
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                 state.record_http_client_lag(client_id, skipped);
                 let fill_frames = skipped.min(RAW_HTTP_LAG_RESYNC_SILENCE_FRAMES);
                 for _ in 0..fill_frames {
-                    stream.write_all(&silence).await?;
+                    sink.write(&silence).await?;
                     state.record_http_client_write(client_id, silence.len());
                 }
                 continue;
@@ -3440,27 +3493,27 @@ async fn stream_wav(
 }
 
 async fn stream_raw_pcm(
-    stream: &mut TcpStream,
+    sink: &mut AudioOut<'_>,
     state: &MediaState,
     client_id: u64,
     feed: Arc<FeedRuntime>,
 ) -> Result<()> {
-    write_stream_headers(stream, "audio/L16; rate=48000; channels=1").await?;
+    sink.start("audio/L16; rate=48000; channels=1").await?;
     let silence = vec![0u8; FRAME_BYTES];
-    stream.write_all(&silence).await?;
+    sink.write(&silence).await?;
     state.record_http_client_write(client_id, silence.len());
     let mut rx = feed.subscribe();
     loop {
         match rx.recv().await {
             Ok(frame) => {
-                stream.write_all(&frame.data).await?;
+                sink.write(&frame.data).await?;
                 state.record_http_client_write(client_id, frame.data.len());
             }
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                 state.record_http_client_lag(client_id, skipped);
                 let fill_frames = skipped.min(RAW_HTTP_LAG_RESYNC_SILENCE_FRAMES);
                 for _ in 0..fill_frames {
-                    stream.write_all(&silence).await?;
+                    sink.write(&silence).await?;
                     state.record_http_client_write(client_id, silence.len());
                 }
                 continue;
@@ -3472,7 +3525,7 @@ async fn stream_raw_pcm(
 
 #[cfg(feature = "gstreamer-backend")]
 async fn stream_gstreamer_encoded(
-    stream: &mut TcpStream,
+    sink: &mut AudioOut<'_>,
     state: &MediaState,
     client_id: u64,
     feed: Arc<FeedRuntime>,
@@ -3508,8 +3561,7 @@ async fn stream_gstreamer_encoded(
                 "failed to prepare GStreamer {} audio stream: {err:#}",
                 format.id
             );
-            write_text_response(
-                stream,
+            sink.refuse(
                 503,
                 &format!("gstreamer audio pipeline is unavailable: {err:#}\n"),
             )
@@ -3546,8 +3598,7 @@ async fn stream_gstreamer_encoded(
             "failed to start GStreamer {} audio stream: {err:#}",
             format.id
         );
-        write_text_response(
-            stream,
+        sink.refuse(
             503,
             &format!("gstreamer audio pipeline failed to start: {err:#}\n"),
         )
@@ -3568,7 +3619,7 @@ async fn stream_gstreamer_encoded(
             format.id
         );
     }
-    write_stream_headers(stream, format.content_type).await?;
+    sink.start(format.content_type).await?;
 
     'stream: loop {
         tokio::select! {
@@ -3600,7 +3651,7 @@ async fn stream_gstreamer_encoded(
                 let Some(encoded) = encoded else {
                     break;
                 };
-                if let Err(err) = stream.write_all(&encoded).await {
+                if let Err(err) = sink.write(&encoded).await {
                     if err.kind() != ErrorKind::BrokenPipe && err.kind() != ErrorKind::ConnectionReset {
                         warn!("haze-media encoded HTTP write failed: {err}");
                     }
@@ -3617,18 +3668,14 @@ async fn stream_gstreamer_encoded(
 
 #[cfg(not(feature = "gstreamer-backend"))]
 async fn stream_gstreamer_encoded(
-    stream: &mut TcpStream,
+    sink: &mut AudioOut<'_>,
     _state: &MediaState,
     _client_id: u64,
     _feed: Arc<FeedRuntime>,
     _format: HttpAudioFormat,
 ) -> Result<()> {
-    write_text_response(
-        stream,
-        503,
-        "haze-media was built without GStreamer support\n",
-    )
-    .await?;
+    sink.refuse(503, "haze-media was built without GStreamer support\n")
+        .await?;
     Ok(())
 }
 
@@ -4625,15 +4672,12 @@ mod tests {
         let (mut writer, reader) = tokio::io::duplex(frame.len());
         writer.write_all(&frame).await.expect("write PCM frame");
         drop(writer);
-        let mut reader = BufReader::new(reader);
-        let mut payload = Vec::new();
+        let mut reader = BridgeReader::new(reader, MEDIA_BRIDGE_LINE_LIMIT);
 
-        let is_binary = read_pcm_bridge_payload(&mut reader, &mut payload)
-            .await
-            .expect("read PCM payload");
+        let payload = reader.next_payload().await.expect("read PCM payload");
 
-        assert_eq!(is_binary, Some(true));
-        assert_eq!(payload, frame);
+        assert_eq!(payload, Payload::Pcm);
+        assert_eq!(reader.payload(), frame);
     }
 
     #[test]
@@ -5414,5 +5458,381 @@ mod tests {
     fn gstreamer_aac_pipeline_emits_adts_frames() {
         let pipeline = gstreamer_audio_pipeline("aac").unwrap();
         assert!(pipeline.contains("stream-format=adts"));
+    }
+}
+
+#[cfg(test)]
+mod bridge_tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::net::TcpListener;
+
+    fn state_with_feed(feed_id: &str) -> MediaState {
+        let xml =
+            format!(r#"<outputs><feed id="{feed_id}"><webrtc enabled="true"/></feed></outputs>"#);
+        let parsed: OutputsXml = quick_xml::de::from_str(&xml).expect("outputs XML");
+        let feed = parsed.feeds.into_iter().next().expect("one feed");
+        let output = output_feed_from_node(feed.id.trim(), feed.icecast, feed.webrtc, true);
+        MediaState::new(
+            BTreeMap::from([(feed.id, output)]),
+            BackendMode::Legacy,
+            false,
+            Vec::new(),
+        )
+    }
+
+    fn pcm_frame(feed_id: &str, sequence: u64) -> Vec<u8> {
+        let samples: Vec<u8> = (0..FRAME_BYTES)
+            .map(|index| (index % 251) as u8 | 1)
+            .collect();
+        let mut frame = Vec::new();
+        haze_media_protocol::encode_pcm_frame(
+            &mut frame,
+            haze_media_protocol::PcmFrame {
+                feed_id,
+                queue_id: None,
+                sample_rate: SAMPLE_RATE,
+                channels: CHANNELS,
+                duration_ms: 20,
+                sequence,
+                pts_ns: sequence * 20_000_000,
+                discontinuity: false,
+                media_kind: haze_media_protocol::PcmMediaKind::Routine,
+                pcm: &samples,
+            },
+        )
+        .expect("encode PCM frame");
+        frame
+    }
+
+    async fn feed_received_audio(state: &MediaState, feed_id: &str) -> bool {
+        for _ in 0..100 {
+            if state
+                .snapshots()
+                .iter()
+                .any(|feed| feed.feed_id == feed_id && feed.last_input_age_ms.is_some())
+            {
+                return true;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn pcm_loop_registers_for_binary_frames_and_survives_bad_input() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake broker");
+        let addr = listener.local_addr().expect("broker address").to_string();
+        let broker = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept haze-media");
+            let (read, mut write) = socket.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let registration: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+
+            let mut payload = Vec::new();
+            // A line over the limit is dropped without breaking the framing.
+            payload.extend_from_slice(&vec![b'x'; MEDIA_BRIDGE_LINE_LIMIT + 10]);
+            payload.push(b'\n');
+            payload.extend_from_slice(&pcm_frame("sk-0001", 0));
+            payload.extend_from_slice(b"not json at all\n");
+            payload.extend_from_slice(&pcm_frame("sk-0001", 1));
+            write.write_all(&payload).await.expect("write PCM payload");
+            // Hold the connection open so the consumer keeps running.
+            let _ = lines.next_line().await;
+            registration
+        });
+
+        let state = state_with_feed("sk-0001");
+        let consumer = tokio::spawn(run_pcm_bridge_loop(addr, state.clone()));
+
+        assert!(
+            feed_received_audio(&state, "sk-0001").await,
+            "no PCM reached the feed after the oversized and malformed input"
+        );
+        consumer.abort();
+        let registration = broker.await.expect("broker task");
+        assert_eq!(registration["type"], "bridge.client");
+        assert_eq!(registration["source"], SOURCE_ID);
+        assert_eq!(registration["data"]["receive_events"], true);
+        assert_eq!(registration["data"]["binary_pcm"], true);
+        assert!(registration["data"].get("client_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn pcm_loop_still_accepts_legacy_json_pcm_events() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake broker");
+        let addr = listener.local_addr().expect("broker address").to_string();
+        let pcm = base64::engine::general_purpose::STANDARD.encode(vec![1u8; FRAME_BYTES]);
+        let event = json!({
+            "type": "playout.pcm",
+            "feed_id": "sk-0001",
+            "data": { "sample_rate": SAMPLE_RATE, "channels": CHANNELS, "pcm": pcm },
+        });
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept haze-media");
+            let (read, mut write) = socket.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let _registration = lines.next_line().await.unwrap().unwrap();
+            let mut raw = serde_json::to_vec(&event).unwrap();
+            raw.push(b'\n');
+            write.write_all(&raw).await.expect("write JSON PCM event");
+            let _ = lines.next_line().await;
+        });
+
+        let state = state_with_feed("sk-0001");
+        let consumer = tokio::spawn(run_pcm_bridge_loop(addr, state.clone()));
+        assert!(feed_received_audio(&state, "sk-0001").await);
+        consumer.abort();
+    }
+
+    #[tokio::test]
+    async fn status_loop_registers_publish_only_then_announces_and_reports() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake broker");
+        let addr = listener.local_addr().expect("broker address").to_string();
+        let broker = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept haze-media");
+            let mut lines = BufReader::new(socket).lines();
+            let mut events = Vec::new();
+            for _ in 0..3 {
+                let line = lines.next_line().await.unwrap().unwrap();
+                events.push(serde_json::from_str::<Value>(&line).unwrap());
+            }
+            events
+        });
+
+        let state = state_with_feed("sk-0001");
+        let reporter = tokio::spawn(run_status_bridge_loop(addr, state));
+        let events = tokio::time::timeout(Duration::from_secs(5), broker)
+            .await
+            .expect("status events arrived")
+            .expect("broker task");
+        reporter.abort();
+
+        assert_eq!(events[0]["type"], "bridge.client");
+        assert_eq!(events[0]["source"], SOURCE_ID);
+        assert_eq!(events[0]["data"]["receive_events"], false);
+        assert_eq!(events[1]["type"], "service.ready");
+        assert_eq!(events[1]["data"]["service"], SOURCE_ID);
+        assert_eq!(events[2]["type"], "media.status");
+        assert_eq!(events[2]["data"]["service"], SOURCE_ID);
+        assert!(events[2]["timestamp"].is_string());
+    }
+}
+
+/// Pins the HTTP routes, which stay the reference behavior while gRPC is added.
+#[cfg(test)]
+mod http_route_tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    const OPUS_OFFER: &str =
+        "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=rtpmap:111 opus/48000/2\r\n";
+
+    fn state(webrtc_codecs: Vec<WebRTCAudioCodec>) -> MediaState {
+        let xml = r#"<outputs><feed id="sk-0001"><webrtc enabled="true"/></feed></outputs>"#;
+        let parsed: OutputsXml = quick_xml::de::from_str(xml).expect("outputs XML");
+        let feed = parsed.feeds.into_iter().next().expect("one feed");
+        let output = output_feed_from_node(feed.id.trim(), feed.icecast, feed.webrtc, true);
+        MediaState::new(
+            BTreeMap::from([(feed.id, output)]),
+            BackendMode::Legacy,
+            !webrtc_codecs.is_empty(),
+            webrtc_codecs,
+        )
+    }
+
+    struct Reply {
+        status: u16,
+        head: String,
+        body: Vec<u8>,
+    }
+
+    impl Reply {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.body).into_owned()
+        }
+
+        fn json(&self) -> Value {
+            serde_json::from_slice(&self.body).expect("JSON body")
+        }
+    }
+
+    /// Sends one request to a real connection handler. A finite response is read
+    /// to the end. A live stream is read until `stream_prefix` body bytes arrived.
+    async fn exchange(state: &MediaState, request: &str, stream_prefix: Option<usize>) -> Reply {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let server_state = state.clone();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let _ = handle_http_connection(stream, server_state).await;
+        });
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        client.write_all(request.as_bytes()).await.expect("send");
+        let mut data = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            if let Some(end) = data.windows(4).position(|window| window == b"\r\n\r\n") {
+                if stream_prefix.is_some_and(|wanted| data.len() >= end + 4 + wanted) {
+                    break;
+                }
+            }
+            let read = client.read(&mut chunk).await.expect("read");
+            if read == 0 {
+                break;
+            }
+            data.extend_from_slice(&chunk[..read]);
+        }
+        let end = data
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("response head");
+        let head = String::from_utf8_lossy(&data[..end]).into_owned();
+        let status = head
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .expect("status code");
+        Reply {
+            status,
+            head,
+            body: data[end + 4..].to_vec(),
+        }
+    }
+
+    fn get(path: &str) -> String {
+        format!("GET {path} HTTP/1.1\r\nHost: media\r\n\r\n")
+    }
+
+    fn post_offer(body: &str) -> String {
+        format!(
+            "POST /api/v1/webrtc/offer HTTP/1.1\r\nHost: media\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn health_and_unknown_routes() {
+        let state = state(Vec::new());
+        for path in ["/health", "/api/v1/health"] {
+            let reply = exchange(&state, &get(path), None).await;
+            assert_eq!(reply.status, 200, "{path}");
+            assert_eq!(reply.json()["service"], "haze-media");
+        }
+        let reply = exchange(&state, &get("/nope"), None).await;
+        assert_eq!(reply.status, 404);
+        assert_eq!(reply.text(), "not found\n");
+    }
+
+    #[tokio::test]
+    async fn audio_requests_are_refused_with_the_documented_statuses() {
+        let state = state(Vec::new());
+        let cases = [
+            (
+                "/api/v1/feed/audio?feed=not%20a%20feed",
+                400,
+                "feed is required\n",
+            ),
+            ("/api/v1/feed/audio", 400, "feed is required\n"),
+            (
+                "/api/v1/feed/audio?feed=missing",
+                404,
+                "feed is not configured\n",
+            ),
+            (
+                "/api/v1/feed/audio?feed=sk-0001&codec=flac",
+                415,
+                "unsupported media codec\n",
+            ),
+            (
+                "/api/v1/feed/audio?feed=sk-0001&codec=opus",
+                503,
+                "gstreamer backend is not available\n",
+            ),
+        ];
+        for (path, status, body) in cases {
+            let reply = exchange(&state, &get(path), None).await;
+            assert_eq!(
+                (reply.status, reply.text().as_str()),
+                (status, body),
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wav_stream_has_a_streaming_head_and_riff_header() {
+        let state = state(Vec::new());
+        let reply = exchange(&state, &get("/api/v1/feed/audio?feed=sk-0001"), Some(44)).await;
+        assert_eq!(reply.status, 200);
+        assert!(
+            reply.head.contains("Content-Type: audio/wav"),
+            "{}",
+            reply.head
+        );
+        assert!(reply.head.contains("Cache-Control: no-store"));
+        assert!(reply.head.contains("X-Accel-Buffering: no"));
+        assert_eq!(&reply.body[..4], b"RIFF");
+    }
+
+    #[tokio::test]
+    async fn offers_are_refused_with_the_documented_statuses() {
+        let reply = exchange(&state(Vec::new()), &get("/api/v1/webrtc/offer"), None).await;
+        assert_eq!(
+            (reply.status, reply.text().as_str()),
+            (405, "method not allowed\n")
+        );
+
+        let unavailable = state(Vec::new());
+        let reply = exchange(&unavailable, &post_offer("{}"), None).await;
+        assert_eq!(reply.status, 503);
+        assert_eq!(reply.json()["error"], "str0m WebRTC backend is unavailable");
+
+        let ready = state(vec![WebRTCAudioCodec::Opus]);
+        let reply = exchange(&ready, &post_offer("not json"), None).await;
+        assert_eq!(reply.status, 400);
+        assert!(reply.json()["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("invalid WebRTC offer JSON"));
+
+        let cases = [
+            (json!({"sdp": OPUS_OFFER}), 400, "feed_id is required"),
+            (
+                json!({"feed_id": "sk-0001", "sdp": "  "}),
+                400,
+                "sdp is required",
+            ),
+            (
+                json!({"feed_id": "other", "sdp": OPUS_OFFER}),
+                404,
+                "feed is not configured",
+            ),
+        ];
+        for (body, status, error) in cases {
+            let reply = exchange(&ready, &post_offer(&body.to_string()), None).await;
+            assert_eq!(reply.status, status, "{body}");
+            assert_eq!(reply.json()["error"], error, "{body}");
+        }
+
+        let reply = exchange(
+            &ready,
+            &post_offer(&json!({"feed_id": "sk-0001", "sdp": "v=0"}).to_string()),
+            None,
+        )
+        .await;
+        assert_eq!(reply.status, 415);
+        assert_eq!(
+            reply.json()["error"],
+            "the WebRTC offer did not include a codec supported by haze-media"
+        );
+        assert_eq!(reply.json()["supported_codecs"], json!(["opus"]));
     }
 }

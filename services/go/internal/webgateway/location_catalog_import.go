@@ -1,13 +1,11 @@
 package webgateway
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -15,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/meowraii/haze-weather-radio/services/go/internal/bridgeclient"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/events"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/locationdb"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/locationimport"
@@ -180,30 +179,25 @@ func requestLocationCatalogReload(ctx context.Context, result locationimport.Res
 	}
 	reloadCtx, cancel := context.WithTimeout(ctx, locationCatalogReloadTimeout)
 	defer cancel()
-	connection, err := (&net.Dialer{Timeout: 3 * time.Second}).DialContext(reloadCtx, "tcp", bridgeAddr)
-	if err != nil {
-		return locationCatalogReloadResult{}, fmt.Errorf("connect to location service bridge: %w", err)
-	}
-	defer connection.Close()
 	deadline := time.Now().Add(locationCatalogReloadTimeout)
 	if contextDeadline, ok := reloadCtx.Deadline(); ok && contextDeadline.Before(deadline) {
 		deadline = contextDeadline
 	}
-	if err := connection.SetDeadline(deadline); err != nil {
-		return locationCatalogReloadResult{}, err
+	connection, err := bridgeclient.Dial(reloadCtx, bridgeclient.Options{
+		Addr: bridgeAddr, MaxLineBytes: 1 << 20, Deadline: deadline,
+	})
+	if err != nil {
+		return locationCatalogReloadResult{}, fmt.Errorf("connect to location service bridge: %w", err)
 	}
+	defer connection.Close()
 	clientID := fmt.Sprintf("haze-web-location-import-%d", time.Now().UnixNano())
-	encoder := json.NewEncoder(connection)
-	if err := encoder.Encode(map[string]any{
-		"type": "bridge.client",
-		"data": map[string]any{
-			"client_id": clientID, "receive_events": true,
-			"subscriptions": []string{"location.catalog.reloaded", "location.catalog.reload_failed"},
-		},
+	if err := connection.Register(bridgeclient.Registration{
+		ClientID: clientID, ReceiveEvents: true,
+		Subscriptions: []string{"location.catalog.reloaded", "location.catalog.reload_failed"},
 	}); err != nil {
 		return locationCatalogReloadResult{}, fmt.Errorf("register location catalog reload client: %w", err)
 	}
-	if err := encoder.Encode(events.Event{
+	if err := connection.PublishValue(events.Event{
 		Type: "location.catalog.reload.request", Source: clientID, ReplyTo: clientID, Target: "haze-location",
 		Subject: fmt.Sprintf("eccc-clc-%s", result.ProviderVersion),
 		Data: map[string]any{
@@ -214,34 +208,38 @@ func requestLocationCatalogReload(ctx context.Context, result locationimport.Res
 	}); err != nil {
 		return locationCatalogReloadResult{}, fmt.Errorf("publish location catalog reload request: %w", err)
 	}
-	scanner := bufio.NewScanner(connection)
-	scanner.Buffer(make([]byte, 16*1024), 1<<20)
-	for scanner.Scan() {
+	var (
+		reload   locationCatalogReloadResult
+		outcome  error
+		answered bool
+	)
+	scanErr := connection.Scan(func(line []byte) bool {
 		var envelope struct {
 			Type   string          `json:"type"`
 			Target string          `json:"target"`
 			Data   json.RawMessage `json:"data"`
 		}
-		if err := json.Unmarshal(scanner.Bytes(), &envelope); err != nil || envelope.Target != clientID {
-			continue
+		if err := json.Unmarshal(line, &envelope); err != nil || envelope.Target != clientID {
+			return true
 		}
 		switch envelope.Type {
 		case "location.catalog.reloaded":
-			var reload locationCatalogReloadResult
+			answered = true
 			if err := json.Unmarshal(envelope.Data, &reload); err != nil {
-				return locationCatalogReloadResult{}, fmt.Errorf("decode location catalog reload response: %w", err)
+				outcome = fmt.Errorf("decode location catalog reload response: %w", err)
+			} else if strings.TrimSpace(reload.CatalogGeneration) == "" {
+				outcome = errors.New("location service returned an empty catalog generation")
 			}
-			if strings.TrimSpace(reload.CatalogGeneration) == "" {
-				return locationCatalogReloadResult{}, errors.New("location service returned an empty catalog generation")
-			}
-			return reload, nil
+			return false
 		case "location.catalog.reload_failed":
+			answered = true
 			var failure struct {
 				Error string `json:"error"`
 				Code  string `json:"code"`
 			}
 			if err := json.Unmarshal(envelope.Data, &failure); err != nil {
-				return locationCatalogReloadResult{}, fmt.Errorf("decode location catalog reload failure: %w", err)
+				outcome = fmt.Errorf("decode location catalog reload failure: %w", err)
+				return false
 			}
 			message := strings.TrimSpace(failure.Error)
 			if message == "" {
@@ -250,10 +248,18 @@ func requestLocationCatalogReload(ctx context.Context, result locationimport.Res
 			if message == "" {
 				message = "location service rejected the catalog reload"
 			}
-			return locationCatalogReloadResult{}, errors.New(message)
+			outcome = errors.New(message)
+			return false
 		}
+		return true
+	})
+	if answered {
+		if outcome != nil {
+			return locationCatalogReloadResult{}, outcome
+		}
+		return reload, nil
 	}
-	if err := scanner.Err(); err != nil {
+	if err := scanErr; err != nil {
 		if reloadCtx.Err() != nil {
 			return locationCatalogReloadResult{}, fmt.Errorf("location catalog reload acknowledgement: %w", reloadCtx.Err())
 		}

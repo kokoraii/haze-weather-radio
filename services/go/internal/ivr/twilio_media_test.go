@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+
+	"github.com/meowraii/haze-weather-radio/services/go/internal/bridgeclient"
 )
 
 func TestReadTwilioStreamStartValidatesFormatIdentityAndReplay(t *testing.T) {
@@ -425,7 +427,7 @@ func mockIVRASRBridge(t *testing.T, transcript string) *bridgeClient {
 	t.Helper()
 	ivrSide, brokerSide := net.Pipe()
 	client := &bridgeClient{
-		conn: ivrSide, events: make(chan map[string]any, 16),
+		bridge: bridgeclient.Wrap(ivrSide, bridgeclient.Options{}), events: make(chan map[string]any, 16),
 		pendingProducts: map[string]chan productResult{}, pendingWx: map[string]chan wxResult{},
 		pendingSynth: map[string]chan synthResult{}, pendingASR: map[string]chan asrResult{},
 	}

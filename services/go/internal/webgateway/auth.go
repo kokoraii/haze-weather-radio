@@ -1,7 +1,6 @@
 package webgateway
 
 import (
-	"bufio"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -11,10 +10,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
-	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -324,6 +322,130 @@ func (a *AuthManager) RecoverLockedAccount(ctx context.Context, username string)
 	return nil
 }
 
+// PasswordReset reports one account whose password was replaced locally.
+type PasswordReset struct {
+	Username string
+	Password string
+}
+
+const generatedPasswordLength = 24
+
+// generatedPasswordAlphabet omits look-alike characters (0/O, 1/I/l) and
+// symbols so a printed password survives copying from a terminal.
+const generatedPasswordAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+
+// ResetAccountPasswords performs a local, audited password reset for every
+// account whose username matches pattern (case-insensitive, with * and ?
+// wildcards). Each match gets a new random password that must be changed at
+// the next sign-in, its lockout state is cleared, and its sessions are revoked. Resets completed before an error are
+// still returned so the caller can report them. It is intended for the
+// haze-web CLI running with the service's private keys.
+func (a *AuthManager) ResetAccountPasswords(ctx context.Context, pattern string) ([]PasswordReset, error) {
+	if a == nil || a.accounts == nil {
+		return nil, fmt.Errorf("account recovery is unavailable in the current sign-in mode")
+	}
+	if !a.accounts.configured {
+		return nil, fmt.Errorf("account sign-in is unavailable: %w", a.accounts.initializationError)
+	}
+	pattern = strings.TrimSpace(pattern)
+	matcher, err := compileUsernamePattern(pattern)
+	if err != nil {
+		return nil, err
+	}
+	accounts, err := a.accounts.store.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	resets := []PasswordReset{}
+	matched := 0
+	for _, account := range accounts {
+		if !matcher.MatchString(account.Username) {
+			continue
+		}
+		matched++
+		password, err := generatePassword()
+		if err != nil {
+			return resets, err
+		}
+		hash, err := a.accounts.hashPassword(password)
+		if err != nil {
+			return resets, err
+		}
+		event := AuditEvent{
+			Event: "LOCAL_PASSWORD_RESET_REQUESTED", ActorID: account.ID, ActorUsername: account.Username,
+			Severity: "critical", Details: map[string]any{"source": "haze-web --reset-password", "pattern": pattern},
+		}
+		if err := a.accounts.audit.Append("webpanel", event); err != nil {
+			return resets, fmt.Errorf("write password reset audit request: %w", err)
+		}
+		// The printed password is single use: the account must replace it at the
+		// next sign-in. Accounts barred from self-service changes keep it, since
+		// forcing a change they cannot make would lock them out.
+		if err := a.accounts.store.SetPassword(ctx, account.ID, hash, account.AllowUserPasswordChange); err != nil {
+			return resets, fmt.Errorf("reset password for %q: %w", account.Username, err)
+		}
+		a.accounts.ResetLoginLimits(ctx, account.Username, account.LastIP)
+		if err := a.accounts.RevokeUser(ctx, account.ID); err != nil {
+			return resets, fmt.Errorf("revoke sessions for %q: %w", account.Username, err)
+		}
+		resets = append(resets, PasswordReset{Username: account.Username, Password: password})
+		event.Event = "LOCAL_PASSWORD_RESET_COMPLETED"
+		if err := a.accounts.audit.Append("webpanel", event); err != nil {
+			return resets, fmt.Errorf("write password reset audit completion: %w", err)
+		}
+	}
+	if matched == 0 {
+		return nil, fmt.Errorf("no accounts match %q", pattern)
+	}
+	return resets, nil
+}
+
+// compileUsernamePattern turns a case-insensitive * and ? wildcard pattern
+// into an anchored matcher. Every other character matches literally.
+func compileUsernamePattern(pattern string) (*regexp.Regexp, error) {
+	if pattern == "" {
+		return nil, fmt.Errorf("an account name or wildcard pattern is required")
+	}
+	var expression strings.Builder
+	expression.WriteString("(?i)^")
+	for _, char := range pattern {
+		switch char {
+		case '*':
+			expression.WriteString(".*")
+		case '?':
+			expression.WriteString(".")
+		default:
+			expression.WriteString(regexp.QuoteMeta(string(char)))
+		}
+	}
+	expression.WriteString("$")
+	return regexp.Compile(expression.String())
+}
+
+func generatePassword() (string, error) {
+	const alphabetSize = len(generatedPasswordAlphabet)
+	// Discard bytes past the last whole multiple of the alphabet size so every
+	// character is equally likely.
+	const limit = 256 - 256%alphabetSize
+	password := make([]byte, 0, generatedPasswordLength)
+	var raw [generatedPasswordLength]byte
+	for len(password) < generatedPasswordLength {
+		if _, err := rand.Read(raw[:]); err != nil {
+			return "", fmt.Errorf("generate password: %w", err)
+		}
+		for _, value := range raw {
+			if int(value) >= limit {
+				continue
+			}
+			password = append(password, generatedPasswordAlphabet[int(value)%alphabetSize])
+			if len(password) == generatedPasswordLength {
+				break
+			}
+		}
+	}
+	return string(password), nil
+}
+
 func (a *AuthManager) cookieSecureForRequest(request *http.Request) bool {
 	if a == nil || !a.secureCookie {
 		return false
@@ -516,78 +638,4 @@ func parseArgon2Params(raw string) (argon2Params, error) {
 
 func decodePHCBase64(value string) ([]byte, error) {
 	return base64.RawStdEncoding.DecodeString(value)
-}
-
-// LoadDotEnv loads simple KEY=VALUE entries without overriding existing env.
-func LoadDotEnv(path string) error {
-	file, err := os.Open(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			if created, createErr := createDotEnvFromExample(path); createErr != nil {
-				return createErr
-			} else if !created {
-				log.Printf("WARN .env file not found: %s", path)
-				return nil
-			}
-			file, err = os.Open(path)
-			if err != nil {
-				return err
-			}
-		} else {
-			return err
-		}
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		key, value, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
-		}
-		key = strings.TrimSpace(key)
-		if key == "" {
-			continue
-		}
-		if _, exists := os.LookupEnv(key); exists {
-			continue
-		}
-		_ = os.Setenv(key, trimEnvValue(value))
-	}
-	return scanner.Err()
-}
-
-func createDotEnvFromExample(path string) (bool, error) {
-	if filepath.Base(path) != ".env" {
-		return false, nil
-	}
-	examplePath := filepath.Join(filepath.Dir(path), ".env.example")
-	raw, err := os.ReadFile(examplePath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			log.Printf("WARN .env file not found and no .env.example is available: %s", path)
-			return false, nil
-		}
-		return false, err
-	}
-	if err := os.WriteFile(path, raw, 0o600); err != nil {
-		return false, err
-	}
-	log.Printf("WARN .env file not found: created %s from %s", path, examplePath)
-	return true, nil
-}
-
-func trimEnvValue(value string) string {
-	value = strings.TrimSpace(value)
-	if len(value) >= 2 {
-		quote := value[0]
-		if (quote == '"' || quote == '\'') && value[len(value)-1] == quote {
-			return value[1 : len(value)-1]
-		}
-	}
-	return value
 }

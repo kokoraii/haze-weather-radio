@@ -171,8 +171,6 @@ pub(crate) struct FeedConfig {
     #[serde(default)]
     pub(crate) alerts: Option<FeedAlertsConfig>,
     #[serde(default)]
-    pub(crate) locations: FeedLocationsConfig,
-    #[serde(default)]
     pub(crate) languages: LanguagesConfig,
     #[serde(default)]
     pub(crate) description: DescriptionConfig,
@@ -246,24 +244,6 @@ pub(crate) struct AlertFilterOtherConfig {
     pub(crate) value_name: String,
     #[serde(rename = "@value", default)]
     pub(crate) value: String,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-pub(crate) struct FeedLocationsConfig {
-    #[serde(default)]
-    pub(crate) coverage: FeedCoverageConfig,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-pub(crate) struct FeedCoverageConfig {
-    #[serde(rename = "region", default)]
-    pub(crate) regions: Vec<FeedCoverageRegionConfig>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-pub(crate) struct FeedCoverageRegionConfig {
-    #[serde(rename = "@id", default)]
-    pub(crate) id: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -819,16 +799,10 @@ impl FeedConfig {
             .unwrap_or(true)
     }
 
-    pub(crate) fn alert_covers_all_locations(&self) -> bool {
-        if self
-            .locations
-            .coverage
-            .regions
-            .iter()
-            .any(|region| !region.id.trim().is_empty())
-        {
-            return false;
-        }
+    /// Whether an alert source is enabled that would take alerts for every
+    /// location when the feed's coverage (from the daemon's feed config
+    /// snapshot) is empty.
+    pub(crate) fn alert_sources_enabled(&self) -> bool {
         let Some(alerts) = &self.alerts else {
             return false;
         };
@@ -1062,7 +1036,6 @@ mod tests {
         assert_eq!(feed.site_name(), "Saskatoon");
         assert_eq!(feed.station_callsign(), "");
         assert_eq!(feed.station_frequency_mhz(), "162.550");
-        assert!(!feed.alert_covers_all_locations());
         assert_eq!(feed.transmitter_metadata.transmitters.len(), 3);
         assert_eq!(
             feed.replacement_transmitter()
@@ -1099,7 +1072,7 @@ mod tests {
         let feed = &parsed.feeds[0];
 
         assert!(feed.same_enabled());
-        assert!(feed.alert_covers_all_locations());
+        assert!(feed.alert_sources_enabled());
     }
 
     #[test]

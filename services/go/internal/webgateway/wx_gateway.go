@@ -1,7 +1,6 @@
 package webgateway
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -11,7 +10,6 @@ import (
 	"html"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -21,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/meowraii/haze-weather-radio/services/go/internal/bridgeclient"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/locationclient"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/tts"
 )
@@ -88,7 +87,7 @@ type wxSynthResult struct {
 }
 
 type wxBridgeClient struct {
-	conn         net.Conn
+	bridge       *bridgeclient.Conn
 	pendingWx    map[string]chan wxBridgeResult
 	pendingSynth map[string]chan wxSynthResult
 	mu           sync.Mutex
@@ -512,13 +511,12 @@ func loadReaderCatalog(configPath string) ([]map[string]any, error) {
 }
 
 func connectWxBridge(ctx context.Context, addr string) (*wxBridgeClient, error) {
-	dialer := net.Dialer{Timeout: 3 * time.Second}
-	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	bridge, err := bridgeclient.Dial(ctx, bridgeclient.Options{Addr: addr, MaxLineBytes: 8 * 1024 * 1024})
 	if err != nil {
 		return nil, err
 	}
 	client := &wxBridgeClient{
-		conn:         conn,
+		bridge:       bridge,
 		pendingWx:    map[string]chan wxBridgeResult{},
 		pendingSynth: map[string]chan wxSynthResult{},
 	}
@@ -527,19 +525,14 @@ func connectWxBridge(ctx context.Context, addr string) (*wxBridgeClient, error) 
 }
 
 func (c *wxBridgeClient) Close() error {
-	if c == nil || c.conn == nil {
+	if c == nil {
 		return nil
 	}
-	return c.conn.Close()
+	return c.bridge.Close()
 }
 
 func (c *wxBridgeClient) Publish(message map[string]any) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, ok := message["timestamp"]; !ok {
-		message["timestamp"] = time.Now().UTC()
-	}
-	return json.NewEncoder(c.conn).Encode(message)
+	return c.bridge.Publish(message)
 }
 
 func (c *wxBridgeClient) WxOnDemand(ctx context.Context, requestID string, request wxGeneratePayload) (wxRenderedProduct, error) {
@@ -719,21 +712,12 @@ func (c *wxBridgeClient) Synthesize(ctx context.Context, jobID string, product w
 }
 
 func (c *wxBridgeClient) readLoop() {
-	scanner := bufio.NewScanner(c.conn)
-	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
+	_ = c.bridge.ReadMessages(func(message map[string]any) bool {
+		if !c.handleWxResult(message) {
+			c.handleSynthResult(message)
 		}
-		var message map[string]any
-		if err := json.Unmarshal([]byte(line), &message); err != nil {
-			continue
-		}
-		if c.handleWxResult(message) || c.handleSynthResult(message) {
-			continue
-		}
-	}
+		return true
+	})
 	c.failPending(fmt.Errorf("host event bridge closed"))
 }
 

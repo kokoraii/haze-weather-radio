@@ -112,6 +112,10 @@ func (s *Service) dispatchWork(ctx context.Context, workers renderWorkers, event
 		if !workers.interactive.trySubmit(job) {
 			s.publishWxFailed(wxOnDemandRequestFromEvent(event), "on-demand render queue is full; retry")
 		}
+	case alertSpeechRequestEvent:
+		if !workers.interactive.trySubmit(job) {
+			s.publishAlertSpeechFailed(firstText(mapAt(event, "data"), event, "request_id", "subject"), "interactive render queue is full; retry")
+		}
 	case "lead.config.updated":
 		s.refreshConfigNow()
 	}

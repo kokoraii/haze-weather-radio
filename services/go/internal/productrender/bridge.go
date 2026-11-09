@@ -1,19 +1,15 @@
 package productrender
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
-	"fmt"
-	"net"
 	"strings"
 	"sync"
-	"time"
+
+	"github.com/meowraii/haze-weather-radio/services/go/internal/bridgeclient"
 )
 
 type bridgeClient struct {
-	conn      net.Conn
-	mu        sync.Mutex
+	bridge    *bridgeclient.Conn
 	events    chan map[string]any
 	done      chan struct{}
 	closeOnce sync.Once
@@ -22,16 +18,12 @@ type bridgeClient struct {
 const bridgeEventBufferSize = 128
 
 func connectBridge(ctx context.Context, addr string) (*bridgeClient, error) {
-	if strings.TrimSpace(addr) == "" {
-		return nil, fmt.Errorf("missing host event bridge address")
-	}
-	dialer := net.Dialer{Timeout: 3 * time.Second}
-	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	bridge, err := bridgeclient.Dial(ctx, bridgeclient.Options{Addr: addr})
 	if err != nil {
 		return nil, err
 	}
 	client := &bridgeClient{
-		conn:   conn,
+		bridge: bridge,
 		events: make(chan map[string]any, bridgeEventBufferSize),
 		done:   make(chan struct{}),
 	}
@@ -48,9 +40,7 @@ func (c *bridgeClient) Close() error {
 		if c.done != nil {
 			close(c.done)
 		}
-		if c.conn != nil {
-			err = c.conn.Close()
-		}
+		err = c.bridge.Close()
 	})
 	return err
 }
@@ -60,40 +50,26 @@ func (c *bridgeClient) Events() <-chan map[string]any {
 }
 
 func (c *bridgeClient) Publish(message map[string]any) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, ok := message["timestamp"]; !ok {
-		message["timestamp"] = time.Now().UTC()
-	}
-	return json.NewEncoder(c.conn).Encode(message)
+	return c.bridge.Publish(message)
 }
 
 func (c *bridgeClient) readLoop() {
 	defer close(c.events)
-	scanner := bufio.NewScanner(c.conn)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		var message map[string]any
-		if err := json.Unmarshal([]byte(line), &message); err != nil {
-			continue
-		}
+	_ = c.bridge.ReadMessages(func(message map[string]any) bool {
 		switch stringAt(message, "type") {
-		case "cap.alert.received", "product.render.request", "wx.on_demand.request", "lead.config.updated", "system.shutdown":
+		case "cap.alert.received", "product.render.request", "wx.on_demand.request", alertSpeechRequestEvent, "lead.config.updated", "system.shutdown":
 		default:
-			continue
+			return true
 		}
 		// Discard unrelated bus traffic, not requests that callers are awaiting.
 		// The dispatcher applies bounded admission and explicit busy responses.
 		select {
 		case c.events <- message:
+			return true
 		case <-c.done:
-			return
+			return false
 		}
-	}
+	})
 }
 
 func stringAt(source map[string]any, key string) string {

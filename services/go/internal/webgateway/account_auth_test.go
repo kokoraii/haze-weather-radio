@@ -453,7 +453,7 @@ func TestConditionalSelfPasswordChangeCannotOverwriteAdminReset(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.accounts.store.SetPassword(context.Background(), account.ID, adminHash); err != nil {
+	if err := manager.accounts.store.SetPassword(context.Background(), account.ID, adminHash, false); err != nil {
 		t.Fatal(err)
 	}
 	staleUserHash, err := manager.accounts.hashPassword("stale user replacement password")
@@ -489,7 +489,7 @@ func TestConditionalMFAEnrollmentCannotSurviveCredentialReset(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.accounts.store.SetPassword(context.Background(), account.ID, replacementHash); err != nil {
+	if err := manager.accounts.store.SetPassword(context.Background(), account.ID, replacementHash, false); err != nil {
 		t.Fatal(err)
 	}
 	encrypted, err := manager.accounts.encryptMFASecret(account.ID, "JBSWY3DPEHPK3PXP")

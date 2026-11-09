@@ -303,13 +303,13 @@ if [[ "$skip_cargo_build" -eq 0 ]]; then
   if [[ "$media_backend" != "builtin" ]]; then
     cargo build "${cargo_profile_args[@]}" -p haze
     cargo build "${cargo_profile_args[@]}" -p haze-cap
-    cargo build "${cargo_profile_args[@]}" -p haze-easnet
+    cargo build "${cargo_profile_args[@]}" -p haze-netalert
     cargo build "${cargo_profile_args[@]}" -p haze-location
     cargo build "${cargo_profile_args[@]}" -p haze-playout --features ffmpeg-runtime
     cargo build "${cargo_profile_args[@]}" -p haze-media --features gstreamer-backend
     cargo build "${cargo_profile_args[@]}" -p haze-cgen --features "gpu-wgpu"
   else
-    cargo build "${cargo_profile_args[@]}" -p haze -p haze-cap -p haze-easnet -p haze-location -p haze-playout
+    cargo build "${cargo_profile_args[@]}" -p haze -p haze-cap -p haze-netalert -p haze-location -p haze-playout
     cargo build "${cargo_profile_args[@]}" -p haze-media --features gstreamer-backend
     cargo build "${cargo_profile_args[@]}" -p haze-cgen --features "gpu-wgpu"
   fi
@@ -318,7 +318,7 @@ fi
 profile_dir="$profile"
 exe_path="$root/target/$profile_dir/haze"
 cap_rust_exe_path="$root/target/$profile_dir/haze-cap-ingest"
-easnet_exe_path="$root/target/$profile_dir/haze-easnet"
+netalert_exe_path="$root/target/$profile_dir/haze-netalert"
 location_exe_path="$root/target/$profile_dir/haze-location"
 playout_exe_path="$root/target/$profile_dir/haze-playout-rs"
 media_exe_path="$root/target/$profile_dir/haze-media"
@@ -331,8 +331,8 @@ if [[ ! -x "$cap_rust_exe_path" ]]; then
   echo "Missing Rust CAP ingest executable: $cap_rust_exe_path" >&2
   exit 1
 fi
-if [[ ! -x "$easnet_exe_path" ]]; then
-  echo "Missing Rust EAS NET executable: $easnet_exe_path" >&2
+if [[ ! -x "$netalert_exe_path" ]]; then
+  echo "Missing Rust network alert executable: $netalert_exe_path" >&2
   exit 1
 fi
 if [[ ! -x "$location_exe_path" ]]; then
@@ -365,7 +365,7 @@ rm -f \
   "$out_full/haze-data-ingest" \
   "$out_full/haze-cap-ingest" \
   "$out_full/haze-cap-ingest-rs" \
-  "$out_full/haze-easnet" \
+  "$out_full/haze-netalert" \
   "$out_full/haze-location" \
   "$out_full/haze-tts" \
   "$out_full/haze-product-render" \
@@ -381,7 +381,7 @@ rm -f \
   "$bin_full/haze-data-ingest" \
   "$bin_full/haze-cap-ingest" \
   "$bin_full/haze-cap-ingest-rs" \
-  "$bin_full/haze-easnet" \
+  "$bin_full/haze-netalert" \
   "$bin_full/haze-location" \
   "$bin_full/haze-tts" \
   "$bin_full/haze-product-render" \
@@ -400,8 +400,8 @@ cp "$exe_path" "$out_full/haze"
 chmod +x "$out_full/haze"
 cp "$cap_rust_exe_path" "$bin_full/haze-cap-ingest"
 chmod +x "$bin_full/haze-cap-ingest"
-cp "$easnet_exe_path" "$bin_full/haze-easnet"
-chmod +x "$bin_full/haze-easnet"
+cp "$netalert_exe_path" "$bin_full/haze-netalert"
+chmod +x "$bin_full/haze-netalert"
 cp "$location_exe_path" "$bin_full/haze-location"
 chmod +x "$bin_full/haze-location"
 cp "$playout_exe_path" "$bin_full/haze-playout-rs"
@@ -411,7 +411,7 @@ chmod +x "$bin_full/haze-media"
 cp "$cgen_exe_path" "$bin_full/haze-cgen"
 chmod +x "$bin_full/haze-cgen"
 
-copy_linux_runtime_dependencies "$bin_full" "$out_full/haze" "$bin_full/haze-cap-ingest" "$bin_full/haze-easnet" "$bin_full/haze-location" "$bin_full/haze-playout-rs" "$bin_full/haze-media" "$bin_full/haze-cgen"
+copy_linux_runtime_dependencies "$bin_full" "$out_full/haze" "$bin_full/haze-cap-ingest" "$bin_full/haze-netalert" "$bin_full/haze-location" "$bin_full/haze-playout-rs" "$bin_full/haze-media" "$bin_full/haze-cgen"
 copy_gstreamer_runtime "$bin_full"
 
 if [[ "$skip_go_services" -eq 0 ]]; then

@@ -57,6 +57,9 @@ func writeDaemonSettings(configPath string, settings map[string]any) (map[string
 	}
 	active := daemonSettingsView(root)
 	sanitized := daemonSettingsView(settings)
+	if err := validateServicePlacements(sanitized); err != nil {
+		return nil, err
+	}
 	overlay := settingsDelta(active, sanitized)
 	settingsPath := daemonSettingsPath(filepath.Dir(configPath), root)
 	if err := os.MkdirAll(filepath.Dir(settingsPath), 0o755); err != nil {
@@ -95,7 +98,7 @@ func daemonSettingsView(source map[string]any) map[string]any {
 	if publicAccess != "disabled" && publicAccess != "public" && publicAccess != "auth_required" {
 		publicAccess = "disabled"
 	}
-	return map[string]any{
+	view := map[string]any{
 		"services": map[string]any{
 			"go": map[string]any{
 				"enabled": boolAt(source, []string{"services", "go", "enabled"}, false),
@@ -229,6 +232,8 @@ func daemonSettingsView(source map[string]any) map[string]any {
 			"chimes":              map[string]any{"enabled": boolAt(source, []string{"playout", "chimes", "enabled"}, true)},
 		},
 	}
+	addPlacementView(view, source)
+	return view
 }
 
 func loadYAMLMap(path string) (map[string]any, error) {

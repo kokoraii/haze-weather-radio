@@ -13,7 +13,9 @@ import (
 	"github.com/meowraii/haze-weather-radio/services/go/internal/tts"
 )
 
-const shimTimeout = 2 * time.Minute
+// defaultTimeout bounds a shim whose caller set no deadline, so a hung
+// 32-bit engine cannot keep the process alive forever.
+const defaultTimeout = 2 * time.Minute
 
 type synthRequest struct {
 	Text            string          `json:"text"`
@@ -23,6 +25,7 @@ type synthRequest struct {
 	Rate            int             `json:"rate,omitempty"`
 	Volume          int             `json:"volume,omitempty"`
 	SentenceSilence float64         `json:"sentence_silence,omitempty"`
+	TimeoutMS       int64           `json:"timeout_ms,omitempty"`
 }
 
 type synthResponse struct {
@@ -37,12 +40,10 @@ func main() {
 	if len(os.Args) < 2 {
 		fail("usage: haze-sapi5-shim.exe list|synthesize")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), shimTimeout)
-	defer cancel()
 	provider := tts.NewSAPI5Provider()
 	switch os.Args[1] {
 	case "list":
-		voices, err := provider.ListVoices(ctx)
+		voices, err := provider.ListVoices(watchdog(defaultTimeout))
 		if err != nil {
 			fail(err.Error())
 		}
@@ -52,7 +53,11 @@ func main() {
 		if err := json.NewDecoder(os.Stdin).Decode(&payload); err != nil {
 			fail(fmt.Sprintf("invalid synthesis request: %v", err))
 		}
-		audio, err := provider.Synthesize(ctx, tts.Request{
+		timeout := defaultTimeout
+		if payload.TimeoutMS > 0 {
+			timeout = time.Duration(payload.TimeoutMS) * time.Millisecond
+		}
+		audio, err := provider.Synthesize(watchdog(timeout), tts.Request{
 			Text:            payload.Text,
 			VoiceID:         payload.VoiceID,
 			Language:        payload.Language,
@@ -73,6 +78,13 @@ func main() {
 	default:
 		fail("unknown command")
 	}
+}
+
+// watchdog exits the shim once timeout passes. A context cannot stop a
+// synchronous SAPI Speak call, and an old 32-bit engine can hang in one.
+func watchdog(timeout time.Duration) context.Context {
+	time.AfterFunc(timeout, func() { fail("32-bit SAPI5 call timed out") })
+	return context.Background()
 }
 
 func writeJSON(value any) {

@@ -453,13 +453,13 @@ try {
         if ($MediaBackend -ne "builtin") {
             cargo build @CargoProfileArgs @CargoTargetArgs -p haze
             cargo build @CargoProfileArgs @CargoTargetArgs -p haze-cap
-            cargo build @CargoProfileArgs @CargoTargetArgs -p haze-easnet
+            cargo build @CargoProfileArgs @CargoTargetArgs -p haze-netalert
             cargo build @CargoProfileArgs @CargoTargetArgs -p haze-location
             cargo build @CargoProfileArgs @CargoTargetArgs -p haze-playout --features ffmpeg-runtime
             cargo build @CargoProfileArgs @CargoTargetArgs -p haze-media --features gstreamer-backend
             cargo build @CargoProfileArgs @CargoTargetArgs -p haze-cgen --features "gpu-wgpu"
         } else {
-            cargo build @CargoProfileArgs @CargoTargetArgs -p haze -p haze-cap -p haze-easnet -p haze-location -p haze-playout
+            cargo build @CargoProfileArgs @CargoTargetArgs -p haze -p haze-cap -p haze-netalert -p haze-location -p haze-playout
             cargo build @CargoProfileArgs @CargoTargetArgs -p haze-media --features gstreamer-backend
             cargo build @CargoProfileArgs @CargoTargetArgs -p haze-cgen --features "gpu-wgpu"
         }
@@ -469,7 +469,7 @@ try {
     $TargetProfileDir = if ($RunningOnWindows) { "target/x86_64-pc-windows-gnullvm/$ProfileDir" } else { "target/$ProfileDir" }
     $ExePath = Join-Path $Root "$TargetProfileDir/haze.exe"
     $CapRustExePath = Join-Path $Root "$TargetProfileDir/haze-cap-ingest.exe"
-    $EasNetExePath = Join-Path $Root "$TargetProfileDir/haze-easnet.exe"
+    $NetAlertExePath = Join-Path $Root "$TargetProfileDir/haze-netalert.exe"
     $LocationExePath = Join-Path $Root "$TargetProfileDir/haze-location.exe"
     $PlayoutExePath = Join-Path $Root "$TargetProfileDir/haze-playout-rs.exe"
     $MediaExePath = Join-Path $Root "$TargetProfileDir/haze-media.exe"
@@ -480,8 +480,8 @@ try {
     if (-not (Test-Path -LiteralPath $CapRustExePath)) {
         throw "Missing Rust CAP ingest executable: $CapRustExePath"
     }
-    if (-not (Test-Path -LiteralPath $EasNetExePath)) {
-        throw "Missing Rust EAS NET executable: $EasNetExePath"
+    if (-not (Test-Path -LiteralPath $NetAlertExePath)) {
+        throw "Missing Rust network alert executable: $NetAlertExePath"
     }
     if (-not (Test-Path -LiteralPath $LocationExePath)) {
         throw "Missing Rust location executable: $LocationExePath"
@@ -512,10 +512,11 @@ try {
         "haze-web.exe",
         "haze-data-ingest.exe",
         "haze-cap-ingest.exe",
-        "haze-easnet.exe",
+        "haze-netalert.exe",
         "haze-location.exe",
         "haze-tts.exe",
         "haze-sapi5-shim.exe",
+        "haze-sapi5-shim-x64.exe",
         "haze-product-render.exe",
         "haze-playlist.exe",
         "haze-webhook.exe",
@@ -578,7 +579,7 @@ try {
 
     Copy-Item -LiteralPath $ExePath -Destination (Join-Path $BinFull "haze.exe") -Force
     Copy-Item -LiteralPath $CapRustExePath -Destination (Join-Path $BinFull "haze-cap-ingest.exe") -Force
-    Copy-Item -LiteralPath $EasNetExePath -Destination (Join-Path $BinFull "haze-easnet.exe") -Force
+    Copy-Item -LiteralPath $NetAlertExePath -Destination (Join-Path $BinFull "haze-netalert.exe") -Force
     Copy-Item -LiteralPath $LocationExePath -Destination (Join-Path $BinFull "haze-location.exe") -Force
     Copy-Item -LiteralPath $PlayoutExePath -Destination (Join-Path $BinFull "haze-playout-rs.exe") -Force
     Copy-Item -LiteralPath $MediaExePath -Destination (Join-Path $BinFull "haze-media.exe") -Force

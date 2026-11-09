@@ -15,7 +15,16 @@ const (
 	routinePreparationWorkerLimit  = 4
 	priorityPreparationWorkerLimit = 4
 	priorityPreparationBacklog     = 64
+	// priorityPreparationsPerFeed leaves room for a few overlapping alerts that
+	// each target every feed, such as a network-wide test during a CAP alert.
+	priorityPreparationsPerFeed = 4
 )
+
+// priorityPreparationBacklogFor sizes the pending alert backlog so a single
+// alert fanned out to every enabled feed is never rejected.
+func priorityPreparationBacklogFor(feedCount int) int {
+	return max(priorityPreparationBacklog, feedCount*priorityPreparationsPerFeed)
+}
 
 type routinePreparation struct {
 	planner *feedPlanner

@@ -4,11 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use haze_bridge_client::{BridgeReader, BridgeWriter, Options, Registration};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
@@ -21,6 +19,8 @@ type PendingProducts = PendingMap<RenderedProduct>;
 
 const SYNTH_REPLY_TIMEOUT: Duration = Duration::from_secs(90);
 const PRODUCT_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Rendered products and synthesis results are the largest events playout reads.
+const MAX_BRIDGE_LINE_BYTES: usize = 8 * 1024 * 1024;
 const PLAYOUT_CLIENT_ID: &str = "haze-playout";
 const PLAYOUT_SUBSCRIPTIONS: &[&str] = &[
     "system.shutdown",
@@ -32,6 +32,14 @@ const PLAYOUT_SUBSCRIPTIONS: &[&str] = &[
     "cap.alert.cancelled",
     "playlist.control",
     "operator.breakin.*",
+];
+
+/// Replies the read loop resolves for [`BridgeClient::synthesize`] and
+/// [`BridgeClient::render_product`]. Every consumer connection subscribes to
+/// them on top of its own list: the broker only delivers untargeted events a
+/// client subscribed to, so a connection that makes those requests without
+/// them waits out every reply timeout.
+const REPLY_SUBSCRIPTIONS: &[&str] = &[
     "tts.synthesized",
     "tts.failed",
     "product.rendered",
@@ -40,7 +48,7 @@ const PLAYOUT_SUBSCRIPTIONS: &[&str] = &[
 
 #[derive(Clone)]
 pub(crate) struct BridgeClient {
-    writer: Arc<Mutex<OwnedWriteHalf>>,
+    writer: BridgeWriter,
     pending_synth: PendingSynth,
     pending_products: PendingProducts,
 }
@@ -104,11 +112,15 @@ pub(crate) struct RenderedSegment {
     pub(crate) audio_path: String,
 }
 
+fn bridge_options() -> Options {
+    Options {
+        max_line_bytes: MAX_BRIDGE_LINE_BYTES,
+        ..Options::default()
+    }
+}
+
 pub(crate) async fn connect(addr: &str) -> Result<BridgeConnection> {
-    let stream = TcpStream::connect(addr)
-        .await
-        .with_context(|| format!("failed to connect to host bridge at {addr}"))?;
-    let (reader, writer) = stream.into_split();
+    let (reader, writer) = haze_bridge_client::connect(addr, &bridge_options(), None).await?;
     let (tx, rx) = mpsc::channel(256);
     let pending_synth = Arc::new(Mutex::new(HashMap::new()));
     let pending_products = Arc::new(Mutex::new(HashMap::new()));
@@ -120,7 +132,7 @@ pub(crate) async fn connect(addr: &str) -> Result<BridgeConnection> {
     ));
     Ok(BridgeConnection {
         client: BridgeClient {
-            writer: Arc::new(Mutex::new(writer)),
+            writer,
             pending_synth,
             pending_products,
         },
@@ -173,50 +185,35 @@ pub(crate) async fn connect_publish_only_retry(addr: &str) -> Result<BridgeClien
 }
 
 async fn connect_publish_only(addr: &str) -> Result<BridgeClient> {
-    let stream = TcpStream::connect(addr)
-        .await
-        .with_context(|| format!("failed to connect to host media bridge at {addr}"))?;
-    let (reader, writer) = stream.into_split();
+    let registration = Registration::publish_only().with_source(PLAYOUT_CLIENT_ID);
+    let (reader, writer) =
+        haze_bridge_client::connect(addr, &bridge_options(), Some(&registration)).await?;
+    // Nothing is delivered to a publish-only connection, so the read half is not used.
     drop(reader);
-    let client = BridgeClient {
-        writer: Arc::new(Mutex::new(writer)),
+    Ok(BridgeClient {
+        writer,
         pending_synth: Arc::new(Mutex::new(HashMap::new())),
         pending_products: Arc::new(Mutex::new(HashMap::new())),
-    };
-    client.set_receive_events(false).await?;
-    Ok(client)
+    })
 }
 
 impl BridgeClient {
-    pub(crate) async fn publish(&self, mut value: Value) -> Result<()> {
-        if value.get("timestamp").is_none() {
-            value["timestamp"] = json!(chrono::Utc::now().to_rfc3339());
-        }
-        let mut raw = serde_json::to_vec(&value)?;
-        raw.push(b'\n');
-        let mut writer = self.writer.lock().await;
-        writer
-            .write_all(&raw)
-            .await
-            .context("failed to write host event bridge event")
+    pub(crate) async fn publish(&self, value: Value) -> Result<()> {
+        self.writer.publish(value).await
     }
 
     /// Writes a complete pre-framed payload prepared by a hot-path producer.
     pub(crate) async fn write_raw(&self, payload: &[u8]) -> Result<()> {
-        let mut writer = self.writer.lock().await;
-        writer
-            .write_all(payload)
-            .await
-            .context("failed to write host event bridge event")
-    }
-
-    pub(crate) async fn set_receive_events(&self, receive_events: bool) -> Result<()> {
-        self.publish(client_registration(receive_events, None, &[]))
-            .await
+        self.writer.write_raw(payload).await
     }
 
     async fn register_consumer(&self, client_id: &str, subscriptions: &[&str]) -> Result<()> {
-        self.publish(client_registration(true, Some(client_id), subscriptions))
+        let mut subscriptions = subscriptions.to_vec();
+        subscriptions.extend(REPLY_SUBSCRIPTIONS);
+        self.writer
+            .register(
+                &Registration::subscriber(client_id, &subscriptions).with_source(PLAYOUT_CLIENT_ID),
+            )
             .await
     }
 
@@ -338,19 +335,19 @@ impl BridgeClient {
 }
 
 async fn read_loop(
-    reader: OwnedReadHalf,
+    mut reader: BridgeReader,
     tx: mpsc::Sender<Value>,
     pending_synth: PendingSynth,
     pending_products: PendingProducts,
 ) {
-    let mut lines = BufReader::new(reader).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
+    loop {
+        let value = match reader.next_event().await {
+            Ok(Some(value)) => value,
+            Ok(None) => break,
+            Err(err) => {
+                tracing::warn!("host event bridge read failed: {err}");
+                break;
+            }
         };
         if handle_synth_result(&value, &pending_synth).await
             || handle_product_result(&value, &pending_products).await
@@ -460,28 +457,112 @@ fn fallback_text(value: &str, fallback: &str) -> String {
     }
 }
 
-fn client_registration(
-    receive_events: bool,
-    client_id: Option<&str>,
-    subscriptions: &[&str],
-) -> Value {
-    let mut data = json!({
-        "receive_events": receive_events,
-        "subscriptions": subscriptions,
-    });
-    if let (Some(client_id), Some(object)) = (client_id, data.as_object_mut()) {
-        object.insert("client_id".to_string(), json!(client_id));
-    }
-    json!({
-        "type": "bridge.client",
-        "source": "haze-playout",
-        "data": data,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    fn client_registration(
+        receive_events: bool,
+        client_id: Option<&str>,
+        subscriptions: &[&str],
+    ) -> Value {
+        let registration = match (receive_events, client_id) {
+            (false, _) => Registration::publish_only(),
+            (true, Some(client_id)) => Registration::subscriber(client_id, subscriptions),
+            (true, None) => Registration::anonymous_subscriber(subscriptions),
+        };
+        registration.with_source(PLAYOUT_CLIENT_ID).to_value()
+    }
+
+    #[tokio::test]
+    async fn consumer_connection_registers_then_correlates_synthesis_replies() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake broker");
+        let addr = listener.local_addr().expect("broker address").to_string();
+        let broker = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept playout");
+            let (read, mut write) = socket.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let registration: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let request: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let reply = json!({
+                "type": "tts.synthesized",
+                "subject": request["subject"],
+                "data": { "job_id": request["data"]["job_id"], "output_path": "out/final.wav" },
+            });
+            let mut raw = serde_json::to_vec(&reply).unwrap();
+            raw.push(b'\n');
+            write.write_all(&raw).await.unwrap();
+            (registration, request)
+        });
+
+        // Like the CAP alert router: its own list names no reply types, yet
+        // its feed dispatchers synthesize alert speech on this connection.
+        let connection = connect_consumer_retry(&addr, PLAYOUT_CLIENT_ID, &["cap.alert.received"])
+            .await
+            .expect("connect to fake broker");
+        let output = std::env::temp_dir()
+            .join("haze-playout-bridge-test")
+            .join("out.wav");
+        let path = connection
+            .client
+            .synthesize(SynthJob {
+                id: "job-1".to_string(),
+                text: "hello".to_string(),
+                reader_id: "reader".to_string(),
+                language: "en-CA".to_string(),
+                output_path: output,
+            })
+            .await
+            .expect("synthesis reply is correlated by job id");
+        assert_eq!(path, "out/final.wav");
+
+        let (registration, request) = broker.await.expect("broker task");
+        assert_eq!(registration["type"], "bridge.client");
+        assert_eq!(registration["source"], PLAYOUT_CLIENT_ID);
+        assert_eq!(registration["data"]["client_id"], PLAYOUT_CLIENT_ID);
+        assert_eq!(registration["data"]["receive_events"], true);
+        let subscriptions = registration["data"]["subscriptions"].as_array().unwrap();
+        for reply in REPLY_SUBSCRIPTIONS {
+            assert!(
+                subscriptions.iter().any(|value| value == reply),
+                "consumer must subscribe to {reply}: {subscriptions:?}"
+            );
+        }
+        assert_eq!(request["type"], "tts.synthesize");
+        assert_eq!(request["data"]["job_id"], "job-1");
+        assert!(request["timestamp"].is_string());
+    }
+
+    #[tokio::test]
+    async fn publish_only_connection_registers_without_receiving() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake broker");
+        let addr = listener.local_addr().expect("broker address").to_string();
+        let broker = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept playout");
+            let mut lines = BufReader::new(socket).lines();
+            let registration: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let raw = lines.next_line().await.unwrap().unwrap();
+            (registration, raw)
+        });
+        let client = connect_publish_only_retry(&addr).await.expect("connect");
+        client
+            .write_raw(b"HPCMdata\n")
+            .await
+            .expect("write pre-framed payload");
+        let (registration, raw) = broker.await.expect("broker task");
+        assert_eq!(registration["data"]["receive_events"], false);
+        assert!(registration["data"].get("client_id").is_none());
+        assert_eq!(raw, "HPCMdata");
+    }
 
     #[test]
     fn playout_registration_uses_targeted_non_pcm_subscriptions() {

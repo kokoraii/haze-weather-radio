@@ -286,6 +286,8 @@ type loadedConfig struct {
 	Leads         lead.Document
 	BaseDir       string
 	Store         datastore.Store
+	// FeedConfigGeneration is the daemon feed config applied to Feeds.
+	FeedConfigGeneration string
 }
 
 type forecastRegionName struct {

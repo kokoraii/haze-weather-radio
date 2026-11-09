@@ -1,33 +1,25 @@
 package webhook
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
-	"net"
 	"strings"
-	"sync"
-	"time"
+
+	"github.com/meowraii/haze-weather-radio/services/go/internal/bridgeclient"
 )
 
 type bridgeClient struct {
-	conn   net.Conn
+	bridge *bridgeclient.Conn
 	events chan map[string]any
-	mu     sync.Mutex
 }
 
 func connectBridge(ctx context.Context, addr string) (*bridgeClient, error) {
-	if strings.TrimSpace(addr) == "" {
-		return nil, fmt.Errorf("missing host event bridge address")
-	}
-	dialer := net.Dialer{Timeout: 3 * time.Second}
-	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	bridge, err := bridgeclient.Dial(ctx, bridgeclient.Options{Addr: addr})
 	if err != nil {
 		return nil, err
 	}
 	client := &bridgeClient{
-		conn:   conn,
+		bridge: bridge,
 		events: make(chan map[string]any, 128),
 	}
 	go client.readLoop()
@@ -35,10 +27,10 @@ func connectBridge(ctx context.Context, addr string) (*bridgeClient, error) {
 }
 
 func (c *bridgeClient) Close() error {
-	if c == nil || c.conn == nil {
+	if c == nil {
 		return nil
 	}
-	return c.conn.Close()
+	return c.bridge.Close()
 }
 
 func (c *bridgeClient) Events() <-chan map[string]any {
@@ -47,22 +39,13 @@ func (c *bridgeClient) Events() <-chan map[string]any {
 
 func (c *bridgeClient) readLoop() {
 	defer close(c.events)
-	scanner := bufio.NewScanner(c.conn)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		var message map[string]any
-		if err := json.Unmarshal([]byte(line), &message); err != nil {
-			continue
-		}
+	_ = c.bridge.ReadMessages(func(message map[string]any) bool {
 		select {
 		case c.events <- message:
 		default:
 		}
-	}
+		return true
+	})
 }
 
 func stringAt(source map[string]any, key string) string {

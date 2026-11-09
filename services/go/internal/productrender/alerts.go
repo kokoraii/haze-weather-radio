@@ -768,6 +768,7 @@ func (s *Service) recordCAPAlert(alert capmodel.Alert, now time.Time) ([]capRegi
 		description := ""
 		instruction := ""
 		backgroundColor := ""
+		var visual alerttext.AlertVisualInput
 		if info != nil {
 			alertText = renderCAPAlertSentence(capRegistryEntry{
 				ID:        alert.Identifier,
@@ -783,11 +784,12 @@ func (s *Service) recordCAPAlert(alert capmodel.Alert, now time.Time) ([]capRegi
 			certainty = info.Certainty
 			description = info.Description
 			instruction = info.Instruction
-			backgroundColor = alerttext.PickBannerColor([]alerttext.AlertVisualInput{{
+			visual = alerttext.AlertVisualInput{
 				Severity:           info.Severity,
 				Event:              strings.Join([]string{sameEventForCAP(alert, *info, s.cfg.BaseDir), alertSubject(*info), info.Event, info.Headline}, " "),
 				BroadcastImmediate: isBroadcastImmediateInfo(*info),
-			}})
+			}
+			backgroundColor = alerttext.PickBannerColor([]alerttext.AlertVisualInput{visual})
 		}
 		audio := alertBroadcastAudio(alert, feedLanguage(feed))
 		broadcastImmediate := info != nil && isBroadcastImmediateInfo(*info)
@@ -812,6 +814,9 @@ func (s *Service) recordCAPAlert(alert capmodel.Alert, now time.Time) ([]capRegi
 			leadPayload = capLeadPayload(s.cfg.Leads, alert, *info, feed, currentLocations)
 		}
 		packet := capAlertPacket(alert, feed, headline, eventName, severity, urgency, certainty, description, instruction, backgroundColor, broadcastImmediate, alertText, audio, samePayload, canonicalLocations)
+		if info != nil {
+			packet.Presentation.Banner = capBannerView(alert, *info, feed, alertText, visual, canonicalLocations, now)
+		}
 		updates = append(updates, capRegistryUpdate{
 			FeedID:             feed.ID,
 			Renderable:         hasRenderableCAPEntries(entries, now),
@@ -842,6 +847,25 @@ func (s *Service) recordCAPAlert(alert capmodel.Alert, now time.Time) ([]capRegi
 		})
 	}
 	return updates, nil
+}
+
+// capBannerView pre-renders the feed's on-air banner card. It uses the same
+// visual input as the packet background color so banner, CGEN, and playout agree.
+func capBannerView(alert capmodel.Alert, info capmodel.AlertInfo, feed feedXML, alertText string, visual alerttext.AlertVisualInput, canonicalLocations []alertmodel.LocationReference, now time.Time) *alertmodel.BannerView {
+	areas := alerttext.CanonicalLocationNames(canonicalLocations)
+	if len(areas) == 0 {
+		areas = alerttext.AreaNames(info)
+	}
+	view := alerttext.SerializeCAPAlert(alert, info, feed.ID, areas, fallbackText(feed.Timezone, "Local"), "cap", now)
+	view.FeedName = feedSiteName(feed)
+	view.CanonicalLocations = append([]alertmodel.LocationReference(nil), canonicalLocations...)
+	if text := strings.TrimSpace(alertText); text != "" {
+		view.Message = text
+	}
+	gradient := alerttext.PickBannerGradient([]alerttext.AlertVisualInput{visual})
+	view.BackgroundColor = gradient[0]
+	view.BackgroundGradient = gradient
+	return &view
 }
 
 func capAlertPacket(alert capmodel.Alert, feed feedXML, headline string, eventName string, severity string, urgency string, certainty string, description string, instruction string, backgroundColor string, broadcastImmediate bool, alertText string, audio capBroadcastAudio, samePayload map[string]any, canonicalLocations []alertmodel.LocationReference) alertmodel.Packet {

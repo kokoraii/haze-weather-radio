@@ -315,7 +315,8 @@
         const AUDIO_OUTPUT_MIXER_RECOVERY_WINDOW_MS = 60000;
         const AUDIO_OUTPUT_MIXER_RECOVERY_LIMIT = 3;
         const AUDIO_OUTPUT_MIXER_BYPASS_MS = 60000;
-        const BANNER_SNAPSHOT_INTERVAL_MS = 2000;
+        const BANNER_RECONNECT_MIN_MS = 1000;
+        const BANNER_RECONNECT_MAX_MS = 15000;
         const WEBRTC_AUDIO_CODECS = new Set(['auto', 'opus', 'g722', 'pcmu', 'pcma']);
 
         const frame = document.getElementById('frame');
@@ -385,8 +386,8 @@
             tickerCurrentKey: '',
             tickerLeadKey: '',
             tickerPlayedKeys: [],
-            snapshotTimer: null,
-            snapshotInflight: false,
+            streamRetryTimer: null,
+            streamRetryDelay: BANNER_RECONNECT_MIN_MS,
         };
 
         function recordBannerAudioEvent(event, details = {}) {
@@ -1217,64 +1218,37 @@
             }
         }
 
+        // Banner state comes from haze-netalert's WebSocket, which the web
+        // panel relays on this origin. The server sends the current state on
+        // subscribe and again whenever the feed's on-air alerts change.
         function streamUrl() {
-            const requestUrl = new URL(`${API_BASE}/banner/stream`, window.location.origin);
-            if (query.feed) {
-                requestUrl.searchParams.set('feed', query.feed);
-            }
-            return requestUrl;
-        }
-
-        function snapshotUrl() {
-            const requestUrl = new URL(`${API_BASE}/banner/current`, window.location.origin);
-            if (query.feed) {
-                requestUrl.searchParams.set('feed', query.feed);
-            }
+            const requestUrl = new URL(`${API_BASE}/netalert`, window.location.origin);
+            requestUrl.protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             return requestUrl;
         }
 
         function closeStream() {
+            if (state.streamRetryTimer) {
+                window.clearTimeout(state.streamRetryTimer);
+                state.streamRetryTimer = null;
+            }
             if (state.stream) {
+                state.stream.onclose = null;
                 state.stream.close();
                 state.stream = null;
             }
         }
 
-        async function fetchCurrentPayload() {
-            if (state.snapshotInflight || state.unloading) {
+        function scheduleStreamReconnect() {
+            if (state.unloading || state.streamRetryTimer) {
                 return;
             }
-            state.snapshotInflight = true;
-            try {
-                const response = await fetch(snapshotUrl(), {
-                    cache: 'no-store',
-                    credentials: 'same-origin',
-                });
-                if (!response.ok) {
-                    throw new Error(`Banner snapshot failed: ${response.status}`);
-                }
-                renderPayload(await response.json());
-            } catch (error) {
-                if (!state.payload) {
-                    renderIdle();
-                }
-                console.error(error);
-            } finally {
-                state.snapshotInflight = false;
-            }
-        }
-
-        function startSnapshotFallback() {
-            stopSnapshotFallback();
-            fetchCurrentPayload();
-            state.snapshotTimer = window.setInterval(fetchCurrentPayload, BANNER_SNAPSHOT_INTERVAL_MS);
-        }
-
-        function stopSnapshotFallback() {
-            if (state.snapshotTimer) {
-                window.clearInterval(state.snapshotTimer);
-                state.snapshotTimer = null;
-            }
+            const delay = state.streamRetryDelay;
+            state.streamRetryDelay = Math.min(delay * 2, BANNER_RECONNECT_MAX_MS);
+            state.streamRetryTimer = window.setTimeout(() => {
+                state.streamRetryTimer = null;
+                connectStream();
+            }, delay);
         }
 
         function bannerAudioElement() {
@@ -1991,31 +1965,45 @@
         }
 
         function handleStreamPayload(event) {
+            let message;
             try {
-                const payload = JSON.parse(event.data || '{}');
-                renderPayload(payload);
+                message = JSON.parse(event.data || '{}');
             } catch {
                 syncOBSAlertState(false);
                 renderIdle();
                 console.error('Invalid banner data stream.');
+                return;
+            }
+            if (message.type === 'banner') {
+                renderPayload(message);
+            } else if (message.type === 'error') {
+                console.error(`Banner subscription rejected: ${message.message || message.code}`);
             }
         }
 
         function connectStream() {
-            if (!('EventSource' in window)) {
+            if (!('WebSocket' in window)) {
                 renderIdle();
                 console.error('This browser does not support the live banner stream.');
                 return;
             }
 
             closeStream();
-            const source = new EventSource(streamUrl());
-            state.stream = source;
-            source.addEventListener('banner', handleStreamPayload);
-            source.onerror = () => {
+            const socket = new WebSocket(streamUrl());
+            state.stream = socket;
+            socket.onopen = () => {
+                state.streamRetryDelay = BANNER_RECONNECT_MIN_MS;
+                socket.send(JSON.stringify({ type: 'subscribe', banner: { feed: query.feed || '*' } }));
+            };
+            socket.onmessage = handleStreamPayload;
+            socket.onclose = () => {
+                if (state.stream === socket) {
+                    state.stream = null;
+                }
                 if (!state.payload) {
                     renderIdle();
                 }
+                scheduleStreamReconnect();
             };
         }
 
@@ -2240,10 +2228,8 @@
             state.unloading = true;
             syncOBSAlertState(false);
             closeStream();
-            stopSnapshotFallback();
             closeAudioStream();
         });
-        startSnapshotFallback();
         connectStream();
         connectAudioStream();
     </script>

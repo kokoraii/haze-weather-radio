@@ -3,6 +3,7 @@
 <outputs>
   <feed id="cwxr-*">
     <webrtc enabled="true"/>
+    <http enabled="false"/>
     <icecast enabled="false"/>
     <udp enabled="false"/>
     <rtp enabled="false"/>

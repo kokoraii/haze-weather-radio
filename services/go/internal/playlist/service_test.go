@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/meowraii/haze-weather-radio/services/go/internal/alertmodel"
+	"github.com/meowraii/haze-weather-radio/services/go/internal/bridgeclient"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/capmodel"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/datastore"
 )
@@ -28,6 +29,23 @@ func TestRustPlayoutOwnsCAPDispatchEventsWhenEnabled(t *testing.T) {
 	}
 	if shouldDeferCAPPlayoutToRust(true, map[string]any{"type": "cap.alert.routine.requested"}) {
 		t.Fatal("routine CAP dispatch should remain available to current consumers")
+	}
+}
+
+// Automations and web panel alerts have no Rust consumer, so the playlist must
+// keep them even with Rust playout enabled. CAP-derived sources stay deferred.
+func TestOperatorOriginatedAlertsStayWithPlaylist(t *testing.T) {
+	for _, eventType := range []string{"cap.alert.broadcast.requested", "cap.alert.cancelled"} {
+		for _, source := range []string{"automation", "haze-web"} {
+			if shouldDeferCAPPlayoutToRust(true, map[string]any{"type": eventType, "source": source}) {
+				t.Errorf("%s from %s was deferred to Rust playout", eventType, source)
+			}
+		}
+		for _, source := range []string{"haze-cap-alert-router", "haze-product-render"} {
+			if !shouldDeferCAPPlayoutToRust(true, map[string]any{"type": eventType, "source": source}) {
+				t.Errorf("%s from %s was not deferred to Rust playout", eventType, source)
+			}
+		}
 	}
 }
 
@@ -173,7 +191,7 @@ func TestPublishAutomationDispatchStatus(t *testing.T) {
 			defer serverConn.Close()
 			planner := &feedPlanner{
 				feed:   feedXML{ID: "cwxr-sk01"},
-				bridge: &bridgeClient{conn: clientConn},
+				bridge: &bridgeClient{bridge: bridgeclient.Wrap(clientConn, bridgeclient.Options{})},
 			}
 			message := make(chan map[string]any, 1)
 			decodeErr := make(chan error, 1)
@@ -328,7 +346,7 @@ func TestCAPCancellationStopsCurrentRoutineAlert(t *testing.T) {
 
 	planner := &feedPlanner{
 		cfg:    loadedConfig{BaseDir: dir},
-		bridge: &bridgeClient{conn: clientConn},
+		bridge: &bridgeClient{bridge: bridgeclient.Wrap(clientConn, bridgeclient.Options{})},
 		feed:   feedXML{ID: "sk-0001"},
 		current: &playlistItem{
 			QueueID:   "alerts-current",
@@ -417,7 +435,7 @@ func TestBuildSegmentedProductItemIncludesAudioOpener(t *testing.T) {
 	}
 	clientConn, serverConn := net.Pipe()
 	bridge := &bridgeClient{
-		conn:            clientConn,
+		bridge:          bridgeclient.Wrap(clientConn, bridgeclient.Options{}),
 		events:          make(chan map[string]any, 16),
 		pendingProducts: map[string]chan productResult{},
 		pendingSynth:    map[string]chan synthResult{},
@@ -478,7 +496,7 @@ func TestBuildSegmentedProductItemPacesTextOnlySegments(t *testing.T) {
 	ttsPCM := []byte{9, 0, 8, 0, 7, 0, 6, 0}
 	clientConn, serverConn := net.Pipe()
 	bridge := &bridgeClient{
-		conn:            clientConn,
+		bridge:          bridgeclient.Wrap(clientConn, bridgeclient.Options{}),
 		events:          make(chan map[string]any, 16),
 		pendingProducts: map[string]chan productResult{},
 		pendingSynth:    map[string]chan synthResult{},
@@ -538,7 +556,7 @@ func TestBuildProductUsesCachedCompleteAudioWhenSegmentSynthesisFails(t *testing
 	}
 	clientConn, serverConn := net.Pipe()
 	bridge := &bridgeClient{
-		conn:            clientConn,
+		bridge:          bridgeclient.Wrap(clientConn, bridgeclient.Options{}),
 		events:          make(chan map[string]any, 16),
 		pendingProducts: map[string]chan productResult{},
 		pendingSynth:    map[string]chan synthResult{},
@@ -869,7 +887,7 @@ func TestStartupPrimerQueuesStaticItemsAndSkipsUnavailableCurrentConditions(t *t
 	defer clientConn.Close()
 
 	client := &bridgeClient{
-		conn:            clientConn,
+		bridge:          bridgeclient.Wrap(clientConn, bridgeclient.Options{}),
 		events:          make(chan map[string]any, 16),
 		pendingProducts: map[string]chan productResult{},
 		pendingSynth:    map[string]chan synthResult{},
@@ -1162,7 +1180,7 @@ func TestPriorityWindowPublishesRoutinePauseAndResume(t *testing.T) {
 	}()
 
 	planner := &feedPlanner{
-		bridge: &bridgeClient{conn: clientConn},
+		bridge: &bridgeClient{bridge: bridgeclient.Wrap(clientConn, bridgeclient.Options{})},
 		feed:   feedXML{ID: "sk-0001"},
 		mode:   "running",
 	}
@@ -1258,7 +1276,7 @@ func TestPendingItemsReplayAfterInterval(t *testing.T) {
 
 	now := time.Date(2026, 6, 22, 12, 0, 0, 0, time.UTC)
 	planner := &feedPlanner{
-		bridge: &bridgeClient{conn: clientConn},
+		bridge: &bridgeClient{bridge: bridgeclient.Wrap(clientConn, bridgeclient.Options{})},
 		feed:   feedXML{ID: "sk-0001"},
 		queue: []playlistItem{{
 			QueueID:   "routine-1",
@@ -1303,7 +1321,7 @@ func TestPendingReplayHeartbeatSkipsCurrentItem(t *testing.T) {
 
 	now := time.Date(2026, 6, 22, 12, 0, 0, 0, time.UTC)
 	planner := &feedPlanner{
-		bridge: &bridgeClient{conn: clientConn},
+		bridge: &bridgeClient{bridge: bridgeclient.Wrap(clientConn, bridgeclient.Options{})},
 		feed:   feedXML{ID: "sk-0001"},
 		current: &playlistItem{
 			QueueID:   "current-1",

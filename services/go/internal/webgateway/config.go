@@ -117,7 +117,18 @@ type Config struct {
 				Addr    string `yaml:"addr"`
 				Listen  string `yaml:"listen"`
 				Backend string `yaml:"backend"`
+				// GRPCAddr is haze-media's loopback gRPC control listener.
+				GRPCAddr string `yaml:"grpc_addr"`
+				// ControlTransport selects how haze-web calls haze-media: http (the
+				// default) or grpc.
+				ControlTransport string `yaml:"control_transport"`
 			} `yaml:"media"`
+			// NetAlert is haze-netalert's WebSocket listener, proxied at
+			// /api/v1/netalert and /api/public/v1/netalert.
+			NetAlert struct {
+				Enabled bool   `yaml:"enabled"`
+				Addr    string `yaml:"addr"`
+			} `yaml:"netalert"`
 		} `yaml:"rust"`
 	} `yaml:"services"`
 }

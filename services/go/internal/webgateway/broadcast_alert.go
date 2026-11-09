@@ -2,6 +2,7 @@ package webgateway
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/meowraii/haze-weather-radio/services/go/internal/alertmodel"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/events"
+	"github.com/meowraii/haze-weather-radio/services/go/internal/feedconfig"
 )
 
 var broadcastOriginatorNamePattern = regexp.MustCompile(`(?i)\bA Broadcast Station or Cable System\b`)
@@ -72,7 +74,7 @@ func (s *wsSession) broadcastAlert(payload map[string]any) (map[string]any, erro
 // broadcastAlertDataByFeed creates a distinct event payload for every target feed.
 // With all_feed_locations, each payload carries only that feed's configured SAME area.
 func (s *wsSession) broadcastAlertDataByFeed(payload map[string]any, targets []string, alertID string, includeSame bool, allFeedLocations bool) (map[string]map[string]any, error) {
-	locationsByFeed, err := alertLocationsByFeed(s.configPath, payload, targets, allFeedLocations)
+	locationsByFeed, err := alertLocationsByFeed(s.server.feedConfig, s.configPath, payload, targets, allFeedLocations)
 	if err != nil {
 		return nil, err
 	}
@@ -83,49 +85,37 @@ func (s *wsSession) broadcastAlertDataByFeed(payload map[string]any, targets []s
 	return dataByFeed, nil
 }
 
-func alertLocationsByFeed(configPath string, payload map[string]any, targets []string, allFeedLocations bool) (map[string][]string, error) {
-	locationsByFeed := make(map[string][]string, len(targets))
+// alertLocationsByFeed returns each target feed's SAME locations, following the
+// daemon's feed config: the feed's whole coverage with all_feed_locations, or
+// the operator's picked areas filtered through the feed's header rules.
+func alertLocationsByFeed(feedConfig *feedconfig.Store, configPath string, payload map[string]any, targets []string, allFeedLocations bool) (map[string][]string, error) {
+	snapshot, ok := feedConfig.Current()
+	if !ok {
+		return nil, fmt.Errorf("the daemon's feed config is not loaded yet; try again shortly")
+	}
+	var picked []string
 	if !allFeedLocations {
-		locations := expandSameLocationsForFeeds(configPath, targets, stringSlicePayload(payload, "locations"))
-		for _, feedID := range targets {
-			locationsByFeed[feedID] = locations
-		}
-		return locationsByFeed, nil
+		picked = expandSameLocationsForFeeds(configPath, targets, stringSlicePayload(payload, "locations"))
 	}
-
-	feeds, err := loadFeedSummaries(configPath)
-	if err != nil {
-		return nil, err
-	}
-	configured := make(map[string][]string, len(feeds))
-	for _, feed := range feeds {
-		feedID := strings.TrimSpace(fmt.Sprint(feed["id"]))
-		if feedID != "" {
-			configured[feedID] = normalizeAlertLocations(stringListAny(feed["same_locations"]))
-		}
-	}
+	locationsByFeed := make(map[string][]string, len(targets))
 	for _, feedID := range targets {
-		locations := configured[feedID]
-		if len(locations) == 0 {
-			return nil, fmt.Errorf("feed %q has no configured SAME locations", feedID)
+		feed, ok := snapshot.Feed(feedID)
+		if !ok {
+			return nil, fmt.Errorf("feed %q is not in the daemon's feed config", feedID)
 		}
-		locationsByFeed[feedID] = locations
+		header := feed.SameHeader(picked)
+		if allFeedLocations {
+			header = feed.FullHeader()
+			if len(header.Codes) == 0 {
+				return nil, fmt.Errorf("feed %q has no configured SAME locations", feedID)
+			}
+		}
+		if len(header.Dropped) > 0 {
+			slog.Warn("SAME header is limited to 31 location codes; dropping the rest", "feed_id", feedID, "dropped", header.Dropped)
+		}
+		locationsByFeed[feedID] = header.Codes
 	}
 	return locationsByFeed, nil
-}
-
-func normalizeAlertLocations(locations []string) []string {
-	seen := map[string]struct{}{}
-	for _, raw := range locations {
-		code := cleanLocationCode(raw)
-		if code == "000000" {
-			return []string{"000000"}
-		}
-		if code != "" {
-			seen[code] = struct{}{}
-		}
-	}
-	return sortedKeys(seen)
 }
 
 func (s *wsSession) broadcastAlertDataForFeed(payload map[string]any, feedID string, sameLocations []string, alertID string, includeSame bool, allFeedLocations bool) map[string]any {

@@ -1,0 +1,100 @@
+// Event bridge contract for the Haze daemon broker.
+//
+// This is the gRPC form of today's newline-delimited JSON host bridge. The
+// daemon stays the broker: every service connects to it, registers a
+// subscription list, and exchanges events through it. See
+// docs/grpc-migration-plan.md for the phased rollout and the semantics a
+// transport must keep (subscription matching, targeted delivery, bounded
+// per-client queues, CAP replay).
+syntax = "proto3";
+
+package haze.bridge.v1;
+
+option go_package = "github.com/meowraii/haze-weather-radio/services/go/internal/gen/bridge/v1;bridgev1";
+
+// EventBridgeService is the broker endpoint exposed by the daemon.
+service EventBridgeService {
+  // Connect opens one long-lived stream per client. The first request must be
+  // a Hello. The broker answers with a Welcome and then streams matching
+  // events, starting with any CAP replay the client subscribed to.
+  rpc Connect(stream ConnectRequest) returns (stream ConnectResponse);
+}
+
+message ConnectRequest {
+  oneof frame {
+    Hello hello = 1;
+    // An event to route to subscribers. It is never echoed back to this stream.
+    Envelope publish = 2;
+    // A service log line, consumed by the daemon logger and not republished.
+    LogRecord log = 3;
+  }
+}
+
+message ConnectResponse {
+  oneof frame {
+    Welcome welcome = 1;
+    Envelope deliver = 2;
+    Notice notice = 3;
+  }
+}
+
+// Hello registers a client. It replaces the JSON "bridge.client" handshake.
+message Hello {
+  // Names the connection for targeted delivery (Envelope.target).
+  string client_id = 1;
+  // False for publish-only clients, which are sent no events.
+  bool receive_events = 2;
+  // Event types to receive. An entry is an exact type, "*" for everything, or
+  // a prefix ending in "*". An empty list receives every event.
+  repeated string subscriptions = 3;
+}
+
+message Welcome {
+  string client_id = 1;
+  // Largest message the broker accepts on this stream, in bytes.
+  uint32 max_message_bytes = 2;
+}
+
+// Envelope carries one bridge event without losing any member of the JSON form.
+//
+// The routing members are modelled so the broker does not parse JSON on the hot
+// path. Everything else is carried verbatim: "data" in data_json, and any other
+// top-level member (for example delivery_id, feed_id, queue_id) in extra_json.
+// JSON is used for both because numbers such as 64-bit sequence counters and
+// nanosecond timestamps do not survive google.protobuf.Struct, which stores
+// every number as a double.
+message Envelope {
+  string id = 1;
+  string type = 2;
+  string source = 3;
+  // RFC 3339 text exactly as published. Producers disagree on sub-second
+  // precision, so it is not parsed into a protobuf timestamp.
+  string timestamp = 4;
+  string subject = 5;
+  // Deliver only to the client registered with this client_id.
+  string target = 6;
+  string reply_to = 7;
+  // The event "data" object as a JSON document. Empty when absent.
+  bytes data_json = 8;
+  // A JSON object holding every other top-level member. Empty when none.
+  bytes extra_json = 9;
+}
+
+message LogRecord {
+  string level = 1;
+  string logger = 2;
+  string message = 3;
+}
+
+// Notice reports a condition about the stream itself.
+message Notice {
+  enum Code {
+    CODE_UNSPECIFIED = 0;
+    // The client fell behind its bounded queue and is being disconnected.
+    CODE_SLOW_CONSUMER = 1;
+    // The broker is shutting down.
+    CODE_SHUTTING_DOWN = 2;
+  }
+  Code code = 1;
+  string detail = 2;
+}

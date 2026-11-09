@@ -56,8 +56,16 @@ func (s *Server) mediaServiceWebRTCAnswer(ctx context.Context, payload map[strin
 }
 
 func (s *Server) mediaServiceWebRTCAnswerResult(ctx context.Context, payload map[string]any) mediaServiceWebRTCAnswerResult {
-	baseURL := mediaServiceBaseURL(s.config)
-	return mediaServiceWebRTCAnswerResultFromBase(ctx, baseURL, payload)
+	return mediaServiceWebRTCAnswerResultWith(ctx, mediaServiceControl(s.config), payload)
+}
+
+// mediaServiceWebRTCAnswerResultWith asks the control client for an answer. A nil
+// client means the Rust media service is disabled, which is an empty result.
+func mediaServiceWebRTCAnswerResultWith(ctx context.Context, control mediaControl, payload map[string]any) mediaServiceWebRTCAnswerResult {
+	if control == nil {
+		return mediaServiceWebRTCAnswerResult{}
+	}
+	return control.WebRTCOffer(ctx, payload)
 }
 
 func mediaServiceWebRTCAnswerFromBase(ctx context.Context, baseURL string, payload map[string]any) (map[string]any, bool) {
@@ -138,15 +146,15 @@ func mediaServiceWebRTCAvailable(ctx context.Context, baseURL string) (bool, boo
 }
 
 func mediaServiceHealth(ctx context.Context, config Config) (map[string]any, bool) {
-	baseURL := mediaServiceBaseURL(config)
-	if baseURL == "" {
+	control := mediaServiceControl(config)
+	if control == nil {
 		return nil, false
 	}
-	return mediaServiceHealthFromBaseURL(ctx, baseURL)
+	return control.Health(ctx)
 }
 
 func mediaServiceHealthFromBaseURL(ctx context.Context, baseURL string) (map[string]any, bool) {
-	checkCtx, cancel := context.WithTimeout(ctx, 750*time.Millisecond)
+	checkCtx, cancel := context.WithTimeout(ctx, mediaHealthTimeout)
 	defer cancel()
 	request, err := http.NewRequestWithContext(checkCtx, http.MethodGet, strings.TrimRight(baseURL, "/")+"/api/v1/health", nil)
 	if err != nil {

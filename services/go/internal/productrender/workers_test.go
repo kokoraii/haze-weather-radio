@@ -6,6 +6,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/meowraii/haze-weather-radio/services/go/internal/bridgeclient"
 )
 
 func TestRenderPoolsIsolateSlowWorkAndPreserveCAPOrder(t *testing.T) {
@@ -88,7 +90,7 @@ func TestRenderWorkPoolBoundsQueueAndCancelsPendingWork(t *testing.T) {
 func TestRenderWorkersUseJobConfigSnapshot(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	server, client := net.Pipe()
-	bridge := &bridgeClient{conn: client, done: make(chan struct{})}
+	bridge := &bridgeClient{bridge: bridgeclient.Wrap(client, bridgeclient.Options{}), done: make(chan struct{})}
 	defer func() {
 		if err := server.Close(); err != nil {
 			t.Error(err)

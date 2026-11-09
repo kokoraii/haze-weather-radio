@@ -16,6 +16,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/events"
+	"github.com/meowraii/haze-weather-radio/services/go/internal/feedconfig"
 )
 
 // Server is the first-pass Go HTTP/WebSocket gateway for Haze.
@@ -28,16 +29,24 @@ type Server struct {
 	auth                *AuthManager
 	receiver            *ReceiverManager
 	media               *MediaHub
-	bannerHub           *BannerHub
 	breakIn             *OperatorBreakInManager
 	listeners           *ListenerTracker
 	feedMapResolveSlots chan struct{}
+	// feedConfig is the daemon's feed config, the source of feed coverage.
+	feedConfig     *feedconfig.Store
+	stopFeedConfig context.CancelFunc
 }
 
 // Close releases long-lived authentication and storage resources.
 func (s *Server) Close() {
-	if s != nil && s.auth != nil {
+	if s == nil {
+		return
+	}
+	if s.auth != nil {
 		s.auth.Close()
+	}
+	if s.stopFeedConfig != nil {
+		s.stopFeedConfig()
 	}
 }
 
@@ -65,12 +74,18 @@ func NewServerWithConfigPath(config Config, configPath string, webroot string) *
 // NewServerWithSurface creates a gateway server constrained to one HTTP surface.
 func NewServerWithSurface(config Config, configPath string, webroot string, surface string) *Server {
 	hostBridgeAddr := os.Getenv("HAZE_HOST_BRIDGE_ADDR")
-	mediaServiceURL := mediaServiceBaseURL(config)
 	mediaBridgeAddr := mediaHubBridgeAddr(config, os.Getenv("HAZE_MEDIA_BRIDGE_ADDR"), hostBridgeAddr)
 	mediaHub := NewMediaHub(mediaBridgeAddr)
-	mediaHub.SetHTTPSource(mediaServiceURL)
-	bannerHub := NewBannerHub(configPath, hostBridgeAddr)
-	server := &Server{
+	mediaHub.SetAudioSource(mediaServiceControl(config))
+	feedConfig := feedconfig.NewStore()
+	feedConfigCtx, stopFeedConfig := context.WithCancel(context.Background())
+	if strings.TrimSpace(hostBridgeAddr) != "" {
+		// Several haze-web processes can run (one per surface), so the client id
+		// carries the process id.
+		clientID := fmt.Sprintf("haze-web-%s-%d-feedconfig", normalizeSurface(surface), os.Getpid())
+		go feedConfig.Run(feedConfigCtx, hostBridgeAddr, clientID)
+	}
+	return &Server{
 		startedAt:           time.Now().UTC(),
 		config:              config,
 		configPath:          filepath.Clean(configPath),
@@ -79,15 +94,12 @@ func NewServerWithSurface(config Config, configPath string, webroot string, surf
 		auth:                NewAuthManagerWithPath(config, configPath),
 		receiver:            NewReceiverManager(config, configPath, mediaHub),
 		media:               mediaHub,
-		bannerHub:           bannerHub,
 		breakIn:             NewOperatorBreakInManager(),
 		listeners:           NewListenerTracker(),
 		feedMapResolveSlots: make(chan struct{}, publicFeedMapResolveConcurrency),
+		feedConfig:          feedConfig,
+		stopFeedConfig:      stopFeedConfig,
 	}
-	if server.surface.allowsAdmin() {
-		server.startBannerStatePublisher(hostBridgeAddr)
-	}
-	return server
 }
 
 // mediaHubBridgeAddr retains the bridge only when the paced Rust media service
@@ -117,6 +129,7 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc("/api/public/v1/map/basemap", s.publicBasemap)
 		mux.HandleFunc("/api/public/v1/feed/webrtc/offer", s.publicFeedWebRTCOffer)
 		mux.HandleFunc("/api/public/v1/alerts/archive/cap.xml", s.publicAlertsArchiveCAPXML)
+		mux.HandleFunc("/api/public/v1/netalert", s.netAlertProxy)
 	}
 	if s.surface.allowsAdmin() {
 		if !s.surface.allowsPublic() {
@@ -124,9 +137,7 @@ func (s *Server) Handler() http.Handler {
 		}
 		mux.HandleFunc("/admin", s.admin)
 		mux.HandleFunc("/banner", s.banner)
-		mux.HandleFunc("/api/v1/banner/current", s.bannerCurrent)
-		mux.HandleFunc("/api/v1/banner/stream", s.bannerStream)
-		mux.HandleFunc("/api/v1/banner/audio", s.bannerAudio)
+		mux.HandleFunc("/api/v1/netalert", s.netAlertProxy)
 		mux.HandleFunc("/api/v1/banner/webrtc/offer", s.bannerWebRTCOffer)
 		mux.HandleFunc("/api/v1/cgen/preview", s.cgenPreview)
 		mux.HandleFunc("/api/v1/cgen/fonts/", s.cgenFontAsset)

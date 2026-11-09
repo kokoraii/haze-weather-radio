@@ -2,17 +2,17 @@
 package locationclient
 
 import (
-	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"strings"
 	"time"
+
+	"github.com/meowraii/haze-weather-radio/services/go/internal/bridgeclient"
 )
 
 const APIVersion = 1
@@ -276,33 +276,32 @@ func (client *Client) Query(ctx context.Context, request Request) (Response, err
 	if request.RequestID == "" {
 		request.RequestID = uniqueID("location-query")
 	}
-	dialer := net.Dialer{Timeout: client.timeout()}
-	connection, err := dialer.DialContext(ctx, "tcp", client.Address)
-	if err != nil {
-		return Response{}, fmt.Errorf("location bridge connect failed: %w", err)
-	}
-	defer connection.Close()
 	deadline := time.Now().Add(client.timeout())
 	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
 		deadline = contextDeadline
 	}
-	_ = connection.SetDeadline(deadline)
+	connection, err := bridgeclient.Dial(ctx, bridgeclient.Options{
+		Addr:         client.Address,
+		DialTimeout:  client.timeout(),
+		MaxLineBytes: 16 * 1024 * 1024,
+		Deadline:     deadline,
+	})
+	if err != nil {
+		return Response{}, fmt.Errorf("location bridge connect failed: %w", err)
+	}
+	defer connection.Close()
 	stopCancellation := context.AfterFunc(ctx, func() {
 		_ = connection.SetDeadline(time.Now())
 	})
 	defer stopCancellation()
-	encoder := json.NewEncoder(connection)
-	if err := encoder.Encode(map[string]any{
-		"type": "bridge.client",
-		"data": map[string]any{
-			"client_id":      client.ClientID,
-			"receive_events": true,
-			"subscriptions":  []string{"location.query.completed", "location.query.failed"},
-		},
+	if err := connection.Register(bridgeclient.Registration{
+		ClientID:      client.ClientID,
+		ReceiveEvents: true,
+		Subscriptions: []string{"location.query.completed", "location.query.failed"},
 	}); err != nil {
 		return Response{}, err
 	}
-	if err := encoder.Encode(map[string]any{
+	if err := connection.PublishValue(map[string]any{
 		"type":     "location.query.request",
 		"source":   client.ClientID,
 		"reply_to": client.ClientID,
@@ -312,33 +311,46 @@ func (client *Client) Query(ctx context.Context, request Request) (Response, err
 	}); err != nil {
 		return Response{}, err
 	}
-	scanner := bufio.NewScanner(connection)
-	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
-	for scanner.Scan() {
+	var (
+		response Response
+		outcome  error
+		answered bool
+	)
+	scanErr := connection.Scan(func(line []byte) bool {
 		var envelope struct {
 			Type    string          `json:"type"`
 			Subject string          `json:"subject"`
 			Data    json.RawMessage `json:"data"`
 		}
-		if err := json.Unmarshal(scanner.Bytes(), &envelope); err != nil || envelope.Subject != request.RequestID {
-			continue
+		if err := json.Unmarshal(line, &envelope); err != nil || envelope.Subject != request.RequestID {
+			return true
 		}
 		switch envelope.Type {
 		case "location.query.completed":
-			var response Response
+			answered = true
 			if err := json.Unmarshal(envelope.Data, &response); err != nil {
-				return Response{}, err
+				outcome = err
 			}
-			return response, nil
+			return false
 		case "location.query.failed":
+			answered = true
 			var failure Failure
 			if err := json.Unmarshal(envelope.Data, &failure); err != nil {
-				return Response{}, err
+				outcome = err
+			} else {
+				outcome = failure
 			}
-			return Response{}, failure
+			return false
 		}
+		return true
+	})
+	if answered {
+		if outcome != nil {
+			return Response{}, outcome
+		}
+		return response, nil
 	}
-	if err := scanner.Err(); err != nil {
+	if err := scanErr; err != nil {
 		if contextErr := ctx.Err(); contextErr != nil {
 			return Response{}, contextErr
 		}

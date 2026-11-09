@@ -19,6 +19,12 @@ const CAP_REPLAY_LIMIT: usize = 512;
 // Modern clients register immediately. This bounded fallback keeps receive-only
 // legacy clients working without exposing new sockets to replay before registration.
 const CLIENT_HANDSHAKE_GRACE: Duration = Duration::from_millis(500);
+// A client whose socket stays full this long is treated as gone, so a hung peer
+// cannot hold its writer thread and file descriptors after the router drops it.
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+// At the descriptor limit accept fails without consuming the backlog, so without
+// a pause the loop spins a core and floods the log until a descriptor frees up.
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 struct BridgeEnvelope {
     origin: Option<usize>,
@@ -28,6 +34,8 @@ struct BridgeEnvelope {
 enum BridgePayload {
     Json(Value),
     BinaryPcm(Vec<u8>),
+    /// The client's reader finished: the peer closed, reset, or sent bad data.
+    ClientClosed,
 }
 
 struct BridgeClientHandle {
@@ -147,6 +155,12 @@ impl HostBridge {
                     BridgePayload::BinaryPcm(raw) => {
                         deliver_binary_pcm(&mut clients, origin, raw);
                     }
+                    // Releasing the handle ends the client's writer thread, which
+                    // closes its socket. Publish-only clients are never written to,
+                    // so no failed send would ever release them.
+                    BridgePayload::ClientClosed => {
+                        clients.retain(|client| Some(client.id) != origin);
+                    }
                 }
             }
         });
@@ -186,15 +200,20 @@ impl HostBridge {
                                     {
                                         break;
                                     }
-                                    spawn_client_writer(writer, rx);
+                                    spawn_client_writer(writer, rx, CLIENT_WRITE_TIMEOUT);
                                 }
-                                Err(err) => warn!("failed to clone host bridge stream: {err}"),
+                                // Without a writer the client could never receive
+                                // anything, so close it and let it redial.
+                                Err(err) => {
+                                    warn!("failed to clone host bridge stream: {err}");
+                                    continue;
+                                }
                             }
                             spawn_client_reader(stream, accept_publisher.clone(), client_id);
                         }
                         Err(err) => {
                             warn!("host event bridge accept failed: {err}");
-                            continue;
+                            thread::sleep(ACCEPT_RETRY_DELAY);
                         }
                     }
                 }
@@ -329,13 +348,19 @@ where
                         return;
                     }
                 }
-                Ok(None) => return,
+                Ok(None) => break,
                 Err(err) => {
                     warn!("host bridge client reader stopped: {err}");
-                    return;
+                    break;
                 }
             }
         }
+        // Queued after everything this client published, so its last events
+        // are still routed before its handle is released.
+        let _ = publisher.send(BridgeEnvelope {
+            origin: Some(client_id),
+            payload: BridgePayload::ClientClosed,
+        });
     });
 }
 
@@ -375,12 +400,22 @@ where
     Ok(Some(BridgePayload::Json(value)))
 }
 
-fn spawn_client_writer(mut writer: TcpStream, receiver: Receiver<Vec<u8>>) {
+/// Writes queued messages until the handle is dropped or a write fails. Shutting
+/// the socket down also wakes the client's reader, so both descriptors close.
+fn spawn_client_writer(mut writer: TcpStream, receiver: Receiver<Vec<u8>>, timeout: Duration) {
     thread::spawn(move || {
+        if let Err(err) = writer.set_write_timeout(Some(timeout)) {
+            warn!("host bridge client write timeout was not applied: {err}");
+        }
         for raw in receiver {
-            if writer.write_all(&raw).is_err() {
-                let _ = writer.shutdown(Shutdown::Both);
-                return;
+            if let Err(err) = writer.write_all(&raw) {
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) {
+                    warn!("closing host bridge client that stopped reading");
+                }
+                break;
             }
         }
         let _ = writer.shutdown(Shutdown::Both);
@@ -621,6 +656,7 @@ fn host_consumes_event(value: &Value) -> bool {
         value.get("type").and_then(Value::as_str),
         Some(
             "service.control"
+                | crate::feed_config::REQUEST_EVENT
                 | "automation.dispatch.accepted"
                 | "automation.dispatch.completed"
                 | "automation.dispatch.failed"
@@ -639,9 +675,33 @@ fn prune_replay(replay: &mut VecDeque<(Instant, Vec<u8>)>) {
 }
 
 #[cfg(test)]
+mod conformance;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn writers_give_up_on_clients_that_stop_reading() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind a test listener");
+        let _hung_peer = TcpStream::connect(listener.local_addr().expect("listener address"))
+            .expect("connect a test peer");
+        let (socket, _) = listener.accept().expect("accept the test peer");
+        let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(4);
+        spawn_client_writer(socket, receiver, Duration::from_millis(100));
+
+        // The writer drops its receiver once a full socket times out a write.
+        let chunk = vec![0u8; 1024 * 1024];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !matches!(
+            sender.try_send(chunk.clone()),
+            Err(TrySendError::Disconnected(_))
+        ) {
+            assert!(Instant::now() < deadline, "the writer kept a hung client");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     #[test]
     fn log_records_are_consumed_by_logger() {
@@ -878,7 +938,7 @@ mod tests {
 
         match message {
             BridgePayload::BinaryPcm(actual) => assert_eq!(actual, frame),
-            BridgePayload::Json(_) => panic!("compact PCM frame was treated as JSON"),
+            _ => panic!("compact PCM frame was treated as another payload"),
         }
     }
 

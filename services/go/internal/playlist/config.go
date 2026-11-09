@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/meowraii/haze-weather-radio/services/go/internal/datastore"
+	"github.com/meowraii/haze-weather-radio/services/go/internal/feedconfig"
 	"gopkg.in/yaml.v3"
 )
 
@@ -98,21 +99,9 @@ type feedXML struct {
 	Languages struct {
 		Langs []feedLangXML `xml:"lang"`
 	} `xml:"languages"`
-	Locations struct {
-		Coverage struct {
-			Regions []coverageRegionXML `xml:"region"`
-		} `xml:"coverage"`
-	} `xml:"locations"`
 	Transmitter struct {
 		Transmitters []transmitterXML `xml:"transmitter"`
 	} `xml:"transmitter_metadata"`
-}
-
-type coverageRegionXML struct {
-	ID         string `xml:"id,attr"`
-	Subregions []struct {
-		ID string `xml:"id,attr"`
-	} `xml:"subregion"`
 }
 
 type feedLangXML struct {
@@ -146,7 +135,9 @@ type loadedConfig struct {
 	BaseDir   string
 	OutputDir string
 	Store     datastore.Store
-	Daemon    struct {
+	// FeedConfig is the daemon's feed config, the source of feed coverage.
+	FeedConfig *feedconfig.Store
+	Daemon     struct {
 		AlertUpdateTonePolicy string `yaml:"alert_update_tone_policy"`
 	}
 }
@@ -204,13 +195,26 @@ func loadConfig(configPath string, outDir string) (loadedConfig, error) {
 
 func loadFeeds(path string) ([]feedXML, error) {
 	if info, err := os.Stat(filepath.Clean(path)); err == nil && info.IsDir() {
-		entries, err := os.ReadDir(filepath.Clean(path)); if err != nil { return nil, err }
+		entries, err := os.ReadDir(filepath.Clean(path))
+		if err != nil {
+			return nil, err
+		}
 		feeds := []feedXML{}
 		for _, entry := range entries {
-			if entry.IsDir() || strings.ToLower(filepath.Ext(entry.Name())) != ".xml" { continue }
-			raw, err := os.ReadFile(filepath.Join(path, entry.Name())); if err != nil { return nil, err }
-			var feed feedXML; if err := xml.Unmarshal(raw, &feed); err != nil { return nil, fmt.Errorf("parse feed XML: %w", err) }
-			if strings.TrimSpace(feed.ID) == "" { feed.ID = strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name())) }
+			if entry.IsDir() || strings.ToLower(filepath.Ext(entry.Name())) != ".xml" {
+				continue
+			}
+			raw, err := os.ReadFile(filepath.Join(path, entry.Name()))
+			if err != nil {
+				return nil, err
+			}
+			var feed feedXML
+			if err := xml.Unmarshal(raw, &feed); err != nil {
+				return nil, fmt.Errorf("parse feed XML: %w", err)
+			}
+			if strings.TrimSpace(feed.ID) == "" {
+				feed.ID = strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
+			}
 			feeds = append(feeds, feed)
 		}
 		return feeds, nil

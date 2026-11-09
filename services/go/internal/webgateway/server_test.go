@@ -20,6 +20,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/meowraii/haze-weather-radio/services/go/internal/alertmodel"
+	"github.com/meowraii/haze-weather-radio/services/go/internal/feedconfig"
 )
 
 func TestServerIPUsesNonLoopbackLocalAddress(t *testing.T) {
@@ -441,47 +442,38 @@ func TestBannerDoesNotRequireSession(t *testing.T) {
 	}
 }
 
-func TestBannerStreamDoesNotRequireSession(t *testing.T) {
+func TestNetAlertProxyRelaysWebSocketWithoutSession(t *testing.T) {
 	t.Setenv("ADMIN_PASSWD", "secret")
-	dir := t.TempDir()
-	configPath := filepath.Join(dir, "config.yaml")
-	mustWrite(t, configPath, "")
-	server := NewServerWithSurface(authEnabledConfig(), configPath, dir, "admin")
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	request := httptest.NewRequest(http.MethodGet, "/api/v1/banner/stream?feed=CAP-IT-ALL", nil).WithContext(ctx)
-	response := httptest.NewRecorder()
+	backend := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != netAlertWSPath {
+			http.NotFound(writer, request)
+			return
+		}
+		connection, err := websocket.Accept(writer, request, nil)
+		if err != nil {
+			return
+		}
+		defer connection.CloseNow()
+		_ = connection.Write(request.Context(), websocket.MessageText, []byte(`{"type":"hello"}`))
+		_, _, _ = connection.Read(request.Context())
+	}))
+	defer backend.Close()
+	config := authEnabledConfig()
+	config.Services.Rust.NetAlert.Enabled = true
+	config.Services.Rust.NetAlert.Addr = strings.TrimPrefix(backend.URL, "http://")
+	server := httptest.NewServer(NewServerWithSurface(config, "config.yaml", t.TempDir(), "admin").Handler())
+	defer server.Close()
 
-	server.Handler().ServeHTTP(response, request)
-
-	if response.Code == http.StatusUnauthorized || response.Code == http.StatusSeeOther {
-		t.Fatalf("status = %d", response.Code)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	connection, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/api/v1/netalert", nil)
+	if err != nil {
+		t.Fatalf("dial through proxy: %v", err)
 	}
-	if !strings.Contains(response.Body.String(), "event: banner") {
-		t.Fatalf("body = %q", response.Body.String())
-	}
-}
-
-func TestBannerCurrentDoesNotRequireSession(t *testing.T) {
-	t.Setenv("ADMIN_PASSWD", "secret")
-	dir := t.TempDir()
-	configPath := filepath.Join(dir, "config.yaml")
-	mustWrite(t, configPath, "")
-	server := NewServerWithSurface(authEnabledConfig(), configPath, dir, "admin")
-	request := httptest.NewRequest(http.MethodGet, "/api/v1/banner/current?feed=CAP-IT-ALL", nil)
-	response := httptest.NewRecorder()
-
-	server.Handler().ServeHTTP(response, request)
-
-	if response.Code != http.StatusOK {
-		t.Fatalf("status = %d", response.Code)
-	}
-	var payload map[string]any
-	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("body was not JSON: %v body=%q", err, response.Body.String())
-	}
-	if payload["feed_id"] != "CAP-IT-ALL" {
-		t.Fatalf("feed_id = %v body=%q", payload["feed_id"], response.Body.String())
+	defer connection.CloseNow()
+	_, message, err := connection.Read(ctx)
+	if err != nil || string(message) != `{"type":"hello"}` {
+		t.Fatalf("proxied message = %q, %v", message, err)
 	}
 }
 
@@ -603,7 +595,7 @@ webpanel:
 `)
 	mustWrite(t, filepath.Join(dir, "managed", "configs", "output.xml"), `<?xml version="1.0" encoding="UTF-8"?>
 <outputs>
-  <feed id="sk-0001"><webrtc enabled="false"/><stream enabled="true"/></feed>
+  <feed id="sk-0001"><webrtc enabled="false"/><http enabled="true"/></feed>
 </outputs>
 `)
 	configPath := filepath.Join(dir, "config.yaml")
@@ -709,7 +701,7 @@ func TestOutputLabelsUseStreamType(t *testing.T) {
 	}
 }
 
-func TestWildcardIcecastOutputEnablesPublicHTTPAudio(t *testing.T) {
+func TestHTTPAudioAndIcecastAreIndependentSinks(t *testing.T) {
 	dir := t.TempDir()
 	mustWrite(t, filepath.Join(dir, "config.yaml"), `version: test
 feeds_file: managed/configs/feeds.xml
@@ -718,14 +710,17 @@ outputs_file: managed/configs/output.xml
 	mustWrite(t, filepath.Join(dir, "managed", "configs", "feeds.xml"), `<?xml version="1.0" encoding="UTF-8"?>
 <feeds>
   <feed id="cwxr-on01" enabled="true" />
-  <feed id="cwxr-sk01" enabled="true" />
+  <feed id="ice-only" enabled="true" />
 </feeds>
 `)
 	mustWrite(t, filepath.Join(dir, "managed", "configs", "output.xml"), `<?xml version="1.0" encoding="UTF-8"?>
 <outputs>
   <feed id="cwxr-*">
-    <webrtc enabled="false"/>
-    <icecast enabled="true"><format>opus</format><acodec>libopus</acodec></icecast>
+    <http enabled="true"/>
+    <icecast enabled="false"/>
+  </feed>
+  <feed id="ice-only">
+    <icecast enabled="true"><format>opus</format></icecast>
   </feed>
 </outputs>
 `)
@@ -734,21 +729,22 @@ outputs_file: managed/configs/output.xml
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(feeds) != 2 {
-		t.Fatalf("feeds = %#v", feeds)
-	}
+	want := map[string]bool{"cwxr-on01": true, "ice-only": false}
 	for _, feed := range feeds {
-		if feed["http_stream_enabled"] != true {
-			t.Fatalf("feed did not inherit wildcard icecast output: %#v", feed)
+		id := stringValue(feed, "id")
+		if feed["http_stream_enabled"] != want[id] {
+			t.Fatalf("%s http_stream_enabled = %v, want %v", id, feed["http_stream_enabled"], want[id])
 		}
 	}
 	outputs, err := loadOutputsXML(filepath.Join(dir, "config.yaml"), map[string]any{"outputs_file": "managed/configs/output.xml"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	labels := outputLabels(outputForFeed(outputs, "cwxr-on01"))
-	if len(labels) != 1 || labels[0] != "icecast" {
-		t.Fatalf("labels = %#v", labels)
+	if labels := outputLabels(outputForFeed(outputs, "cwxr-on01")); len(labels) != 1 || labels[0] != "http" {
+		t.Fatalf("wildcard labels = %#v", labels)
+	}
+	if labels := outputLabels(outputForFeed(outputs, "ice-only")); len(labels) != 1 || labels[0] != "icecast" {
+		t.Fatalf("icecast labels = %#v", labels)
 	}
 }
 
@@ -2651,7 +2647,14 @@ func TestBroadcastAlertDataByFeedUsesEachFeedLocations(t *testing.T) {
 </feeds>`)
 	mustWrite(t, filepath.Join(dir, "managed", "csv", "CLC_Base_Zone.csv"), "CLC,FEATURE_ID,NAME,NOM\n046200,fixture,Manitoba coverage,\n046211,fixture,Manitoba local,\n013200,fixture,New Brunswick coverage,\n013211,fixture,New Brunswick local,\n")
 
-	session := wsSession{configPath: filepath.Join(dir, "config.yaml")}
+	// The snapshot the daemon publishes for these feeds: each region lists one
+	// subregion, so a whole-coverage header is the region plus that subregion.
+	feedConfig := feedconfig.NewStore()
+	feedConfig.Set(&feedconfig.Snapshot{Version: feedconfig.SnapshotVersion, Feeds: []feedconfig.Feed{
+		{FeedID: "mb-0001", Entries: []feedconfig.Entry{{ID: "046200", RegionCode: "046200", Matcher: feedconfig.Matcher{Kind: feedconfig.MatchPrefix, Value: "0462"}, Header: feedconfig.HeaderListed, Subregions: []feedconfig.Matcher{{Kind: feedconfig.MatchExact, Value: "046211"}}}}},
+		{FeedID: "nb-0001", Entries: []feedconfig.Entry{{ID: "013200", RegionCode: "013200", Matcher: feedconfig.Matcher{Kind: feedconfig.MatchPrefix, Value: "0132"}, Header: feedconfig.HeaderListed, Subregions: []feedconfig.Matcher{{Kind: feedconfig.MatchExact, Value: "013211"}}}}},
+	}})
+	session := wsSession{configPath: filepath.Join(dir, "config.yaml"), server: &Server{feedConfig: feedConfig}}
 	dataByFeed, err := session.broadcastAlertDataByFeed(map[string]any{
 		"originator":         "WXR",
 		"event":              "RWT",

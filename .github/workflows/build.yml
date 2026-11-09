@@ -167,6 +167,41 @@ jobs:
       - name: Test CGEN GPU and MSDF path
         run: cargo test -p haze-cgen --features gpu-wgpu --locked ${{ runner.os == 'Windows' && '--target x86_64-pc-windows-gnullvm' || '' }}
 
+  proto:
+    name: Protobuf contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: services/go/go.mod
+          check-latest: true
+          cache: true
+          cache-dependency-path: services/go/go.sum
+
+      # The generated Go code is committed, so only this job needs buf. The
+      # native Windows and FreeBSD jobs never run protoc.
+      - name: Lint contracts and verify the generated Go code is current
+        run: bash scripts/gen-proto.sh --check
+
+      - name: Check wire compatibility with the base branch
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if git cat-file -e "origin/${BASE_REF}:buf.yaml" 2>/dev/null; then
+            bash scripts/gen-proto.sh --breaking-against "origin/${BASE_REF}"
+          else
+            echo "The base branch has no buf.yaml yet, so there is nothing to compare against."
+          fi
+
   catalog_artifacts:
     name: Resolve validated location catalogs
     runs-on: ubuntu-latest

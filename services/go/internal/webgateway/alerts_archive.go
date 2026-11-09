@@ -112,21 +112,6 @@ func archiveRejectedSummary(records []archiveCAPRecord) map[string]any {
 	}
 }
 
-func archiveStoreRecords(configPath string, bucket string, since time.Time) []archiveCAPRecord {
-	config, err := LoadConfig(configPath)
-	if err != nil {
-		return nil
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	store, err := datastore.Open(ctx, config.Storage, filepath.Dir(filepath.Clean(configPath)))
-	if err != nil {
-		return nil
-	}
-	defer store.Close()
-	return listArchiveStoreRecords(ctx, store, bucket, since)
-}
-
 func archiveStoreRecordBuckets(configPath string, now time.Time) ([]archiveCAPRecord, []archiveCAPRecord, []archiveCAPRecord) {
 	config, err := LoadConfig(configPath)
 	if err != nil {
@@ -275,7 +260,6 @@ func handleAlertsArchiveAction(configPath string, payload map[string]any) (map[s
 }
 
 func publishAlertArchiveInvalidated(alertID string, feedID string) {
-	clearBannerArchiveCache()
 	bridgeAddr := strings.TrimSpace(os.Getenv("HAZE_HOST_BRIDGE_ADDR"))
 	if bridgeAddr == "" {
 		return

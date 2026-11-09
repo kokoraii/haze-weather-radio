@@ -1,0 +1,83 @@
+// PCM media bridge contract.
+//
+// The gRPC form of the daemon's second broker instance, which carries
+// continuous PCM from haze-playout to media consumers. The frame mirrors the
+// binary HPCM layout in crates/haze-media-protocol so a move keeps the same
+// fields and the same drop-the-stale-backlog rules. This service is only
+// adopted if Phase 3 of docs/grpc-migration-plan.md passes its measurement gate.
+syntax = "proto3";
+
+package haze.media.v1;
+
+option go_package = "github.com/meowraii/haze-weather-radio/services/go/internal/gen/media/v1;mediav1";
+
+// MediaBridgeService is the PCM broker endpoint exposed by the daemon.
+service MediaBridgeService {
+  // Connect opens one long-lived stream per client. The first request must be
+  // a MediaHello.
+  rpc Connect(stream ConnectRequest) returns (stream ConnectResponse);
+}
+
+message ConnectRequest {
+  oneof frame {
+    MediaHello hello = 1;
+    PcmFrame publish = 2;
+  }
+}
+
+message ConnectResponse {
+  oneof frame {
+    MediaWelcome welcome = 1;
+    PcmFrame deliver = 2;
+    MediaNotice notice = 3;
+  }
+}
+
+message MediaHello {
+  string client_id = 1;
+  // False for publish-only clients such as haze-playout.
+  bool receive_frames = 2;
+}
+
+message MediaWelcome {
+  string client_id = 1;
+  // Largest message the broker accepts on this stream, in bytes. It must be
+  // above the 4 MiB PCM frame limit to leave room for protobuf framing.
+  uint32 max_message_bytes = 2;
+}
+
+// MediaKind classifies a frame. The numbers are the HPCM media kind plus one,
+// because proto3 reserves zero for the unspecified value.
+enum MediaKind {
+  MEDIA_KIND_UNSPECIFIED = 0;
+  MEDIA_KIND_SILENCE = 1;
+  MEDIA_KIND_ROUTINE = 2;
+  MEDIA_KIND_ALERT = 3;
+  MEDIA_KIND_OPERATOR_BREAK_IN = 4;
+}
+
+message PcmFrame {
+  string feed_id = 1;
+  string queue_id = 2;
+  uint32 sample_rate = 3;
+  uint32 channels = 4;
+  uint32 duration_ms = 5;
+  // Monotonic per feed. A gap or reset is reported with discontinuity.
+  uint64 sequence = 6;
+  uint64 pts_ns = 7;
+  bool discontinuity = 8;
+  MediaKind media_kind = 9;
+  // Interleaved signed 16-bit little-endian samples.
+  bytes pcm = 10;
+}
+
+message MediaNotice {
+  enum Code {
+    CODE_UNSPECIFIED = 0;
+    // The client fell behind its bounded queue and is being disconnected.
+    CODE_SLOW_CONSUMER = 1;
+    CODE_SHUTTING_DOWN = 2;
+  }
+  Code code = 1;
+  string detail = 2;
+}

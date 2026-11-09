@@ -1,0 +1,18 @@
+[package]
+name = "haze-bridge-client"
+description = "Shared Rust client for the Haze host event bridge"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+haze-media-protocol = { path = "../haze-media-protocol" }
+serde_json = "1.0"
+tokio = { version = "1.48", features = ["io-util", "net", "rt", "sync", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1.48", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }

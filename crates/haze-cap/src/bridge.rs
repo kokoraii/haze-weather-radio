@@ -3,12 +3,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use haze_bridge_client::{BridgeReader, BridgeWriter, Options, Registration};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::TcpStream;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{oneshot, Mutex};
 use tokio::time::sleep;
 use tracing::{error, warn};
@@ -84,7 +83,7 @@ impl EventEnvelope {
 pub struct EventPublisher {
     addr: Option<String>,
     client_id: String,
-    writer: Arc<Mutex<Option<OwnedWriteHalf>>>,
+    writer: Arc<Mutex<Option<BridgeWriter>>>,
     pending_acks:
         Arc<Mutex<std::collections::HashMap<String, Vec<oneshot::Sender<Result<(), String>>>>>>,
     journal_lock: Arc<Mutex<()>>,
@@ -214,37 +213,22 @@ impl EventPublisher {
         let mut guard = self.writer.lock().await;
         if guard.is_none() {
             let addr = self.addr.as_ref().expect("bridge addr checked");
-            let stream = TcpStream::connect(addr)
-                .await
-                .with_context(|| format!("failed to connect to host bridge at {addr}"))?;
-            let (reader, mut writer) = stream.into_split();
             let registration = publisher_registration(&self.client_id);
-            writer
-                .write_all(&registration)
-                .await
-                .context("failed to register CAP publisher with host bridge")?;
-            writer
-                .write_all(b"\n")
-                .await
-                .context("failed to terminate CAP publisher bridge registration")?;
-            writer
-                .flush()
-                .await
-                .context("failed to flush CAP publisher bridge registration")?;
+            let (reader, writer) =
+                haze_bridge_client::connect(addr, &Options::default(), Some(&registration))
+                    .await
+                    .context("failed to register CAP publisher with host bridge")?;
             tokio::spawn(read_acknowledgements(
                 reader,
                 Arc::clone(&self.pending_acks),
             ));
             *guard = Some(writer);
         }
-        let writer = guard.as_mut().expect("bridge writer exists");
-        let write_result = async {
-            writer.write_all(line).await?;
-            writer.write_all(b"\n").await?;
-            writer.flush().await
-        }
-        .await;
-        if let Err(err) = write_result {
+        let writer = guard.as_ref().expect("bridge writer exists");
+        let mut framed = Vec::with_capacity(line.len() + 1);
+        framed.extend_from_slice(line);
+        framed.push(b'\n');
+        if let Err(err) = writer.write_raw(&framed).await {
             *guard = None;
             return Err(err).context("failed to write host bridge event");
         }
@@ -275,15 +259,19 @@ async fn persist_journal(path: &Path, line: &[u8]) -> Result<()> {
 }
 
 async fn read_acknowledgements(
-    reader: OwnedReadHalf,
+    mut reader: BridgeReader,
     pending: Arc<
         Mutex<std::collections::HashMap<String, Vec<oneshot::Sender<Result<(), String>>>>>,
     >,
 ) {
-    let mut lines = BufReader::new(reader).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
-            continue;
+    loop {
+        let value = match reader.next_event().await {
+            Ok(Some(value)) => value,
+            Ok(None) => break,
+            Err(err) => {
+                warn!("CAP ingest broker acknowledgement read failed: {err}");
+                break;
+            }
         };
         if value.get("type").and_then(Value::as_str) != Some(ROUTER_ACK_EVENT) {
             continue;
@@ -318,17 +306,8 @@ async fn read_acknowledgements(
     error!("CAP ingest broker acknowledgement reader disconnected");
 }
 
-fn publisher_registration(client_id: &str) -> Vec<u8> {
-    serde_json::to_vec(&json!({
-        "type": "bridge.client",
-        "source": "haze-cap-ingest",
-        "data": {
-            "client_id": client_id,
-            "receive_events": true,
-            "subscriptions": [ROUTER_ACK_EVENT],
-        }
-    }))
-    .expect("CAP bridge registration serializes")
+fn publisher_registration(client_id: &str) -> Registration {
+    Registration::subscriber(client_id, &[ROUTER_ACK_EVENT]).with_source("haze-cap-ingest")
 }
 
 #[cfg(test)]
@@ -337,9 +316,7 @@ mod tests {
 
     #[test]
     fn cap_publisher_registers_as_publish_only() {
-        let registration: Value =
-            serde_json::from_slice(&publisher_registration("haze-cap-ingest:test"))
-                .expect("registration JSON");
+        let registration = publisher_registration("haze-cap-ingest:test").to_value();
         assert_eq!(registration["type"], "bridge.client");
         assert_eq!(registration["data"]["client_id"], "haze-cap-ingest:test");
         assert_eq!(registration["data"]["receive_events"], true);
@@ -347,6 +324,69 @@ mod tests {
             registration["data"]["subscriptions"],
             json!([ROUTER_ACK_EVENT])
         );
+    }
+
+    #[tokio::test]
+    async fn durable_cap_alert_is_journaled_sent_and_cleared_on_router_acknowledgement() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake broker");
+        let addr = listener.local_addr().expect("broker address").to_string();
+        let broker = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept publisher");
+            let (read, mut write) = socket.into_split();
+            let mut lines = BufReader::new(read).lines();
+            let registration: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let alert: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let acknowledgement = json!({
+                "type": ROUTER_ACK_EVENT,
+                "data": { "delivery_id": alert["delivery_id"], "status": "committed" },
+            });
+            let mut raw = serde_json::to_vec(&acknowledgement).unwrap();
+            raw.push(b'\n');
+            write.write_all(&raw).await.unwrap();
+            (registration, alert)
+        });
+
+        let journal = std::env::temp_dir().join(format!(
+            "haze-cap-bridge-test-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let mut publisher = EventPublisher::new(Some(addr), "test");
+        publisher.journal_dir = journal.clone();
+        let event = EventEnvelope::cap_alert(
+            "naads",
+            json!({"identifier": "alert-1", "raw_xml": "<alert/>"}),
+            json!({}),
+        );
+        tokio::time::timeout(Duration::from_secs(5), publisher.publish(&event))
+            .await
+            .expect("router acknowledgement arrived")
+            .expect("publish succeeded");
+
+        let (registration, alert) = broker.await.expect("broker task");
+        assert_eq!(registration["type"], "bridge.client");
+        assert_eq!(registration["data"]["client_id"], "haze-cap-ingest:test");
+        assert_eq!(
+            registration["data"]["subscriptions"],
+            json!([ROUTER_ACK_EVENT])
+        );
+        assert_eq!(alert["type"], "cap.alert.received");
+        assert_eq!(alert["subject"], "alert-1");
+        assert_eq!(
+            std::fs::read_dir(&journal)
+                .expect("journal directory")
+                .count(),
+            0,
+            "the acknowledged alert must be cleared from the durable journal"
+        );
+        let _ = std::fs::remove_dir_all(&journal);
     }
 
     #[test]

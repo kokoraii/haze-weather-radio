@@ -1679,6 +1679,7 @@ fn default_runtime_cleanup_rules() -> Vec<RuntimeCleanupRule> {
         ("runtime/ivr/asr", 5 * MINUTE),
         ("runtime/audio/alerts", 7 * 24 * 60 * MINUTE),
         ("runtime/audio/easnet", 7 * 24 * 60 * MINUTE),
+        ("runtime/audio/netalert", 30 * MINUTE),
     ]
     .into_iter()
     .filter_map(|(path, seconds)| {
@@ -2282,7 +2283,11 @@ fn publish_scheduled_package(publisher: &Sender<Value>, pkg_id: &str) {
     }));
 }
 
-fn decode_config_with_overlay<T>(path: &Path, app_dir: &Path, runtime_dir: &Path) -> Result<T>
+pub(crate) fn decode_config_with_overlay<T>(
+    path: &Path,
+    app_dir: &Path,
+    runtime_dir: &Path,
+) -> Result<T>
 where
     T: serde::de::DeserializeOwned,
 {
@@ -2380,7 +2385,7 @@ fn expand_env_vars(raw: &str) -> String {
     out
 }
 
-fn resolve_path(base: &Path, path: &Path) -> PathBuf {
+pub(crate) fn resolve_path(base: &Path, path: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
     } else {

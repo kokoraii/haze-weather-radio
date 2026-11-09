@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<easnet enabled="true">
+<easnet enabled="false">
   <listener enabled="true" addr="0.0.0.0:41800" max_message_bytes="262144" read_timeout="10s" />
   <audio_server
     enabled="true"
