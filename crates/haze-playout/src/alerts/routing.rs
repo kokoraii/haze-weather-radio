@@ -298,21 +298,20 @@ fn info_groups(alert: &Alert) -> Vec<InfoGroup> {
     groups.into_values().collect()
 }
 
-fn all_location_codes(info: &AlertInfo) -> BTreeSet<String> {
-    let mut codes = BTreeSet::new();
-    for area in &info.areas {
-        for geocode in &area.geocodes {
+/// The location codes one CAP area names, skipping non-location geocodes.
+fn area_location_codes(area: &haze_cap::model::AlertArea) -> impl Iterator<Item = String> + '_ {
+    area.geocodes
+        .iter()
+        .filter(|geocode| {
             let name = geocode.name.to_ascii_lowercase();
-            if name.contains(":dlc:") || name.contains("threat") {
-                continue;
-            }
-            let code = normalize_location(&geocode.value);
-            if !code.is_empty() {
-                codes.insert(code);
-            }
-        }
-    }
-    codes
+            !name.contains(":dlc:") && !name.contains("threat")
+        })
+        .map(|geocode| normalize_location(&geocode.value))
+        .filter(|code| !code.is_empty())
+}
+
+fn all_location_codes(info: &AlertInfo) -> BTreeSet<String> {
+    info.areas.iter().flat_map(area_location_codes).collect()
 }
 
 fn feed_locations(
@@ -721,15 +720,30 @@ fn choose_info<'a>(infos: &'a [AlertInfo], language: &str) -> Option<&'a AlertIn
         .or_else(|| infos.first())
 }
 
+/// Builds the spoken and displayed alert text for one feed. `locations` are
+/// the alert's codes inside the feed's coverage, and only the areas naming one
+/// of them are read out, so a feed does not list another feed's areas. If no
+/// area can be tied to a code (or the feed takes every location), all areas
+/// are named.
 fn alert_text(alert: &Alert, info: &AlertInfo, locations: &[String]) -> String {
     let mut sentences = Vec::new();
     let headline = nonempty(&info.headline, &info.event, "Weather alert");
-    let areas = info
+    let described = |area: &&haze_cap::model::AlertArea| !area.description.trim().is_empty();
+    let mut areas = info
         .areas
         .iter()
-        .filter(|area| !area.description.trim().is_empty())
+        .filter(described)
+        .filter(|area| area_location_codes(area).any(|code| locations.contains(&code)))
         .map(|area| area.description.trim())
         .collect::<Vec<_>>();
+    if areas.is_empty() {
+        areas = info
+            .areas
+            .iter()
+            .filter(described)
+            .map(|area| area.description.trim())
+            .collect();
+    }
     let area_text = if areas.is_empty() {
         locations.join(", ")
     } else {
@@ -1316,6 +1330,32 @@ mod tests {
         // The configured forecast region 065200 contains 065201, so it is toned too.
         assert_eq!(decisions[0].same_locations, vec!["065200", "065201"]);
         assert_eq!(decisions[0].kind, DispatchKind::Priority);
+    }
+
+    #[test]
+    fn alert_text_names_only_the_areas_the_feed_covers() {
+        let mut alert = alert("Alert", "Expected", "Severe", "Likely");
+        let area = |description: &str, code: &str| haze_cap::model::AlertArea {
+            description: description.to_string(),
+            geocodes: vec![haze_cap::model::NameValue {
+                name: "layer:EC-MSC-SMC:1.0:CLC".to_string(),
+                value: code.to_string(),
+            }],
+            ..Default::default()
+        };
+        alert.infos[0].areas = vec![area("City of Regina", "062100"), area("R.M. of Arm River", "065201")];
+
+        let decisions = route_document(
+            &alert,
+            "delivery-trim",
+            "now",
+            &[feed()],
+            &default_coverage(),
+            &mut RouterState::default(),
+        );
+        assert_eq!(decisions.len(), 1);
+        assert!(decisions[0].text.contains("R.M. of Arm River"));
+        assert!(!decisions[0].text.contains("Regina"));
     }
 
     #[test]
