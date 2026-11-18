@@ -11,9 +11,11 @@
 mod compile;
 pub mod coverage;
 mod model;
+mod province;
 
 pub use compile::{compile_feed_xml, load_snapshot, ConfigError};
 pub use coverage::{normalize_code, SameHeader, SAME_MAX_LOCATIONS};
+pub use province::{clc_province, sgc_province};
 pub use model::{
     CoverageEntry, FeedConfigSnapshot, FeedCoverage, HeaderPolicy, MatchKind, Matcher,
     SNAPSHOT_VERSION,

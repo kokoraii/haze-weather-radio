@@ -119,6 +119,7 @@ pub(crate) struct RoutingResult {
 
 impl AlertPipeline {
     pub(crate) fn load(base_dir: &Path) -> Result<Self> {
+        load_naads_event_mapping(base_dir);
         let state_path = base_dir.join(ROUTER_STATE_PATH);
         let state = match std::fs::read(&state_path) {
             Ok(raw) => serde_json::from_slice(&raw).with_context(|| {
@@ -1116,4 +1117,4 @@ fn stage_timing_dispatch(stage: &str, dispatch: &AlertDispatch) -> Value {
 
 mod routing;
 
-use routing::{first_text, nonempty, parse_cap_time, route_document};
+use routing::{first_text, load_naads_event_mapping, nonempty, parse_cap_time, route_document};

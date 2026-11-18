@@ -52,7 +52,12 @@ pub(crate) fn route_document(
             let Some(info) = choose_info(&group.infos, &feed.language()) else {
                 continue;
             };
-            if info_expired(info) || !filter_allows(&provider.filter, alert, info) {
+            // Broadcast-immediate and wireless-immediate alerts (including the
+            // national Alert Ready tests, sent as Minor) air on every covered
+            // feed whatever its filter.
+            if info_expired(info)
+                || (!is_immediate(info) && !filter_allows(&provider.filter, alert, info))
+            {
                 continue;
             }
             let hazard_prior_locations = active
@@ -338,9 +343,20 @@ fn feed_locations(
             Vec::new()
         };
     }
+    // A province-wide alert affects all of the feed's locations in that province.
+    let mut located = province_locations(coverage, codes.iter());
+    located.extend(codes.into_iter().filter(|code| coverage.covers(code)));
+    located.into_iter().collect()
+}
+
+/// The feed's codes inside any province that `codes` names by SGC code.
+fn province_locations<'a>(
+    coverage: &FeedCoverage,
+    codes: impl Iterator<Item = &'a String>,
+) -> BTreeSet<String> {
     codes
-        .into_iter()
-        .filter(|code| coverage.covers(code))
+        .filter_map(|code| haze_feed_config::sgc_province(code))
+        .flat_map(|province| coverage.province_codes(province))
         .collect()
 }
 
@@ -401,6 +417,11 @@ fn same_codes(
             .map(|geocode| normalize_location(&geocode.value))
             .filter(|code| !code.is_empty())
             .collect::<BTreeSet<_>>();
+        same.extend(
+            province_locations(coverage, area_locations.iter())
+                .into_iter()
+                .filter(|code| locations.contains(code)),
+        );
         let newly_covered = area_locations
             .iter()
             .filter(|location| locations.contains(location))
@@ -580,6 +601,11 @@ fn routine_alert_allowed(alert: &Alert) -> bool {
     {
         return false;
     }
+    // An Actual alert flagged for immediate broadcast is meant for the public,
+    // even when it is a scheduled Alert Ready test message.
+    if alert.infos.iter().any(is_immediate) {
+        return true;
+    }
     let text = alert
         .infos
         .iter()
@@ -602,9 +628,7 @@ fn priority_eligible(alert: &Alert, info: &AlertInfo, same_event: &str) -> bool 
     if is_cancel(alert) || !is_fresh(alert, info, same_event) {
         return false;
     }
-    if parameter_values(info, "broadcast_immediate")
-        .any(|value| matches!(value.as_str(), "true" | "yes" | "1"))
-    {
+    if is_immediate(info) {
         return true;
     }
     // Advisories and statements air in the routine loop without tones.
@@ -620,6 +644,14 @@ fn priority_eligible(alert: &Alert, info: &AlertInfo, same_event: &str) -> bool 
         "moderate" | "severe" | "extreme"
     ) && !info.urgency.eq_ignore_ascii_case("past")
         && !info.certainty.eq_ignore_ascii_case("unlikely")
+}
+
+/// Whether the alert is flagged for immediate broadcast or wireless alerting
+/// (`layer:SOREM:1.0:Broadcast_Immediately`, `layer:SOREM:2.0:WirelessImmediate`).
+fn is_immediate(info: &AlertInfo) -> bool {
+    ["broadcast_immediate", "wirelessimmediate"].iter().any(|flag| {
+        parameter_values(info, flag).any(|value| matches!(value.as_str(), "true" | "yes" | "1"))
+    })
 }
 
 /// Lowercased values of the info parameters whose name contains `wanted`.
@@ -650,6 +682,33 @@ fn is_fresh(alert: &Alert, info: &AlertInfo, same_event: &str) -> bool {
     now < anchor || now.signed_duration_since(anchor) <= limit
 }
 
+/// CAP-CP event code to SAME event, from `naadsToEas` in managed/sameMapping.json.
+static NAADS_TO_SAME: std::sync::RwLock<BTreeMap<String, String>> =
+    std::sync::RwLock::new(BTreeMap::new());
+
+#[derive(serde::Deserialize)]
+struct SameMappingFile {
+    #[serde(rename = "naadsToEas", default)]
+    naads_to_eas: BTreeMap<String, String>,
+}
+
+/// Loads the NAADS event mapping. Without it, NAADS alerts that carry no SAME
+/// code of their own cannot tone, so a missing or bad file is logged loudly.
+pub(crate) fn load_naads_event_mapping(base_dir: &std::path::Path) {
+    let path = base_dir.join("managed").join("sameMapping.json");
+    let mapping = std::fs::read(&path)
+        .map_err(anyhow::Error::from)
+        .and_then(|raw| Ok(serde_json::from_slice::<SameMappingFile>(&raw)?));
+    match mapping {
+        Ok(file) => {
+            tracing::info!(events = file.naads_to_eas.len(), "loaded the NAADS to SAME event mapping");
+            *NAADS_TO_SAME.write().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                file.naads_to_eas;
+        }
+        Err(err) => tracing::error!(path = %path.display(), %err, "NAADS to SAME event mapping is unavailable"),
+    }
+}
+
 fn same_event_code(alert: &Alert, info: &AlertInfo) -> String {
     for event_code in &info.event_codes {
         if matches!(
@@ -662,6 +721,19 @@ fn same_event_code(alert: &Alert, info: &AlertInfo) -> String {
                 .all(|byte| byte.is_ascii_alphanumeric())
         {
             return event_code.value.to_ascii_uppercase();
+        }
+    }
+    // NAADS alerts carry CAP-CP event codes; managed/sameMapping.json maps them
+    // (testMessage to NPT, for example). ECCC alerts carry their own SAME codes.
+    if detect_source(alert) != "eccc" {
+        let mapping = NAADS_TO_SAME.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(code) = info
+            .event_codes
+            .iter()
+            .filter(|code| code.name.to_ascii_lowercase().contains("cap-cp:event"))
+            .find_map(|code| mapping.get(code.value.trim()))
+        {
+            return code.clone();
         }
     }
     let event = format!("{} {}", info.event, info.headline).to_ascii_lowercase();
@@ -726,6 +798,16 @@ fn choose_info<'a>(infos: &'a [AlertInfo], language: &str) -> Option<&'a AlertIn
 /// area can be tied to a code (or the feed takes every location), all areas
 /// are named.
 fn alert_text(alert: &Alert, info: &AlertInfo, locations: &[String]) -> String {
+    // NAADS issuers write the exact script broadcasters should air.
+    if let Some(script) = info
+        .parameters
+        .iter()
+        .find(|parameter| parameter.name.to_ascii_lowercase().ends_with(":broadcast_text"))
+        .map(|parameter| parameter.value.trim())
+        .filter(|script| !script.is_empty())
+    {
+        return script.to_string();
+    }
     let mut sentences = Vec::new();
     let headline = nonempty(&info.headline, &info.event, "Weather alert");
     let described = |area: &&haze_cap::model::AlertArea| !area.description.trim().is_empty();
@@ -1330,6 +1412,57 @@ mod tests {
         // The configured forecast region 065200 contains 065201, so it is toned too.
         assert_eq!(decisions[0].same_locations, vec!["065200", "065201"]);
         assert_eq!(decisions[0].kind, DispatchKind::Priority);
+    }
+
+    #[test]
+    fn province_wide_alert_ready_test_tones_every_feed_location_in_the_province() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        std::fs::create_dir_all(dir.path().join("managed")).expect("managed directory");
+        std::fs::write(
+            dir.path().join("managed/sameMapping.json"),
+            r#"{"naadsToEas":{"testMessage":"NPT"}}"#,
+        )
+        .expect("write mapping");
+        load_naads_event_mapping(dir.path());
+
+        let mut feed = feed();
+        // Feeds commonly block Minor alerts; immediate-broadcast alerts air anyway.
+        feed.alerts.as_mut().expect("alerts").cap_cp.filter.blocklist.severities = vec!["Minor".to_string()];
+        let cov = coverage(
+            r#"<region id="065100"/><region id="065500"><subregion id="065512"/></region><region id="052600"/>"#,
+        );
+        let mut test = alert("Alert", "Immediate", "Minor", "Observed");
+        test.sender = "SkSaskatchewanPublicSafetyAgency".to_string();
+        let info = &mut test.infos[0];
+        info.event = "Test Message".to_string();
+        info.headline = "This is a test of the Alert Ready System".to_string();
+        info.event_codes = vec![haze_cap::model::NameValue {
+            name: "profile:CAP-CP:Event:0.4".to_string(),
+            value: "testMessage".to_string(),
+        }];
+        info.parameters = vec![
+            haze_cap::model::NameValue {
+                name: "layer:SOREM:1.0:Broadcast_Immediately".to_string(),
+                value: "Yes".to_string(),
+            },
+            haze_cap::model::NameValue {
+                name: "layer:SOREM:1.0:Broadcast_Text".to_string(),
+                value: "This is a test of the Saskatchewan Alert Ready System.".to_string(),
+            },
+        ];
+        info.areas[0].description = "Saskatchewan".to_string();
+        info.areas[0].geocodes = vec![haze_cap::model::NameValue {
+            name: "profile:CAP-CP:Location:0.3".to_string(),
+            value: "47".to_string(),
+        }];
+
+        let decisions =
+            route_document(&test, "delivery-npas-test", "now", &[feed], &cov, &mut RouterState::default());
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].kind, DispatchKind::Priority);
+        assert_eq!(decisions[0].same_event, "NPT");
+        assert_eq!(decisions[0].same_locations, vec!["065100", "065500", "065512"]);
+        assert_eq!(decisions[0].text, "This is a test of the Saskatchewan Alert Ready System.");
     }
 
     #[test]

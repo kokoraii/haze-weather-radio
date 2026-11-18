@@ -30,6 +30,8 @@ Rules behind the table:
 - A SAME header holds at most 31 codes. Region codes come first, then listed subregions, then other affected codes, so the limit drops the least specific codes. Drops are logged.
 - An alert that names no locations (automations, whole-coverage operator alerts) uses the feed's full header: every region code plus every listed subregion.
 - A feed with no coverage takes alerts for every location.
+- An alert that names a whole province or territory by SGC code (`47` for Saskatchewan) affects every code the feed covers in that province, and its SAME header holds all of them. A CLC code's province comes from its first three digits (`crates/haze-feed-config/src/province.rs`). Only the CAP router applies this rule so far.
+- An alert flagged `Broadcast_Immediately` or `WirelessImmediate` skips the feed's alert filter, so national Alert Ready tests (sent as Minor) air on every covered feed. Its SAME event comes from `naadsToEas` in `managed/sameMapping.json` (`testMessage` is `NPT`).
 
 ## Validation
 
