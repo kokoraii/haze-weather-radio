@@ -1,0 +1,86 @@
+# Builds the portable Windows, Linux and FreeBSD bundles and uploads each one as
+# an artifact named <bundle>-<sha>. Called by Build and Main.
+#
+# Location catalog packs are not bundled. They are optional at runtime
+# (required="false" in locations.xml), so haze-location falls back to the legacy
+# core. Operators install them as described in docs/location-system.md.
+name: Bundles
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  GOFLAGS: -mod=readonly
+
+jobs:
+  windows:
+    name: Bundle (Windows)
+    runs-on: windows-2025
+    timeout-minutes: 150
+    env:
+      BUNDLE: Haze_UAP-Windows-x86_64-Portable
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-windows
+      - name: Build bundle
+        shell: pwsh
+        run: ./scripts/build-haze.ps1 -Profile release -OutputDir "dist/$env:BUNDLE"
+      - name: Check and archive bundle
+        shell: bash
+        run: bash scripts/ci/package-bundle.sh "$BUNDLE"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.BUNDLE }}-${{ github.sha }}
+          path: dist/${{ env.BUNDLE }}.tar.xz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  linux:
+    name: Bundle (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      BUNDLE: Haze_UAP-Linux-x86_64-Portable
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-linux
+      - name: Build bundle
+        run: bash scripts/build-haze.sh --profile release --output-dir "dist/$BUNDLE"
+      - name: Check and archive bundle
+        run: bash scripts/ci/package-bundle.sh "$BUNDLE"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.BUNDLE }}-${{ github.sha }}
+          path: dist/${{ env.BUNDLE }}.tar.xz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  freebsd:
+    name: Bundle (FreeBSD)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      BUNDLE: Haze_UAP-FreeBSD-x86_64-Portable
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build bundle in FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14.4"
+          mem: 12288
+          cpu: 4
+          envs: BUNDLE CARGO_TERM_COLOR GOFLAGS
+          run: sh scripts/ci/freebsd.sh bundle "$BUNDLE"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.BUNDLE }}-${{ github.sha }}
+          path: dist/${{ env.BUNDLE }}.tar.xz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

@@ -1,0 +1,61 @@
+# Weekly read-only audit of every resolved Cargo and Go dependency against the
+# RustSec and Go vulnerability databases. It opens no branches and runs no tests.
+# A job fails when it finds a vulnerability, and the findings are in the run
+# summary.
+name: Dependency Audit
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  cargo:
+    name: Audit Cargo.lock
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      # An explicit bash shell enables pipefail, so tee cannot hide the exit code.
+      - name: Run cargo audit
+        shell: bash
+        run: |
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          status=0
+          cargo audit --color never 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || status=$?
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
+  go:
+    name: Audit Go modules
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: services/go/go.mod
+          check-latest: true
+          cache-dependency-path: services/go/go.sum
+      # Module scan needs no compile, so it also covers Windows-only and cgo code.
+      # It reports on the whole module but refuses to start from a directory with
+      # no Go files, and services/go has none.
+      - name: Run govulncheck
+        working-directory: services/go/cmd/haze-web
+        shell: bash
+        run: |
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          status=0
+          go run golang.org/x/vuln/cmd/govulncheck@latest -scan module 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || status=$?
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"

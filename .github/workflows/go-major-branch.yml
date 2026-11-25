@@ -1,0 +1,107 @@
+# Applies one Go major update on a new auto/go/ branch, tests it, and opens a
+# pull request with the result. Nothing here merges: that stays manual.
+#
+# Pushes made with GITHUB_TOKEN do not trigger other workflows, so this calls the
+# tests directly instead of relying on the Build workflow.
+name: Go Major Update Branch
+
+on:
+  workflow_call:
+    inputs:
+      module:
+        type: string
+        required: true
+      new_module:
+        type: string
+        required: true
+      from_version:
+        type: string
+        required: true
+      version:
+        type: string
+        required: true
+      branch:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  branch:
+    name: Create branch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.push.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: services/go/go.mod
+          check-latest: true
+          cache-dependency-path: services/go/go.sum
+      - id: push
+        name: Apply update and push
+        env:
+          MODULE: ${{ inputs.module }}
+          NEW_MODULE: ${{ inputs.new_module }}
+          VERSION: ${{ inputs.version }}
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+          python3 scripts/ci/go_major_updates.py apply "$MODULE" "$NEW_MODULE" "$VERSION"
+          git add services/go
+          git commit -m "Update $MODULE to $NEW_MODULE $VERSION"
+          git push origin "$BRANCH"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  tests:
+    needs: branch
+    uses: ./.github/workflows/reusable-tests.yml
+    with:
+      ref: ${{ inputs.branch }}
+
+  report:
+    name: Open pull request
+    needs: [branch, tests]
+    if: always() && needs.branch.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+      statuses: write
+    steps:
+      - env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          MODULE: ${{ inputs.module }}
+          NEW_MODULE: ${{ inputs.new_module }}
+          FROM_VERSION: ${{ inputs.from_version }}
+          VERSION: ${{ inputs.version }}
+          BRANCH: ${{ inputs.branch }}
+          SHA: ${{ needs.branch.outputs.sha }}
+          TESTS: ${{ needs.tests.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          draft=()
+          if [[ "$TESTS" == "success" ]]; then
+            state=success
+            outcome="The full test suite passed on Windows, Linux and FreeBSD."
+          else
+            state=failure
+            draft=(--draft)
+            outcome="The tests did not pass (${TESTS}), so this needs porting work before it can merge."
+          fi
+          gh api "repos/${GH_REPO}/statuses/${SHA}" \
+            -f state="$state" -f context="Go major update tests" -f target_url="$RUN_URL" >/dev/null
+          printf -v body 'Updates `%s` %s to `%s` %s.\n\n%s\n\n[Test run](%s)\n\nThis branch was opened automatically and will not merge itself.' \
+            "$MODULE" "$FROM_VERSION" "$NEW_MODULE" "$VERSION" "$outcome" "$RUN_URL"
+          # Needs "Allow GitHub Actions to create and approve pull requests" in the
+          # repository settings. The branch and its status exist either way.
+          gh pr create --head "$BRANCH" --title "Update $NEW_MODULE to $VERSION" --body "$body" "${draft[@]}" ||
+            echo "::warning::Could not open a pull request. Open one from ${GITHUB_SERVER_URL}/${GH_REPO}/compare/${BRANCH}?expand=1"

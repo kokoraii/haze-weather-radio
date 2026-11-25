@@ -1,0 +1,86 @@
+name: Set up Windows build
+description: >-
+  MSYS2 CLANG64, Go and Rust for the x86_64-pc-windows-gnullvm target. Tests and
+  bundles share this action so they always use the same toolchain and packages.
+
+runs:
+  using: composite
+  steps:
+    # release: false updates the runner image's C:\msys64 in place. The default
+    # installs a second copy under RUNNER_TEMP, while the build scripts and
+    # crates/haze/build.rs look in C:\msys64.
+    - name: Install MSYS2 CLANG64 packages
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: CLANG64
+        release: false
+        update: true
+        path-type: inherit
+        # libnice provides libgstnice.dll. pkgconf provides pkg-config.exe and
+        # conflicts with the older pkg-config package.
+        install: >-
+          mingw-w64-clang-x86_64-clang
+          mingw-w64-clang-x86_64-llvm-tools
+          mingw-w64-clang-x86_64-cmake
+          mingw-w64-clang-x86_64-ninja
+          mingw-w64-clang-x86_64-ffmpeg
+          mingw-w64-clang-x86_64-gstreamer
+          mingw-w64-clang-x86_64-gst-libav
+          mingw-w64-clang-x86_64-gst-plugins-base
+          mingw-w64-clang-x86_64-gst-plugins-good
+          mingw-w64-clang-x86_64-gst-plugins-bad
+          mingw-w64-clang-x86_64-gst-plugins-ugly
+          mingw-w64-clang-x86_64-libc++
+          mingw-w64-clang-x86_64-libnice
+          mingw-w64-clang-x86_64-libunwind
+          mingw-w64-clang-x86_64-opus
+          mingw-w64-clang-x86_64-opusfile
+          mingw-w64-clang-x86_64-pkgconf
+
+    # Do not set PKG_CONFIG_LIBDIR here. It hides transitive dependency metadata.
+    - name: Configure native build environment
+      shell: pwsh
+      run: |
+        $clang64 = "C:\msys64\clang64"
+        $bin = "$clang64\bin"
+        function Set-CiEnv {
+          param([string] $Name, [string] $Value)
+          Set-Item -Path "Env:$Name" -Value $Value
+          "$Name=$Value" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        }
+        # Later GITHUB_PATH entries come first, so clang64\bin wins over usr\bin.
+        Add-Content -Path $env:GITHUB_PATH -Value "C:\msys64\usr\bin"
+        Add-Content -Path $env:GITHUB_PATH -Value $bin
+        $env:Path = "$bin;C:\msys64\usr\bin;$env:Path"
+        Set-CiEnv "PKG_CONFIG" "$bin\pkg-config.exe"
+        Set-CiEnv "PKG_CONFIG_PATH" "$clang64\lib\pkgconfig;$clang64\share\pkgconfig"
+        Set-CiEnv "PKG_CONFIG_ALLOW_CROSS" "1"
+        Set-CiEnv "LIBCLANG_PATH" $bin
+        Set-CiEnv "CXX_STDLIB" "libc++"
+        Set-CiEnv "CXXSTDLIB_x86_64_pc_windows_gnullvm" "libc++"
+        Set-CiEnv "BINDGEN_EXTRA_CLANG_ARGS_x86_64_pc_windows_gnullvm" "--target=x86_64-w64-windows-gnu"
+        Set-CiEnv "CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER" "x86_64-w64-mingw32-clang.exe"
+        Set-CiEnv "CC_x86_64_pc_windows_gnullvm" "x86_64-w64-mingw32-clang.exe"
+        Set-CiEnv "CXX_x86_64_pc_windows_gnullvm" "x86_64-w64-mingw32-clang++.exe"
+        Set-CiEnv "AR_x86_64_pc_windows_gnullvm" "llvm-ar.exe"
+        foreach ($package in @("glib-2.0", "libavcodec", "opus", "gstreamer-1.0", "gstreamer-app-1.0", "gstreamer-audio-1.0", "gstreamer-video-1.0")) {
+          & "$bin\pkg-config.exe" --print-errors --exists $package
+          if ($LASTEXITCODE -ne 0) {
+            throw "MSYS2 CLANG64 package check failed for $package"
+          }
+        }
+
+    - name: Set up Go
+      uses: actions/setup-go@v7
+      with:
+        go-version-file: services/go/go.mod
+        check-latest: true
+        cache-dependency-path: services/go/go.sum
+
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: x86_64-pc-windows-gnullvm
+
+    - name: Cache Rust build output
+      uses: Swatinem/rust-cache@v2

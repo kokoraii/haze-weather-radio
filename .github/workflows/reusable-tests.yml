@@ -1,0 +1,107 @@
+# Runs the full test suite on every platform. Called by Build, Main and the Go
+# major update branches.
+name: Tests
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to test. Defaults to the commit that triggered the caller.
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  GOFLAGS: -mod=readonly
+
+jobs:
+  linux:
+    name: Test (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: ./.github/actions/setup-linux
+      - name: Vet Go services
+        working-directory: services/go
+        run: go vet ./...
+      - name: Test Go services
+        working-directory: services/go
+        run: go test -count=1 ./...
+      - name: Test Rust workspace
+        run: cargo test --workspace --locked
+      - name: Test CGEN GPU and MSDF path
+        run: cargo test -p haze-cgen --features gpu-wgpu --locked
+
+  windows:
+    name: Test (Windows)
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: ./.github/actions/setup-windows
+      - name: Vet Go services
+        working-directory: services/go
+        env:
+          CGO_ENABLED: "0"
+        run: go vet ./...
+      - name: Test Go services
+        working-directory: services/go
+        env:
+          CGO_ENABLED: "0"
+        run: go test -count=1 ./...
+      - name: Test Rust workspace
+        run: cargo test --workspace --locked --target x86_64-pc-windows-gnullvm
+      - name: Test CGEN GPU and MSDF path
+        run: cargo test -p haze-cgen --features gpu-wgpu --locked --target x86_64-pc-windows-gnullvm
+
+  freebsd:
+    name: Test (FreeBSD)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Test in FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14.4"
+          mem: 12288
+          cpu: 4
+          copyback: false
+          envs: CARGO_TERM_COLOR GOFLAGS
+          run: sh scripts/ci/freebsd.sh test
+
+  # The generated Go code is committed, so only this job needs buf.
+  proto:
+    name: Protobuf contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: services/go/go.mod
+          check-latest: true
+          cache-dependency-path: services/go/go.sum
+      - name: Lint contracts and verify the generated Go code is current
+        run: bash scripts/gen-proto.sh --check
+      - name: Check wire compatibility with main
+        if: ${{ (inputs.ref || github.ref_name) != 'main' }}
+        run: |
+          if git cat-file -e "origin/main:buf.yaml" 2>/dev/null; then
+            bash scripts/gen-proto.sh --breaking-against origin/main
+          else
+            echo "main has no buf.yaml yet, so there is nothing to compare against."
+          fi

@@ -1,0 +1,48 @@
+# Opens an auto/go/ branch when a core Go module gets a new major version.
+# Dependabot handles every other update but cannot change a Go module path.
+#
+# An update that already has a branch is skipped. To decline one, close its pull
+# request and keep the branch.
+name: Go Major Updates
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "41 5 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    name: Find new major versions
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      updates: ${{ steps.detect.outputs.updates }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: detect
+        run: echo "updates=$(python3 scripts/ci/go_major_updates.py detect)" >> "$GITHUB_OUTPUT"
+
+  update:
+    name: ${{ matrix.update.new_module }}
+    needs: detect
+    if: needs.detect.outputs.updates != '[]'
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        update: ${{ fromJSON(needs.detect.outputs.updates) }}
+    permissions:
+      contents: write
+      pull-requests: write
+      statuses: write
+    uses: ./.github/workflows/go-major-branch.yml
+    with:
+      module: ${{ matrix.update.module }}
+      new_module: ${{ matrix.update.new_module }}
+      from_version: ${{ matrix.update.from_version }}
+      version: ${{ matrix.update.version }}
+      branch: ${{ matrix.update.branch }}

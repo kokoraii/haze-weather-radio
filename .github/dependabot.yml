@@ -1,0 +1,100 @@
+# Dependency updates for core dependencies. Branches are named auto/... and
+# nothing merges automatically. Dependabot's pushes trigger the Build workflow,
+# which runs the tests and builds the bundles against the new versions.
+#
+# Security updates also need "Dependabot security updates" turned on in the
+# repository settings. They respect `allow`, so only the names listed here get a
+# branch. The weekly Dependency Audit workflow reports on everything else.
+#
+# Go major versions change the module path, which Dependabot cannot do. The Go
+# Major Updates workflow covers those.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: daily
+    open-pull-requests-limit: 10
+    pull-request-branch-name:
+      prefix: auto
+    allow:
+      # Direct: async runtime, gRPC, media, GPU rendering, storage, networking.
+      - dependency-name: tokio
+      - dependency-name: "tonic*"
+      - dependency-name: "prost*"
+      - dependency-name: protox
+      - dependency-name: "gstreamer*"
+      - dependency-name: str0m
+      - dependency-name: opus
+      - dependency-name: cpal
+      - dependency-name: wgpu
+      - dependency-name: glyphon
+      - dependency-name: cosmic-text
+      - dependency-name: rusqlite
+      - dependency-name: reqwest
+      - dependency-name: russh
+      - dependency-name: tokio-tungstenite
+      - dependency-name: quick-xml
+      - dependency-name: serde
+      - dependency-name: serde_json
+      # Transitive: only reach a branch through a security update.
+      - dependency-name: "rustls*"
+      - dependency-name: "aws-lc-*"
+      - dependency-name: "hyper*"
+      - dependency-name: h2
+      - dependency-name: ring
+      - dependency-name: tungstenite
+      - dependency-name: libsqlite3-sys
+    ignore:
+      # Only breaking releases count as updates. Dependabot reads 0.25 to 0.26 as
+      # semver-minor even though Cargo treats it as breaking, so 0.x crates only
+      # ignore patches. Security updates are not affected by these update types.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-patch"]
+      # Crates at 1.0 or later also ignore minors. Add a crate here when it
+      # reaches 1.0.
+      - dependency-name: tokio
+        update-types: ["version-update:semver-minor"]
+      - dependency-name: wgpu
+        update-types: ["version-update:semver-minor"]
+      - dependency-name: serde
+        update-types: ["version-update:semver-minor"]
+      - dependency-name: serde_json
+        update-types: ["version-update:semver-minor"]
+    groups:
+      # These families only build when they move together.
+      gstreamer:
+        patterns: ["gstreamer*"]
+      grpc:
+        patterns: ["tonic*", "prost*", "protox"]
+      gpu-text:
+        patterns: ["wgpu", "glyphon", "cosmic-text"]
+
+  - package-ecosystem: gomod
+    directory: /services/go
+    schedule:
+      interval: daily
+    open-pull-requests-limit: 10
+    pull-request-branch-name:
+      prefix: auto
+    allow:
+      # Direct. Keep in step with CORE_MODULES in scripts/ci/go_major_updates.py.
+      - dependency-name: aidanwoods.dev/go-paseto
+      - dependency-name: github.com/coder/websocket
+      - dependency-name: "github.com/jackc/pgx*"
+      - dependency-name: "github.com/k2-fsa/sherpa-onnx-go*"
+      - dependency-name: "github.com/pion/*"
+      - dependency-name: "github.com/redis/go-redis*"
+      - dependency-name: github.com/twilio/twilio-go
+      - dependency-name: google.golang.org/grpc
+      - dependency-name: google.golang.org/protobuf
+      - dependency-name: gopkg.in/yaml.v3
+      - dependency-name: modernc.org/sqlite
+      # Pre-1.0 modules that release constantly, so they only matter for
+      # security fixes. The ignore rule below filters out their version updates.
+      - dependency-name: golang.org/x/crypto
+      - dependency-name: golang.org/x/net
+    ignore:
+      # Security updates are not affected by these update types.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-minor", "version-update:semver-patch"]

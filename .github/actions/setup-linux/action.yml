@@ -1,0 +1,33 @@
+name: Set up Linux build
+description: >-
+  Native libraries, Go and Rust for Linux. Tests and bundles share this action
+  so they always build against the same package set.
+
+runs:
+  using: composite
+  steps:
+    - name: Install native build dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake git ffmpeg g++ libasound2-dev libopus-dev pkg-config \
+          libavcodec-dev libavformat-dev libavutil-dev libavfilter-dev \
+          libswresample-dev libswscale-dev \
+          libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+          gstreamer1.0-libav gstreamer1.0-tools gstreamer1.0-plugins-base \
+          gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+          gstreamer1.0-plugins-ugly
+        pkg-config --exists libavcodec opus gstreamer-1.0 gstreamer-app-1.0
+
+    - name: Set up Go
+      uses: actions/setup-go@v7
+      with:
+        go-version-file: services/go/go.mod
+        check-latest: true
+        cache-dependency-path: services/go/go.sum
+
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache Rust build output
+      uses: Swatinem/rust-cache@v2

@@ -1,0 +1,82 @@
+# Every push to main: run the tests and build the bundles. Every third push also
+# publishes those bundles as a nightly prerelease.
+#
+# The push counter is this workflow's github.run_number. GitHub assigns it
+# atomically, so concurrent pushes cannot race, and it needs no stored state. It
+# stays the same when a run is re-run, so a failed nightly can be retried. This
+# workflow only runs on main pushes, so other branches never advance the count.
+#
+# Renaming this file resets the counter. Pushes with [skip ci] are not counted.
+#
+# No concurrency group: GitHub cancels queued runs in a group, which could drop
+# the run that was due to publish.
+name: Main
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    uses: ./.github/workflows/reusable-tests.yml
+
+  bundles:
+    uses: ./.github/workflows/reusable-bundles.yml
+
+  cadence:
+    name: Check nightly cadence
+    runs-on: ubuntu-24.04
+    outputs:
+      publish: ${{ steps.count.outputs.publish }}
+    steps:
+      - id: count
+        run: |
+          if (( GITHUB_RUN_NUMBER % 3 == 0 )); then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Main push ${GITHUB_RUN_NUMBER}: a nightly publishes on every third push."
+          fi
+
+  # Skipped unless the tests and all three bundles passed on this push.
+  nightly:
+    name: Publish nightly prerelease
+    needs: [tests, bundles, cadence]
+    if: needs.cadence.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: Haze_UAP-*-${{ github.sha }}
+          path: release
+          merge-multiple: true
+      - name: Publish prerelease
+        working-directory: release
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          archives=(*.tar.xz)
+          if (( ${#archives[@]} != 3 )); then
+            echo "::error::Expected 3 bundle archives, found: ${archives[*]}"
+            exit 1
+          fi
+          sha256sum "${archives[@]}" > SHA256SUMS
+          tag="nightly-${GITHUB_RUN_NUMBER}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            # A re-run of this run. The tag still points at the same commit.
+            gh release upload "$tag" "${archives[@]}" SHA256SUMS --clobber
+            gh release edit "$tag" --draft=false --prerelease
+          else
+            gh release create "$tag" "${archives[@]}" SHA256SUMS \
+              --target "$GITHUB_SHA" \
+              --prerelease \
+              --latest=false \
+              --title "Nightly ${GITHUB_RUN_NUMBER} (${GITHUB_SHA:0:12})" \
+              --generate-notes
+          fi

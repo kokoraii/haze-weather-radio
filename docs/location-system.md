@@ -73,7 +73,7 @@ python scripts/util/build_location_catalog.py \
   --allow-downloads
 ```
 
-The builder writes each database atomically, creates SHA-256 sidecars, and records both members in a deterministic manifest. Point geometry remains in the core pack for fast nearest-location queries. Polygon and MultiPolygon data is stored only in the geometry pack. The scheduled `Location Catalogs` workflow builds and validates `global-core`, `ca-weather`, and `us-weather`, then publishes installable, checksummed artifacts. Downloaded archives and generated SQLite packs are intentionally excluded from the repository.
+The builder writes each database atomically, creates SHA-256 sidecars, and records both members in a deterministic manifest. Point geometry remains in the core pack for fast nearest-location queries. Polygon and MultiPolygon data is stored only in the geometry pack. CI does not build these packs and portable bundles do not include them, so run the builder for `global-core`, `ca-weather`, and `us-weather` and install the output under `managed/locations/`. Without them, `haze-location` runs on the legacy core. Downloaded archives and generated SQLite packs are intentionally excluded from the repository.
 
 Map callers request boundary geometry explicitly. `haze-location` resolves names and identifiers from the core first, reads only the selected WKB from the paired geometry database, converts it to GeoJSON for the existing map contract, and leaves ordinary IVR and search responses geometry-free.
 
