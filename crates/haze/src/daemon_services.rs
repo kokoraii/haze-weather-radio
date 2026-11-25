@@ -472,6 +472,15 @@ struct AutomationSame {
 struct AutomationContent {
     text: String,
     reader_id: String,
+    /// Every language block; playlist picks the ones each feed carries.
+    langs: Vec<AutomationLang>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AutomationLang {
+    code: String,
+    text: String,
+    reader_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -649,6 +658,8 @@ struct AutomationContentXml {
 struct AutomationLangXml {
     #[serde(rename = "@code", default)]
     code: String,
+    #[serde(rename = "@reader_id", default)]
+    reader_id: String,
     #[serde(default)]
     text: String,
 }
@@ -823,6 +834,7 @@ impl AutomationPlan {
                 "same_callsign": self.same.sender_id,
                 "same_tone": self.same.tone,
                 "alert_text": self.content.text,
+                "alert_langs": self.content.langs,
                 "message_type": "Alert",
                 "reader_id": self.content.reader_id,
                 "alert_sent_at": Utc::now().to_rfc3339(),
@@ -912,6 +924,7 @@ fn load_automation_plan(
             content: AutomationContent {
                 text: automation_text(&item.content),
                 reader_id: item.content.reader_id.trim().to_string(),
+                langs: automation_langs(&item.content),
             },
             targets: automation_targets(item.target, automation_feeds),
         });
@@ -933,6 +946,26 @@ fn has_schedule_xml(schedule: &AutomationScheduleXml) -> bool {
         || !schedule.minutes.trim().is_empty()
         || !schedule.seconds.trim().is_empty()
         || !schedule.weeks.weeks.is_empty()
+}
+
+fn automation_langs(content: &AutomationContentXml) -> Vec<AutomationLang> {
+    content
+        .langs
+        .iter()
+        .filter(|lang| !lang.code.trim().is_empty() && !lang.text.trim().is_empty())
+        .enumerate()
+        .map(|(index, lang)| AutomationLang {
+            code: lang.code.trim().to_string(),
+            text: lang.text.trim().to_string(),
+            // The content-level reader belongs to the first (default) block.
+            // Other blocks without a reader let TTS pick one by language.
+            reader_id: if index == 0 {
+                fallback_string(lang.reader_id.clone(), content.reader_id.clone())
+            } else {
+                lang.reader_id.trim().to_string()
+            },
+        })
+        .collect()
 }
 
 fn automation_text(content: &AutomationContentXml) -> String {
@@ -2434,6 +2467,7 @@ mod tests {
             content: AutomationContent {
                 text: String::new(),
                 reader_id: "000".to_string(),
+                langs: Vec::new(),
             },
             targets,
         }

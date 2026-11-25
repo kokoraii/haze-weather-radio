@@ -17,6 +17,7 @@ type alertTemplatesXML struct {
 }
 
 type alertTemplateXML struct {
+	ID          string               `xml:"id,attr,omitempty"`
 	Name        string               `xml:"name"`
 	Description string               `xml:"description"`
 	Automated   automatedTemplateXML `xml:"automated"`
@@ -65,6 +66,7 @@ type sameTemplateXML struct {
 	Locations  templateLocationsXML `xml:"locations"`
 	Duration   durationAttrsXML     `xml:"duration"`
 	SenderID   string               `xml:"sender_id"`
+	Tone       string               `xml:"tone,omitempty"`
 }
 
 type templateLocationsXML struct {
@@ -83,11 +85,13 @@ type durationAttrsXML struct {
 
 type contentTemplateXML struct {
 	AttentionTone string            `xml:"attention_tone,attr,omitempty"`
+	ReaderID      string            `xml:"reader_id,attr,omitempty"`
 	Langs         []langTemplateXML `xml:"lang"`
 }
 
 type langTemplateXML struct {
-	Code string `xml:"code,attr"`
+	Code     string `xml:"code,attr"`
+	ReaderID string `xml:"reader_id,attr,omitempty"`
 	Text string `xml:"text"`
 	File string `xml:"file"`
 }
@@ -125,6 +129,7 @@ func loadAlertTemplates(configPath string) (map[string]any, error) {
 		minutes := parseIntText(template.SAME.Duration.Minutes, 15)
 		msg := map[string]any{}
 		files := map[string]any{}
+		readers := map[string]any{}
 		for _, lang := range template.Content.Langs {
 			key := strings.TrimSpace(lang.Code)
 			if key == "" {
@@ -132,8 +137,10 @@ func loadAlertTemplates(configPath string) (map[string]any, error) {
 			}
 			msg[key] = strings.TrimSpace(lang.Text)
 			files[key] = strings.TrimSpace(lang.File)
+			readers[key] = strings.TrimSpace(lang.ReaderID)
 		}
 		result[code] = map[string]any{
+			"id":          strings.TrimSpace(template.ID),
 			"name":        fallbackText(template.Name, code),
 			"description": strings.TrimSpace(template.Description),
 			"automated": map[string]any{
@@ -146,6 +153,7 @@ func loadAlertTemplates(configPath string) (map[string]any, error) {
 				"originator": strings.TrimSpace(template.SAME.Originator),
 				"event":      code,
 				"sender_id":  strings.TrimSpace(template.SAME.SenderID),
+				"tone":       strings.TrimSpace(template.SAME.Tone),
 				"locations":  templateLocations(template.SAME.Locations.Locations),
 				"duration": map[string]any{
 					"hr":  hours,
@@ -153,6 +161,7 @@ func loadAlertTemplates(configPath string) (map[string]any, error) {
 				},
 				"content": map[string]any{
 					"attention_tone": strings.TrimSpace(template.Content.AttentionTone),
+					"reader_id":      strings.TrimSpace(template.Content.ReaderID),
 					"lang":           msg,
 					"file":           files,
 				},
@@ -161,6 +170,7 @@ func loadAlertTemplates(configPath string) (map[string]any, error) {
 			"sameExpire": fmt.Sprintf("%02d%02d", clampInt(hours, 0, 99), clampInt(minutes, 0, 59)),
 			"msg":        msg,
 			"files":      files,
+			"readers":    readers,
 		}
 	}
 	return result, nil
@@ -176,6 +186,18 @@ func writeAlertTemplates(configPath string, content string) (map[string]any, err
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
+	allowed, err := configuredLanguages(configPath)
+	if err != nil {
+		return nil, err
+	}
+	for _, code := range keys {
+		template, _ := payload[code].(map[string]any)
+		for lang := range mapFromAny(template["msg"]) {
+			if !languageAllowed(lang, allowed) {
+				return nil, fmt.Errorf("automation %s uses language %q, which no feed has enabled (configured: %s)", code, lang, strings.Join(allowed, ", "))
+			}
+		}
+	}
 	out := alertTemplatesXML{
 		XMLName:     xml.Name{Local: "automations"},
 		Automations: make([]alertTemplateXML, 0, len(keys)),
@@ -225,6 +247,7 @@ func templateToXML(code string, source map[string]any) alertTemplateXML {
 	if len(msg) == 0 {
 		msg = mapFromAny(content["lang"])
 	}
+	readers := mapFromAny(source["readers"])
 	files := mapFromAny(source["files"])
 	if len(files) == 0 {
 		files = mapFromAny(content["file"])
@@ -238,15 +261,17 @@ func templateToXML(code string, source map[string]any) alertTemplateXML {
 	sort.Strings(langKeys)
 	for _, lang := range langKeys {
 		langs = append(langs, langTemplateXML{
-			Code: lang,
-			Text: fmt.Sprint(msg[lang]),
-			File: fmt.Sprint(files[lang]),
+			Code:     lang,
+			ReaderID: stringFromMap(readers, lang),
+			Text:     fmt.Sprint(msg[lang]),
+			File:     stringFromMap(files, lang),
 		})
 	}
 	automated, _ := source["automated"].(map[string]any)
 	schedule := automationScheduleXMLFromAny(automated["schedule"])
 	target := automationTargetXMLFromAny(automated["target"])
 	return alertTemplateXML{
+		ID:          stringFromMap(source, "id"),
 		Name:        fallbackText(stringFromMap(source, "name"), code),
 		Description: stringFromMap(source, "description"),
 		Automated: automatedTemplateXML{
@@ -263,9 +288,11 @@ func templateToXML(code string, source map[string]any) alertTemplateXML {
 			},
 			Duration: durationAttrsXML{Hours: strconvText(hours), Minutes: strconvText(minutes)},
 			SenderID: stringFromMap(same, "sender_id"),
+			Tone:     stringFromMap(same, "tone"),
 		},
 		Content: contentTemplateXML{
 			AttentionTone: stringFromMap(content, "attention_tone"),
+			ReaderID:      stringFromMap(content, "reader_id"),
 			Langs:         langs,
 		},
 		Target: target,
@@ -478,4 +505,37 @@ func clampInt(value int, minValue int, maxValue int) int {
 		return maxValue
 	}
 	return value
+}
+
+// configuredLanguages lists every language code enabled on at least one feed.
+// Automation text may only be written in these languages.
+func configuredLanguages(configPath string) ([]string, error) {
+	root, err := loadYAMLMap(configPath)
+	if err != nil {
+		return nil, err
+	}
+	parsed, err := loadFeedsXML(configPath, root)
+	if err != nil {
+		return nil, err
+	}
+	codes := []string{}
+	for _, feed := range parsed.Feeds {
+		codes = append(codes, feedLanguages(feed)...)
+	}
+	codes = uniqueStrings(codes)
+	sort.Strings(codes)
+	return codes, nil
+}
+
+// languageAllowed accepts an exact configured code, or a bare base language
+// ("en") when some feed carries a regional form of it ("en-US").
+func languageAllowed(code string, allowed []string) bool {
+	code = strings.ToLower(strings.TrimSpace(code))
+	for _, candidate := range allowed {
+		candidate = strings.ToLower(candidate)
+		if candidate == code || (!strings.Contains(code, "-") && strings.HasPrefix(candidate, code+"-")) {
+			return true
+		}
+	}
+	return false
 }

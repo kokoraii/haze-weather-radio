@@ -6302,6 +6302,57 @@ select option:checked {
 	min-height: 38px
 }
 
+.automation-lang-list {
+	display: grid;
+	gap: 10px;
+}
+
+.automation-lang-block {
+	display: grid;
+	gap: 6px;
+}
+
+.automation-lang-head,
+.automation-lang-add {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 8px;
+}
+
+.automation-lang-head strong {
+	min-width: 56px;
+}
+
+.automation-lang-head input {
+	width: 140px;
+}
+
+.automation-lang-add {
+	margin-top: 8px;
+}
+
+.automation-vars {
+	margin: 8px 0 0;
+	font-size: 0.85em;
+	opacity: 0.85;
+	display: flex;
+	flex-wrap: wrap;
+	gap: 4px;
+	align-items: center;
+}
+
+.automation-vars button {
+	font: inherit;
+	font-family: monospace;
+	padding: 1px 6px;
+	border-radius: 4px;
+	border: 1px solid currentColor;
+	background: transparent;
+	color: inherit;
+	cursor: pointer;
+}
+
 .automation-actions {
 	display: flex;
 	justify-content: flex-end;

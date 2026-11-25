@@ -1,4 +1,5 @@
 import { panelClient } from './lib/ws-client.js';
+import { bindVariableChips } from './lib/variable-chips.js';
 
 const statusBanner = document.getElementById('automationStatusBanner');
 const selectEl = document.getElementById('automationSelect');
@@ -25,12 +26,18 @@ const fields = {
     locations: document.getElementById('automationLocations'),
     duration: document.getElementById('automationDuration'),
     tone: document.getElementById('automationTone'),
-    text: document.getElementById('automationText'),
 };
+const langList = document.getElementById('automationLangList');
+const langSelect = document.getElementById('automationLangSelect');
+const langAddButton = document.getElementById('automationLangAddButton');
+const varsBar = document.querySelector('.automation-vars');
 
 let bound = false;
 let automations = {};
 let selectedKey = '';
+// Languages enabled on at least one feed; the backend rejects any other.
+let configuredLanguages = [];
+let lastTextarea = null;
 
 function escapeHtml(value) {
     return String(value ?? '').replace(/[&<>"']/g, (char) => ({
@@ -70,13 +77,67 @@ function durationParts(raw) {
     return { hr: Number(digits.slice(0, 2)) || 0, min: Number(digits.slice(2, 4)) || 0 };
 }
 
+// Reads the language blocks as { msg: {code: text}, readers: {code: reader} }.
+function readLangBlocks() {
+    const msg = {};
+    const readers = {};
+    langList.querySelectorAll('.automation-lang-block').forEach((block) => {
+        const code = block.dataset.lang;
+        msg[code] = block.querySelector('textarea').value.trim();
+        readers[code] = block.querySelector('input').value.trim();
+    });
+    return { msg, readers };
+}
+
+// The first block is the default; it airs when a feed carries none of the others.
+function langBlock(code, text, reader, removable) {
+    const block = document.createElement('div');
+    block.className = 'automation-lang-block';
+    block.dataset.lang = code;
+    block.innerHTML = `<div class="automation-lang-head">
+            <strong>${escapeHtml(code)}</strong>
+            <input type="text" placeholder="reader (auto)" aria-label="Reader ID for ${escapeHtml(code)}">
+            ${removable ? '<button class="btn-action" type="button">Remove</button>' : '<small>default language</small>'}
+        </div>
+        <textarea rows="6"></textarea>`;
+    block.querySelector('input').value = reader || '';
+    const textarea = block.querySelector('textarea');
+    textarea.value = text || '';
+    textarea.addEventListener('focus', () => { lastTextarea = textarea; });
+    block.querySelector('button')?.addEventListener('click', () => {
+        block.remove();
+        renderLangSelect();
+    });
+    return block;
+}
+
+function fillLangBlocks(msg, readers) {
+    langList.innerHTML = '';
+    const codes = Object.keys(msg);
+    if (!codes.length) codes.push('en');
+    codes.forEach((code, index) => {
+        langList.appendChild(langBlock(code, msg[code], readers[code], index > 0));
+    });
+    lastTextarea = langList.querySelector('textarea');
+    renderLangSelect();
+}
+
+// Offers only languages some feed has enabled and this automation lacks.
+function renderLangSelect() {
+    const used = new Set([...langList.querySelectorAll('.automation-lang-block')].map((block) => block.dataset.lang.toLowerCase()));
+    const available = configuredLanguages.filter((code) => !used.has(code.toLowerCase()));
+    langSelect.innerHTML = available.map((code) => `<option value="${escapeHtml(code)}">${escapeHtml(code)}</option>`).join('');
+    langSelect.disabled = available.length === 0;
+    langAddButton.disabled = available.length === 0;
+}
+
 function readForm() {
     const item = current();
     if (!item) return;
     const previousKey = selectedKey;
     const event = fields.event.value.trim().toUpperCase() || previousKey || 'RWT';
     const duration = durationParts(fields.duration.value);
-    const text = fields.text.value.trim();
+    const { msg, readers } = readLangBlocks();
     const locations = splitCSV(fields.locations.value).map((id) => ({ id, source: 'eccc' }));
     const feedIds = splitCSV(fields.feeds.value || '*');
     const next = {
@@ -103,14 +164,16 @@ function readForm() {
             locations,
             duration,
             content: {
+                ...(item.same?.content || {}),
                 attention_tone: fields.tone.value.trim().toUpperCase() || 'WXR',
-                lang: { en: text },
+                lang: msg,
                 file: {},
             },
         },
         sameEvent: event,
         sameExpire: `${String(duration.hr).padStart(2, '0')}${String(duration.min).padStart(2, '0')}`,
-        msg: { en: text },
+        msg,
+        readers,
         files: {},
     };
     delete automations[previousKey];
@@ -142,7 +205,7 @@ function fillForm() {
     fields.locations.value = (same.locations || []).map((loc) => loc.id || loc).filter(Boolean).join(',');
     fields.duration.value = item.sameExpire || `${String(duration.hr || 0).padStart(2, '0')}${String(duration.min || 15).padStart(2, '0')}`;
     fields.tone.value = content.attention_tone || 'WXR';
-    fields.text.value = item.msg?.en || content.lang?.en || '';
+    fillLangBlocks(item.msg || content.lang || {}, item.readers || {});
 }
 
 function render() {
@@ -168,7 +231,12 @@ function render() {
 async function loadAutomations() {
     statusBanner.textContent = 'Loading automations...';
     statusBanner.dataset.state = 'pending';
-    automations = await panelClient.command('automations.get', {}, 8000) || {};
+    const [loaded, languages] = await Promise.all([
+        panelClient.command('automations.get', {}, 8000),
+        panelClient.command('automations.languages', {}, 8000),
+    ]);
+    automations = loaded || {};
+    configuredLanguages = languages?.languages || [];
     render();
     statusBanner.textContent = 'Automations loaded.';
     statusBanner.dataset.state = 'ok';
@@ -210,6 +278,7 @@ function addAutomation() {
         sameEvent: key,
         sameExpire: '0015',
         msg: { en: '' },
+        readers: {},
         files: {},
     };
     selectedKey = key;
@@ -231,6 +300,12 @@ export function initAutomationsView() {
         fillForm();
     });
     addButton.addEventListener('click', addAutomation);
+    langAddButton.addEventListener('click', () => {
+        if (!langSelect.value) return;
+        langList.appendChild(langBlock(langSelect.value, '', '', true));
+        renderLangSelect();
+    });
+    bindVariableChips(varsBar, () => lastTextarea);
     saveButton.addEventListener('click', () => {
         saveAutomations().catch((error) => {
             statusBanner.textContent = error.message || 'Unable to save automations.';

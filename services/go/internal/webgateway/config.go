@@ -109,6 +109,7 @@ type Config struct {
 	Operator struct {
 		OnAirName    any `yaml:"on_air_name"`
 		OperatorName any `yaml:"operator_name"`
+		PhoneNumber  any `yaml:"phone_number"`
 	} `yaml:"operator"`
 	Services struct {
 		Rust struct {

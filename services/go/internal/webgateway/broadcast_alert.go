@@ -78,9 +78,14 @@ func (s *wsSession) broadcastAlertDataByFeed(payload map[string]any, targets []s
 	if err != nil {
 		return nil, err
 	}
+	varsByFeed, err := s.alertVarsByFeed(payload, targets)
+	if err != nil {
+		return nil, err
+	}
 	dataByFeed := make(map[string]map[string]any, len(targets))
 	for _, feedID := range targets {
-		dataByFeed[feedID] = s.broadcastAlertDataForFeed(payload, feedID, locationsByFeed[feedID], alertID, includeSame, allFeedLocations)
+		feedPayload := payloadWithVariables(payload, varsByFeed[feedID])
+		dataByFeed[feedID] = s.broadcastAlertDataForFeed(feedPayload, feedID, locationsByFeed[feedID], alertID, includeSame, allFeedLocations)
 	}
 	return dataByFeed, nil
 }

@@ -1,5 +1,6 @@
 import { apiCommand, apiGet, session } from './lib/api.js';
 import { panelClient } from './lib/ws-client.js';
+import { bindVariableChips } from './lib/variable-chips.js';
 import { getDashboardState, refreshDashboard, waitForDashboardState } from './dashboard.js';
 
 const TEST_CODES = new Set(['DMO', 'RWT', 'RMT']);
@@ -239,6 +240,7 @@ function buildLayout() {
                             <span>Message text</span>
                             <textarea id="baMessage" rows="6" placeholder="Custom alert text after the generated intro"></textarea>
                         </label>
+                        <p id="baMessageVars" class="automation-vars">Variables (click to insert):</p>
                     </div>
                 </div>
             </section>
@@ -332,6 +334,7 @@ const streamUrl = document.getElementById('baStreamUrl');
 const toneList = document.getElementById('baToneList');
 const introBox = document.getElementById('baIntro');
 const messageBox = document.getElementById('baMessage');
+bindVariableChips(document.getElementById('baMessageVars'), () => messageBox);
 const scheduleEnabled = document.getElementById('baScheduleEnabled');
 const scheduleAt = document.getElementById('baScheduleAt');
 const planEvent = document.getElementById('baPlanEvent');

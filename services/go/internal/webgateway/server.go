@@ -1514,6 +1514,12 @@ func (s *wsSession) executeCommand(command string, payload map[string]any) (any,
 		return s.previewLeadStatement(payload)
 	case "automations.get", "same.templates.get":
 		return loadAlertTemplates(s.configPath)
+	case "automations.languages":
+		languages, err := configuredLanguages(s.configPath)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"languages": languages}, nil
 	case "automations.put", "same.templates.put":
 		content, _ := payload["content"].(string)
 		if content == "" {

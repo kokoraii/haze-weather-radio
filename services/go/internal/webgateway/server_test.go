@@ -2663,6 +2663,7 @@ func TestBroadcastAlertDataByFeedUsesEachFeedLocations(t *testing.T) {
 		"feed_ids":           []any{"mb-0001", "nb-0001"},
 		"locations":          []any{"046211"},
 		"area_names":         []any{"Foreign manual area"},
+		"voice_message":      "Test from {transmitterCall} on {feed-id}.",
 	}, []string{"mb-0001", "nb-0001"}, "manual-test", true, true)
 	if err != nil {
 		t.Fatal(err)
@@ -2696,6 +2697,10 @@ func TestBroadcastAlertDataByFeedUsesEachFeedLocations(t *testing.T) {
 				t.Fatalf("area_names = %#v", areas)
 			}
 			packet, ok := alertmodel.FromMap(data)
+			wantText := "Test from " + test.callsign + " on " + test.feedID + "."
+			if !ok || packet.Content.CustomText != wantText {
+				t.Fatalf("alert packet custom text = %q, want %q", packet.Content.CustomText, wantText)
+			}
 			if !ok || packet.SAME == nil || strings.Join(packet.SAME.Locations, ",") != strings.Join(test.locations, ",") {
 				t.Fatalf("alert packet SAME locations = %#v", packet)
 			}

@@ -33,7 +33,11 @@ func (s *wsSession) previewAlert(payload map[string]any) (map[string]any, error)
 		delete(scopedPayload, "area_names")
 	}
 	scopedPayload["locations"] = locationsByFeed[targets[0]]
-	data := s.broadcastAlertDataForFeed(payload, targets[0], locationsByFeed[targets[0]], alertID, includeSame, allFeedLocations)
+	varsByFeed, err := s.alertVarsByFeed(payload, targets[:1])
+	if err != nil {
+		return nil, err
+	}
+	data := s.broadcastAlertDataForFeed(payloadWithVariables(payload, varsByFeed[targets[0]]), targets[0], locationsByFeed[targets[0]], alertID, includeSame, allFeedLocations)
 	alertText := strings.TrimSpace(stringValue(data, "alert_text"))
 	if alertText == "" {
 		return nil, fmt.Errorf("alert preview text is empty")

@@ -1,4 +1,4 @@
-version: 26.11.18
+version: 26.11.25
 daemon_settings_file: runtime/state/daemonSettings.json
 
 storage:
@@ -421,6 +421,8 @@ operator:
     text: "@meowraii",
     pronunciation: "meow rai"
   ]
+  # Spoken by automations as {phoneNumber}. Leave empty if none.
+  phone_number: ""
   email: [
     address: [
       text: "meowraii",

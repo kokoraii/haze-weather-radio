@@ -1621,6 +1621,9 @@ func normalizePriorityAlertRequest(data map[string]any) (map[string]any, string)
 
 func (p *feedPlanner) preparePriorityAlert(ctx context.Context, data map[string]any) (prepared priorityAlertPreparation, err error) {
 	data, alertID := normalizePriorityAlertRequest(data)
+	if firstText(nil, data, "automation_id") != "" {
+		p.applyAutomationContent(data)
+	}
 	includeSame := includeSameAlert(data)
 
 	isUpdate := strings.EqualFold(firstText(nil, data, "status"), "updated")
@@ -2559,10 +2562,11 @@ func alertAttentionToneEnabled(data map[string]any) bool {
 
 func (p *feedPlanner) renderAlertTTSAsPCM(ctx context.Context, queueID string, outputPath string, alertText string, sampleRate int, channels int, data map[string]any) error {
 	readerID := strings.TrimSpace(firstText(nil, data, "reader_id", "tts_reader_id"))
-	if readerID == "" {
+	automationLanguage := firstText(nil, data, "alert_language")
+	if readerID == "" && automationLanguage == "" {
 		readerID = "00"
 	}
-	language := feedLanguage(p.feed)
+	language := fallbackText(automationLanguage, feedLanguage(p.feed))
 	if strings.TrimSpace(alertText) == "" {
 		renderCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		product, err := p.bridge.RenderProduct(renderCtx, queueID, p.feed.ID, "alerts", language)
@@ -2579,12 +2583,33 @@ func (p *feedPlanner) renderAlertTTSAsPCM(ctx context.Context, queueID string, o
 	if strings.TrimSpace(alertText) == "" {
 		return fmt.Errorf("rendered alert text is empty")
 	}
+	if err := p.synthesizeAlertPCM(ctx, queueID, outputPath, alertText, readerID, language, sampleRate, channels); err != nil {
+		return err
+	}
+	extras, _ := data["alert_extra_langs"].([]automationLang)
+	for index, lang := range extras {
+		segmentPath := fmt.Sprintf("%s.lang%d", outputPath, index)
+		// An empty reader lets TTS pick a voice for the language.
+		err := p.synthesizeAlertPCM(ctx, fmt.Sprintf("%s-lang%d", queueID, index), segmentPath, lang.Text, lang.ReaderID, lang.Code, sampleRate, channels)
+		if err == nil {
+			err = appendPCMWithGap(outputPath, segmentPath, sampleRate, channels, time.Second)
+		}
+		_ = os.Remove(segmentPath)
+		if err != nil {
+			return fmt.Errorf("alert %s segment failed: %w", lang.Code, err)
+		}
+	}
+	return nil
+}
+
+// synthesizeAlertPCM renders one text segment to raw PCM16 at outputPath.
+func (p *feedPlanner) synthesizeAlertPCM(ctx context.Context, queueID string, outputPath string, text string, readerID string, language string, sampleRate int, channels int) error {
 	requestedWAVPath := filepath.Join(p.cfg.OutputDir, safeID(p.feed.ID), queueID+".wav")
 	synthCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 	wavPath, err := p.bridge.Synthesize(synthCtx, synthJob{
 		ID:               queueID,
-		Text:             alertText,
+		Text:             text,
 		ReaderID:         readerID,
 		Language:         language,
 		Timezone:         feedTimezone(p.feed),
@@ -2605,6 +2630,24 @@ func (p *feedPlanner) renderAlertTTSAsPCM(ctx context.Context, queueID string, o
 		return nil
 	}
 	return convertAudioToPCM(ctx, wavPath, outputPath, sampleRate, channels)
+}
+
+// appendPCMWithGap appends gap of silence and then segmentPath's PCM16 to targetPath.
+func appendPCMWithGap(targetPath string, segmentPath string, sampleRate int, channels int, gap time.Duration) error {
+	segment, err := os.ReadFile(segmentPath)
+	if err != nil {
+		return err
+	}
+	file, err := os.OpenFile(targetPath, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	silence := make([]byte, int(gap.Seconds()*float64(sampleRate))*channels*2)
+	if _, err := file.Write(append(silence, segment...)); err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
 }
 
 func combineSAMEAlertAudio(outputPath string, header []byte, voicePath string, eom []byte, sampleRate int, channels int) error {

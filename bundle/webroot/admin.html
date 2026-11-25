@@ -607,10 +607,16 @@
                                     <span>Tone</span>
                                     <input id="automationTone" type="text" placeholder="WXR">
                                 </label>
-                                <label class="daemon-field automation-wide">
+                                <div class="daemon-field automation-wide">
                                     <span>Text</span>
-                                    <textarea id="automationText" rows="7"></textarea>
-                                </label>
+                                    <div id="automationLangList" class="automation-lang-list"></div>
+                                    <div class="automation-lang-add">
+                                        <select id="automationLangSelect" aria-label="Language to add"></select>
+                                        <button id="automationLangAddButton" class="btn-action" type="button">Add Language</button>
+                                    </div>
+                                    <p class="automation-vars">Variables (click to insert):
+                                    </p>
+                                </div>
                             </div>
                             <div class="section-body automation-actions">
                                 <button id="automationAddButton" class="btn-action" type="button">Add</button>
