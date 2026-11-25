@@ -16,7 +16,8 @@ Each automation has one or more `<lang>` blocks:
 - Only languages enabled on at least one feed can be added. The editor offers just those, and the server rejects any other on save. A bare code such as `en` is accepted when a feed carries a regional form (`en-US`, `en-CA`).
 - On each feed, the blocks for the feed's enabled languages air back to back, in the feed's language order, with one second between them.
 - The first block is the default. It airs on a feed that carries none of the automation's languages.
-- `reader_id` on a block picks its voice. The content-level `reader_id` applies to the first block only. Other blocks without one let TTS choose a voice for the language.
+- Each block is spoken in the feed's own language code (an `en` block airs as `en-US` on an `en-US` feed).
+- `reader_id` on a block picks its voice. The content-level `reader_id` applies to the first block only. A block without one uses the first male reader for its language in `readers.xml`.
 
 ## Variables
 

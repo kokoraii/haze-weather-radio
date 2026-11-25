@@ -1,6 +1,7 @@
 package playlist
 
 import (
+	"maps"
 	"path/filepath"
 	"strings"
 	"time"
@@ -17,26 +18,39 @@ type automationLang struct {
 	ReaderID string
 }
 
-// applyAutomationContent resolves an automation request's text for this feed.
+// languageReader asks haze-tts for the first male reader of the request's
+// language. An empty reader would skip reader selection and speak in the
+// engine's default voice (Microsoft David on SAPI).
+const languageReader = "male"
+
+// automationContent resolves an automation request's text for this feed and
+// returns a new map; data is shared across feeds and is not modified. It must
+// run before the request is normalized into an alert packet, because the
+// packet's speech text is taken from alert_text.
+//
 // It keeps only the language blocks the feed has enabled (in the feed's
 // language order), expands variables in each, and stores the first block as
 // alert_text and the rest as alert_extra_langs for renderAlertTTSAsPCM.
-func (p *feedPlanner) applyAutomationContent(data map[string]any) {
+func (p *feedPlanner) automationContent(data map[string]any) map[string]any {
+	out := maps.Clone(data)
 	vars := p.automationFeedVars(data)
 	langs := selectAutomationLangs(feedLanguages(p.feed), automationLangsFromData(data))
 	if len(langs) == 0 {
-		data["alert_text"] = alertvars.Expand(firstText(nil, data, "alert_text"), vars)
-		return
+		out["alert_text"] = alertvars.Expand(firstText(nil, data, "alert_text"), vars)
+		return out
 	}
 	for index := range langs {
 		langs[index].Text = alertvars.Expand(langs[index].Text, vars)
+		if langs[index].ReaderID == "" {
+			langs[index].ReaderID = languageReader
+		}
 	}
 	primary := langs[0]
-	data["alert_text"] = primary.Text
-	data["alert_language"] = primary.Code
-	// Empty lets TTS choose a voice for the block's language.
-	data["reader_id"] = primary.ReaderID
-	data["alert_extra_langs"] = langs[1:]
+	out["alert_text"] = primary.Text
+	out["alert_language"] = primary.Code
+	out["reader_id"] = primary.ReaderID
+	out["alert_extra_langs"] = langs[1:]
+	return out
 }
 
 func automationLangsFromData(data map[string]any) []automationLang {
@@ -56,8 +70,10 @@ func automationLangsFromData(data map[string]any) []automationLang {
 }
 
 // selectAutomationLangs returns the automation blocks the feed carries, in the
-// feed's language order. A feed that carries none of them still airs the first
-// block, so an automation never goes silent on a feed.
+// feed's language order, each tagged with the feed's own language code (en
+// becomes en-US) so TTS voice and dictionary lookups match exactly. A feed
+// that carries none of them still airs the first block, so an automation never
+// goes silent on a feed.
 func selectAutomationLangs(feedLangs []feedLangXML, langs []automationLang) []automationLang {
 	if len(langs) == 0 {
 		return nil
@@ -67,7 +83,9 @@ func selectAutomationLangs(feedLangs []feedLangXML, langs []automationLang) []au
 	for _, feedLang := range feedLangs {
 		if index := matchAutomationLang(feedLang.Code, langs, used); index >= 0 {
 			used[index] = true
-			selected = append(selected, langs[index])
+			lang := langs[index]
+			lang.Code = feedLang.Code
+			selected = append(selected, lang)
 		}
 	}
 	if len(selected) == 0 {

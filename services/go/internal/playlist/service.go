@@ -1620,10 +1620,10 @@ func normalizePriorityAlertRequest(data map[string]any) (map[string]any, string)
 }
 
 func (p *feedPlanner) preparePriorityAlert(ctx context.Context, data map[string]any) (prepared priorityAlertPreparation, err error) {
-	data, alertID := normalizePriorityAlertRequest(data)
 	if firstText(nil, data, "automation_id") != "" {
-		p.applyAutomationContent(data)
+		data = p.automationContent(data)
 	}
+	data, alertID := normalizePriorityAlertRequest(data)
 	includeSame := includeSameAlert(data)
 
 	isUpdate := strings.EqualFold(firstText(nil, data, "status"), "updated")
@@ -2589,7 +2589,6 @@ func (p *feedPlanner) renderAlertTTSAsPCM(ctx context.Context, queueID string, o
 	extras, _ := data["alert_extra_langs"].([]automationLang)
 	for index, lang := range extras {
 		segmentPath := fmt.Sprintf("%s.lang%d", outputPath, index)
-		// An empty reader lets TTS pick a voice for the language.
 		err := p.synthesizeAlertPCM(ctx, fmt.Sprintf("%s-lang%d", queueID, index), segmentPath, lang.Text, lang.ReaderID, lang.Code, sampleRate, channels)
 		if err == nil {
 			err = appendPCMWithGap(outputPath, segmentPath, sampleRate, channels, time.Second)
