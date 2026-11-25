@@ -3,11 +3,8 @@ package webhook
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
@@ -66,6 +63,8 @@ func Run(ctx context.Context, options Options) error {
 	}
 	loadDotEnv(filepath.Join(filepath.Dir(filepath.Clean(options.ConfigPath)), ".env"))
 	loadDotEnv(".env")
+	dispatch := newDispatcher(ctx, webhookHTTPClient(options.Timeout))
+	cache := &configCache{}
 	for {
 		cfg, err := loadConfig(options)
 		if err != nil {
@@ -80,13 +79,14 @@ func Run(ctx context.Context, options Options) error {
 			sleepOrDone(ctx, time.Second)
 			continue
 		}
-		service := &Service{
-			cfg:     cfg,
-			bridge:  bridge,
-			client:  webhookHTTPClient(options.Timeout),
-			timeout: options.Timeout,
-		}
-		err = service.runConnected(ctx)
+		log.Printf("Discord webhook service connected to event bridge")
+		service := &Service{cfg: cfg, cache: cache, dispatch: dispatch}
+		stop := context.AfterFunc(ctx, func() { _ = bridge.Close() })
+		err = bridge.ReadMessages(func(event map[string]any) bool {
+			service.handleEvent(event)
+			return true
+		})
+		stop()
 		_ = bridge.Close()
 		if ctx.Err() != nil {
 			return nil
@@ -96,31 +96,17 @@ func Run(ctx context.Context, options Options) error {
 	}
 }
 
+// Service routes alert events to the configured webhooks. The dispatcher and
+// config cache outlive bridge reconnects.
 type Service struct {
-	cfg     loadedConfig
-	bridge  *bridgeClient
-	client  *http.Client
-	timeout time.Duration
-	cache   configCache
+	cfg      loadedConfig
+	cache    *configCache
+	dispatch *dispatcher
 }
 
-func (s *Service) runConnected(ctx context.Context) error {
-	log.Printf("Discord webhook service connected to event bridge")
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case event, ok := <-s.bridge.Events():
-			if !ok {
-				return fmt.Errorf("event bridge closed")
-			}
-			s.handleEvent(ctx, event)
-		}
-	}
-}
-
-func (s *Service) handleEvent(ctx context.Context, event map[string]any) {
-	if firstText(event, nil, "type") != "cap.alert.audio.ready" {
+// handleEvent never blocks: the broker disconnects clients that stop reading.
+func (s *Service) handleEvent(event map[string]any) {
+	if firstText(event, nil, "type") != alertAudioReady {
 		return
 	}
 	data := mapAt(event, "data")
@@ -146,45 +132,32 @@ func (s *Service) handleEvent(ctx context.Context, event map[string]any) {
 		if isAdmin && !cfg.logAdminAlerts() {
 			continue
 		}
-		if err := s.dispatch(ctx, cfg, feedID, sameEvent, data); err != nil {
-			log.Printf("[%s] Discord webhook dispatch failed: %v", feedID, err)
+		job := delivery{
+			feedID: feedID,
+			label:  fmt.Sprintf("%s (%s)", sameEvent, firstNonBlank(firstText(nil, data, "alert_id"), firstText(nil, data, "title"))),
+			url:    cfg.WebhookURL,
+			body:   buildPayload(cfg, feedID, sameEvent, data, s.cfg.ListenBaseURL),
+		}
+		if !s.dispatch.enqueue(job, s.audioTranscode(cfg, feedID, data)) {
+			log.Printf("[%s] Discord webhook queue full, alert dropped: %s", feedID, job.label)
 		}
 	}
 }
 
-func (s *Service) dispatch(ctx context.Context, cfg WebhookConfig, feedID string, sameEvent string, data map[string]any) error {
-	payload := buildPayload(cfg, feedID, sameEvent, data, s.cfg.ListenBaseURL)
-	audioPath := resolvePath(s.cfg.BaseDir, firstText(nil, data, "audio_path"))
-	attached := false
-	var audio attachment
-	var err error
-	if cfg.audioEnabled() && audioPath != "" {
-		audio, err = transcodeAlertAudio(ctx, audioPath, cfg.EmbedAudio.Codec, intAt(data, "sample_rate", 48000), intAt(data, "channels", 1))
+// audioTranscode returns the attachment job for an alert, or nil when the
+// webhook does not embed audio.
+func (s *Service) audioTranscode(cfg WebhookConfig, feedID string, data map[string]any) func() attachment {
+	rel := firstText(nil, data, "audio_path")
+	if !cfg.audioEnabled() || rel == "" {
+		return nil
+	}
+	return func() attachment {
+		audio, err := transcodeAlertAudio(s.dispatch.ctx, resolvePath(s.cfg.BaseDir, rel), cfg.EmbedAudio.Codec, intAt(data, "sample_rate", 48000), intAt(data, "channels", 1))
 		if err != nil {
 			log.Printf("[%s] Discord webhook audio attachment skipped: %v", feedID, err)
-		} else {
-			attached = true
 		}
+		return audio
 	}
-	status, detail, err := s.post(ctx, cfg.WebhookURL, payload, audio)
-	if err != nil {
-		return err
-	}
-	if attached && (status == http.StatusBadRequest || status == http.StatusRequestEntityTooLarge) {
-		log.Printf("[%s] Discord webhook rejected alert attachment, retrying without audio", feedID)
-		status, detail, err = s.post(ctx, cfg.WebhookURL, payload, attachment{})
-		if err != nil {
-			return err
-		}
-	}
-	if status < 200 || status >= 300 {
-		if detail != "" {
-			return fmt.Errorf("HTTP %d: %s", status, clipText(detail, 240))
-		}
-		return fmt.Errorf("HTTP %d", status)
-	}
-	log.Printf("[%s] Discord webhook dispatched: %s (%s)", feedID, sameEvent, firstNonBlank(firstText(nil, data, "alert_id"), firstText(nil, data, "title")))
-	return nil
 }
 
 type discordPayload struct {
@@ -305,59 +278,6 @@ func integratedListenURL(base string, feedID string) string {
 	query.Set("codec", "pcm16")
 	parsed.RawQuery = query.Encode()
 	return parsed.String()
-}
-
-func (s *Service) post(ctx context.Context, url string, payload discordPayload, file attachment) (int, string, error) {
-	if len(file.Data) == 0 {
-		body, err := json.Marshal(payload)
-		if err != nil {
-			return 0, "", err
-		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-		if err != nil {
-			return 0, "", err
-		}
-		req.Header.Set("Content-Type", "application/json")
-		return doRequest(s.client, req)
-	}
-	var body bytes.Buffer
-	writer := multipart.NewWriter(&body)
-	payloadBytes, err := json.Marshal(payload)
-	if err != nil {
-		return 0, "", err
-	}
-	if err := writer.WriteField("payload_json", string(payloadBytes)); err != nil {
-		return 0, "", err
-	}
-	part, err := writer.CreateFormFile("files[0]", file.Name)
-	if err != nil {
-		return 0, "", err
-	}
-	if _, err := part.Write(file.Data); err != nil {
-		return 0, "", err
-	}
-	if err := writer.Close(); err != nil {
-		return 0, "", err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, &body)
-	if err != nil {
-		return 0, "", err
-	}
-	req.Header.Set("Content-Type", writer.FormDataContentType())
-	return doRequest(s.client, req)
-}
-
-func doRequest(client *http.Client, req *http.Request) (int, string, error) {
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, "", err
-	}
-	defer func() {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 512))
-		_ = resp.Body.Close()
-	}()
-	detail, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	return resp.StatusCode, strings.TrimSpace(string(detail)), nil
 }
 
 type attachment struct {

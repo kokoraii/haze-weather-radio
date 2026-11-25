@@ -8,43 +8,18 @@ import (
 	"github.com/meowraii/haze-weather-radio/services/go/internal/bridgeclient"
 )
 
-type bridgeClient struct {
-	bridge *bridgeclient.Conn
-	events chan map[string]any
-}
+const alertAudioReady = "cap.alert.audio.ready"
 
-func connectBridge(ctx context.Context, addr string) (*bridgeClient, error) {
-	bridge, err := bridgeclient.Dial(ctx, bridgeclient.Options{Addr: addr})
-	if err != nil {
-		return nil, err
-	}
-	client := &bridgeClient{
-		bridge: bridge,
-		events: make(chan map[string]any, 128),
-	}
-	go client.readLoop()
-	return client, nil
-}
-
-func (c *bridgeClient) Close() error {
-	if c == nil {
-		return nil
-	}
-	return c.bridge.Close()
-}
-
-func (c *bridgeClient) Events() <-chan map[string]any {
-	return c.events
-}
-
-func (c *bridgeClient) readLoop() {
-	defer close(c.events)
-	_ = c.bridge.ReadMessages(func(message map[string]any) bool {
-		select {
-		case c.events <- message:
-		default:
-		}
-		return true
+// connectBridge subscribes to alert-audio events only. Without a subscription
+// the broker sends every event on the bus (playout PCM, status).
+func connectBridge(ctx context.Context, addr string) (*bridgeclient.Conn, error) {
+	return bridgeclient.Dial(ctx, bridgeclient.Options{
+		Addr: addr,
+		Register: &bridgeclient.Registration{
+			ClientID:      serviceID,
+			ReceiveEvents: true,
+			Subscriptions: []string{alertAudioReady},
+		},
 	})
 }
 
