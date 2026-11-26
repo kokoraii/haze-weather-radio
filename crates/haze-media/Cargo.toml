@@ -27,7 +27,7 @@ anyhow = "1.0"
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-quick-xml = { version = "0.38", features = ["serialize"] }
+quick-xml = { version = "0.42", features = ["serialize"] }
 hound = "3.5"
 haze-bridge-client = { path = "../haze-bridge-client" }
 haze-contracts = { path = "../haze-contracts" }
