@@ -15,7 +15,7 @@ anyhow = "1.0"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.5", features = ["derive", "env"] }
-cpal = "0.16"
+cpal = "0.18"
 dunce = "1.0"
 haze-media = { path = "../haze-media" }
 haze-bridge-client = { path = "../haze-bridge-client" }
@@ -26,7 +26,7 @@ haze-same = { path = "../haze-same" }
 hound = "3.5"
 memmap2 = "0.9"
 mimalloc = { version = "0.1", default-features = false }
-quick-xml = { version = "0.38", features = ["serialize"] }
+quick-xml = { version = "0.42", features = ["serialize"] }
 rtrb = "0.3.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

@@ -1710,7 +1710,7 @@ fn preflight_scene_xml(xml: &str) -> Result<(), SceneError> {
     let mut node_count = 0_usize;
     loop {
         match reader.read_event() {
-            Ok(Event::Start(start)) if start.name().as_ref() == b"node" => {
+            Ok(Event::Start(start)) if start.name().as_ref() == "node" => {
                 node_depth += 1;
                 node_count += 1;
                 if node_depth > MAX_SCENE_DEPTH {
@@ -1724,7 +1724,7 @@ fn preflight_scene_xml(xml: &str) -> Result<(), SceneError> {
                     )));
                 }
             }
-            Ok(Event::Empty(empty)) if empty.name().as_ref() == b"node" => {
+            Ok(Event::Empty(empty)) if empty.name().as_ref() == "node" => {
                 node_count += 1;
                 if node_depth + 1 > MAX_SCENE_DEPTH {
                     return Err(SceneError::XmlDeserialize(format!(
@@ -1737,7 +1737,7 @@ fn preflight_scene_xml(xml: &str) -> Result<(), SceneError> {
                     )));
                 }
             }
-            Ok(Event::End(end)) if end.name().as_ref() == b"node" => {
+            Ok(Event::End(end)) if end.name().as_ref() == "node" => {
                 node_depth = node_depth.saturating_sub(1);
             }
             Ok(Event::Eof) => return Ok(()),

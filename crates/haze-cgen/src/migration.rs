@@ -5,12 +5,15 @@
 //! environment placeholders intact while adding only the schema version 2
 //! defaults that have unambiguous legacy behavior.
 
+use std::borrow::Cow;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
+use quick_xml::events::attributes::Attribute;
 use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
+use quick_xml::name::QName;
 use quick_xml::{Reader, Writer};
 use thiserror::Error;
 
@@ -234,8 +237,7 @@ fn inspect_document(xml: &[u8]) -> Result<u16, MigrationError> {
                 }
             }
             Event::Text(text) if depth == 0 => {
-                let decoded = text.decode().map_err(|_| MigrationError::InvalidXml)?;
-                if !decoded.trim().is_empty() {
+                if !text.xml10_content().trim().is_empty() {
                     return Err(MigrationError::InvalidXml);
                 }
             }
@@ -259,7 +261,7 @@ fn inspect_document(xml: &[u8]) -> Result<u16, MigrationError> {
 }
 
 fn schema_version_from_root(root: &BytesStart<'_>) -> Result<u16, MigrationError> {
-    let Some(value) = attribute_value(root, b"schema_version")? else {
+    let Some(value) = attribute_value(root, "schema_version")? else {
         return Ok(LEGACY_SCHEMA_VERSION);
     };
     value
@@ -362,8 +364,7 @@ fn migrate_legacy_xml(xml: &[u8], report: &mut MigrationReport) -> Result<Vec<u8
                 }
             }
             Event::End(end) => {
-                let closing_name = std::str::from_utf8(end.name().into_inner())
-                    .map_err(|_| MigrationError::InvalidXml)?;
+                let closing_name = end.name().into_inner();
                 if stack.last().map(String::as_str) != Some(closing_name) {
                     return Err(MigrationError::InvalidXml);
                 }
@@ -423,8 +424,7 @@ fn infer_legacy_force_layouts(xml: &[u8]) -> Result<Vec<&'static str>, Migration
                 }
             }
             Event::End(end) => {
-                let closing_name = std::str::from_utf8(end.name().into_inner())
-                    .map_err(|_| MigrationError::InvalidXml)?;
+                let closing_name = end.name().into_inner();
                 if stack.last().map(String::as_str) != Some(closing_name) {
                     return Err(MigrationError::InvalidXml);
                 }
@@ -459,13 +459,13 @@ fn observe_legacy_audio_rendition(
     let Some(maximum_channels) = active_channels.as_mut() else {
         return Err(MigrationError::InvalidXml);
     };
-    let enabled = attribute_value(start, b"enabled")?
+    let enabled = attribute_value(start, "enabled")?
         .map(|value| migration_bool_text(&value, true))
         .unwrap_or(true);
     if !enabled {
         return Ok(());
     }
-    let channels = attribute_value(start, b"channels")?
+    let channels = attribute_value(start, "channels")?
         .map(|value| {
             value
                 .trim()
@@ -499,7 +499,7 @@ fn force_layout_for_channels(channels: u16) -> &'static str {
 }
 
 fn concrete_feed_id(start: &BytesStart<'_>, feed_index: usize) -> Result<String, MigrationError> {
-    let id = attribute_value(start, b"id")?.unwrap_or_default();
+    let id = attribute_value(start, "id")?.unwrap_or_default();
     let id = id.trim();
     if id.is_empty() || id == "*" {
         return Err(MigrationError::MissingConcreteFeedId { index: feed_index });
@@ -530,7 +530,7 @@ fn migrate_feed_element(
             && stack[stack.len() - 2] == "feed");
 
     if priority_input {
-        if let Some(candidate) = attribute_value(start, b"feed_id")? {
+        if let Some(candidate) = attribute_value(start, "feed_id")? {
             let candidate = candidate.trim();
             if !candidate.is_empty() && candidate != "*" {
                 feed.preferred_alert_feed = candidate.to_string();
@@ -687,8 +687,9 @@ fn default_attribute_updates<'a>(defaults: &'a [(&'a str, &'a str)]) -> Vec<Attr
 
 #[derive(Debug)]
 struct OwnedAttribute {
-    key: Vec<u8>,
-    value: Vec<u8>,
+    key: String,
+    /// Escaped, as it appears in the XML.
+    value: String,
 }
 
 fn update_attributes(
@@ -699,8 +700,8 @@ fn update_attributes(
     for attribute in start.attributes().with_checks(true) {
         let attribute = attribute.map_err(|_| MigrationError::InvalidXml)?;
         attributes.push(OwnedAttribute {
-            key: attribute.key.as_ref().to_vec(),
-            value: attribute.value.as_ref().to_vec(),
+            key: attribute.key.as_ref().to_owned(),
+            value: attribute.value.into_owned(),
         });
     }
 
@@ -708,10 +709,10 @@ fn update_attributes(
     for update in updates {
         let existing = attributes
             .iter_mut()
-            .find(|attribute| attribute.key.as_slice() == update.key.as_bytes());
+            .find(|attribute| attribute.key == update.key);
         match existing {
             Some(attribute) => {
-                let decoded = decode_attribute_bytes(&attribute.value)?;
+                let decoded = unescape_attribute(&attribute.value)?;
                 let should_replace = match update.condition {
                     UpdateCondition::Always => decoded != update.value,
                     UpdateCondition::Missing => false,
@@ -720,14 +721,14 @@ fn update_attributes(
                     }
                 };
                 if should_replace {
-                    attribute.value = escaped_attribute_bytes(update.value);
+                    attribute.value = quick_xml::escape::escape(update.value).into_owned();
                     changed += 1;
                 }
             }
             None => {
                 attributes.push(OwnedAttribute {
-                    key: update.key.as_bytes().to_vec(),
-                    value: escaped_attribute_bytes(update.value),
+                    key: update.key.to_owned(),
+                    value: quick_xml::escape::escape(update.value).into_owned(),
                 });
                 changed += 1;
             }
@@ -740,12 +741,16 @@ fn update_attributes(
 
     let mut rebuilt = BytesStart::new(element_name(start)?.to_string());
     for attribute in &attributes {
-        rebuilt.push_attribute((attribute.key.as_slice(), attribute.value.as_slice()));
+        // The value is already escaped, so it is pushed raw: the tuple forms escape again.
+        rebuilt.push_attribute(Attribute {
+            key: QName(&attribute.key),
+            value: Cow::Borrowed(&attribute.value),
+        });
     }
     Ok((rebuilt, changed))
 }
 
-fn attribute_value(start: &BytesStart<'_>, key: &[u8]) -> Result<Option<String>, MigrationError> {
+fn attribute_value(start: &BytesStart<'_>, key: &str) -> Result<Option<String>, MigrationError> {
     let attribute = start
         .try_get_attribute(key)
         .map_err(|_| MigrationError::InvalidXml)?;
@@ -753,26 +758,19 @@ fn attribute_value(start: &BytesStart<'_>, key: &[u8]) -> Result<Option<String>,
         return Ok(None);
     };
     attribute
-        .decode_and_unescape_value(start.decoder())
+        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
         .map(|value| Some(value.into_owned()))
         .map_err(|_| MigrationError::InvalidXml)
 }
 
-fn decode_attribute_bytes(value: &[u8]) -> Result<String, MigrationError> {
-    let value = std::str::from_utf8(value).map_err(|_| MigrationError::InvalidXml)?;
+fn unescape_attribute(value: &str) -> Result<String, MigrationError> {
     quick_xml::escape::unescape(value)
         .map(|value| value.into_owned())
         .map_err(|_| MigrationError::InvalidXml)
 }
 
-fn escaped_attribute_bytes(value: &str) -> Vec<u8> {
-    quick_xml::escape::escape(value).as_bytes().to_vec()
-}
-
 fn element_name(start: &BytesStart<'_>) -> Result<String, MigrationError> {
-    std::str::from_utf8(start.name().into_inner())
-        .map(str::to_owned)
-        .map_err(|_| MigrationError::InvalidXml)
+    Ok(start.name().into_inner().to_owned())
 }
 
 fn write_event<'a>(writer: &mut Writer<Vec<u8>>, event: Event<'a>) -> Result<(), MigrationError> {

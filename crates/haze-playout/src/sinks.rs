@@ -558,9 +558,11 @@ impl AudioDeviceSink {
             host.output_devices()?
                 .find(|device| {
                     device
-                        .name()
-                        .map(|name| {
-                            name.to_ascii_lowercase()
+                        .description()
+                        .map(|description| {
+                            description
+                                .name()
+                                .to_ascii_lowercase()
                                 .contains(&device_name.to_ascii_lowercase())
                         })
                         .unwrap_or(false)
@@ -569,7 +571,7 @@ impl AudioDeviceSink {
         };
         let config = cpal::StreamConfig {
             channels,
-            sample_rate: cpal::SampleRate(sample_rate),
+            sample_rate,
             buffer_size: cpal::BufferSize::Default,
         };
         let samples_per_second = device_samples_per_second(sample_rate, channels);
@@ -578,7 +580,7 @@ impl AudioDeviceSink {
         let max_pending_samples =
             samples_for_duration(samples_per_second, AUDIO_DEVICE_MAX_PENDING_MS);
         let stream = device.build_output_stream(
-            &config,
+            config,
             move |output: &mut [i16], _| {
                 let stale_samples = device_stale_samples_to_drop(
                     consumer.slots(),

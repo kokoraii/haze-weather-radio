@@ -2117,8 +2117,7 @@ fn reject_legacy_cgen_xml(path: &Path, raw: &str) -> Result<()> {
         match reader.read_event() {
             Ok(Event::Start(event)) => {
                 let element_name = event.name();
-                let name_bytes = element_name.as_ref();
-                let name = std::str::from_utf8(name_bytes).unwrap_or_default();
+                let name = element_name.as_ref();
                 let parent = stack.last().map(String::as_str).unwrap_or_default();
                 if legacy_element(parent, name) {
                     bail!(
@@ -2132,8 +2131,7 @@ fn reject_legacy_cgen_xml(path: &Path, raw: &str) -> Result<()> {
             }
             Ok(Event::Empty(event)) => {
                 let element_name = event.name();
-                let name_bytes = element_name.as_ref();
-                let name = std::str::from_utf8(name_bytes).unwrap_or_default();
+                let name = element_name.as_ref();
                 let parent = stack.last().map(String::as_str).unwrap_or_default();
                 if legacy_element(parent, name) {
                     bail!(
@@ -2165,8 +2163,7 @@ fn reject_legacy_attrs<'a>(
     for attr in attributes {
         let attr = attr
             .with_context(|| format!("failed to read cgen XML attribute in {}", path.display()))?;
-        let key_bytes = attr.key.as_ref();
-        let key = std::str::from_utf8(key_bytes).unwrap_or_default();
+        let key = attr.key.as_ref();
         if legacy_attribute(name, key) {
             bail!(
                 "legacy cgen {} @{} attribute is no longer supported in {}",
