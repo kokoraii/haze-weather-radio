@@ -1,10 +1,28 @@
-<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="UTF-8"?>
 <automations>
-  <automation id="required_weekly_test">
-    <name>Required Weekly Test</name>
-    <description>Weekly Weatheradio alarm test automation.</description>
-    <enabled>true</enabled>
+  <automation id="automation_variables_test">
+    <name>Weekly Test</name>
+    <description>Automated Weekly and Monthly Tests</description>
+    <automated>
+      <enabled>true</enabled>
+      <timing>
+        <months></months>
+        <days></days>
+        <weekdays>wed</weekdays>
+        <hours>12</hours>
+        <minutes>0</minutes>
+        <seconds>0</seconds>
+        <weeks>
+          <week event_override="RMT">1</week>
+          <week>2</week>
+          <week>3</week>
+          <week>4</week>
+        </weeks>
+      </timing>
+    </automated>
     <schedule>
+      <months></months>
+      <days></days>
       <weekdays>wed</weekdays>
       <hours>12</hours>
       <minutes>0</minutes>
@@ -14,26 +32,29 @@
         <week>2</week>
         <week>3</week>
         <week>4</week>
-        <week>5</week>
       </weeks>
     </schedule>
-    <target>
-      <feed id="*"/>
-    </target>
     <same>
       <enabled>true</enabled>
       <originator>WXR</originator>
       <event>RWT</event>
-      <locations/>
-      <duration hr="0" min="15"/>
-      <sender_id/>
-      <tone>WXR</tone>
+      <locations></locations>
+      <duration hr="01" min="00"></duration>
+      <sender_id></sender_id>
+      <tone>NONE</tone>
     </same>
-    <content attention_tone="WXR" reader_id="000">
+    <content attention_tone="NONE">
       <lang code="en">
-        <text>The preceding signal was a test of the weather radio alarm system. During particularly dangerous situations, specially built receivers will be automatically activated to warn of the impending hazard. Tests of this system are normally activated by the operator of this radio network. Required Weekly Tests are normally sent each Wednesday at noon, with the Required Monthly Test sent on the first Wednesday of the month. This concludes this test of the weather radio alarm system.</text>
-        <file/>
+        <text>The preceding signal was the {eventType} of your weather radio&#39;s tone alarm feature on feed {feed-id}. During dangerous situations, specially built receivers automatically activate to warn of impending hazards. Tests of this system are normally conducted by {networkName} each {autoDay} at 12 o&#39;clock noon. {feed-id} services the {primaryCoverage} area and surrounding localities. This concludes this test of the weather radio tone alarm feature from {networkName}.</text>
+        <file></file>
+      </lang>
+      <lang code="fr-CA">
+        <text>Le signal précédent était le {eventType} de la fonction d’alarme sonore de votre radio météo sur le service {feed-id}. En cas de situation dangereuse, des récepteurs spécialement conçus s’activent automatiquement pour vous avertir d’un danger imminent. Des tests de ce système sont normalement effectués par {networkName} chaque {autoDay} à midi. Le service {feed-id} dessert la région de {primaryCoverage} et les localités environnantes. Ceci conclut ce test de la fonction d’alarme sonore de la radio météo de {networkName}.</text>
+        <file></file>
       </lang>
     </content>
+    <target>
+      <feed id="*"></feed>
+    </target>
   </automation>
 </automations>
