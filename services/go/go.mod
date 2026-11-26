@@ -11,7 +11,6 @@ require (
 	github.com/hraban/opus v0.0.0-20251117090126-c76ea7e21bf3
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/jonas-p/go-shp v0.1.1
-	github.com/k2-fsa/sherpa-onnx-go v1.13.3
 	github.com/klauspost/compress v1.18.6
 	github.com/pion/interceptor v0.1.45
 	github.com/pion/rtp v1.10.2
@@ -29,6 +28,12 @@ require (
 )
 
 require (
+	github.com/k2-fsa/sherpa-onnx-go-linux/v2 v2.0.3 // indirect
+	github.com/k2-fsa/sherpa-onnx-go-macos/v2 v2.0.3 // indirect
+	github.com/k2-fsa/sherpa-onnx-go-windows/v2 v2.0.3 // indirect
+)
+
+require (
 	aidanwoods.dev/go-result v0.3.1 // indirect
 	github.com/boombuler/barcode v1.0.1-0.20190219062509-6c824513bacc // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
@@ -39,9 +44,7 @@ require (
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
-	github.com/k2-fsa/sherpa-onnx-go-linux v1.13.3 // indirect
-	github.com/k2-fsa/sherpa-onnx-go-macos v1.13.3 // indirect
-	github.com/k2-fsa/sherpa-onnx-go-windows v1.13.3 // indirect
+	github.com/k2-fsa/sherpa-onnx-go/v2 v2.0.3
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/pion/datachannel v1.6.0 // indirect
