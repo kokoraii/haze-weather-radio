@@ -15,7 +15,7 @@ anyhow = "1.0"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.5", features = ["derive", "env"] }
-cpal = "0.16"
+cpal = "0.18"
 dunce = "1.0"
 haze-media = { path = "../haze-media" }
 haze-bridge-client = { path = "../haze-bridge-client" }
