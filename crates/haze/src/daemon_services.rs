@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, UdpSocket};
@@ -1150,6 +1150,11 @@ fn xml_bool(raw: &str, fallback: bool) -> bool {
 struct AutomationDispatchLedger {
     #[serde(default)]
     dispatched: HashMap<String, i64>,
+    /// Unix seconds when the scheduler first saw each automation enabled.
+    /// Catch-up never fires a slot scheduled before this, so enabling (or
+    /// creating) an automation does not replay the past day's slots.
+    #[serde(default)]
+    enabled_since: HashMap<String, i64>,
 }
 
 impl AutomationDispatchLedger {
@@ -1173,6 +1178,35 @@ impl AutomationDispatchLedger {
 
     fn has_dispatched(&self, key: &str) -> bool {
         self.dispatched.contains_key(key)
+    }
+
+    /// Stamps newly enabled automations with `now` and forgets ones that are no
+    /// longer enabled, so disabling and re-enabling starts a fresh window.
+    /// Returns true when the ledger changed.
+    fn sync_enabled<'a>(
+        &mut self,
+        enabled_ids: impl IntoIterator<Item = &'a str>,
+        now: DateTime<Utc>,
+    ) -> bool {
+        let enabled: HashSet<&str> = enabled_ids.into_iter().collect();
+        let before = self.enabled_since.len();
+        self.enabled_since
+            .retain(|id, _| enabled.contains(id.as_str()));
+        let mut changed = self.enabled_since.len() != before;
+        for id in enabled {
+            if !self.enabled_since.contains_key(id) {
+                self.enabled_since.insert(id.to_string(), now.timestamp());
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Whether a slot predates the automation being enabled.
+    fn before_enabled(&self, automation_id: &str, scheduled_for: DateTime<Utc>) -> bool {
+        self.enabled_since
+            .get(automation_id)
+            .is_some_and(|since| scheduled_for.timestamp() < *since)
     }
 
     fn record(&mut self, key: String, scheduled_for: DateTime<Utc>) {
@@ -1271,6 +1305,11 @@ fn scheduler_loop(
 ) {
     let dispatch_state_path = runtime_dir.join(AUTOMATION_DISPATCH_STATE_FILE);
     let mut dispatch_ledger = AutomationDispatchLedger::load(&dispatch_state_path);
+    if dispatch_ledger.sync_enabled(plan.automations.iter().map(|a| a.id.as_str()), Utc::now()) {
+        if let Err(error) = dispatch_ledger.save(&dispatch_state_path) {
+            warn!(path = %dispatch_state_path.display(), %error, "failed to persist automation dispatch state");
+        }
+    }
     let mut pending_dispatches = HashMap::<String, PendingAutomationDispatch>::new();
     let mut last_minute_key = String::new();
     let mut last_second_key = String::new();
@@ -1325,6 +1364,9 @@ fn scheduler_loop(
                     let Some(due) = automation.due_for_target(now_utc, target) else {
                         continue;
                     };
+                    if dispatch_ledger.before_enabled(&automation.id, due.scheduled_for) {
+                        continue;
+                    }
                     let dispatch_key = automation.dispatch_key(target, due.scheduled_for);
                     if dispatch_ledger.has_dispatched(&dispatch_key) {
                         continue;
@@ -2718,6 +2760,26 @@ mod tests {
 
         let restored = AutomationDispatchLedger::load(&path);
         assert!(restored.has_dispatched("required_weekly_test:cwxr-on01:1783526400000"));
+    }
+
+    #[test]
+    fn catch_up_skips_slots_from_before_an_automation_was_enabled() {
+        let enabled_at = Utc::now();
+        let mut ledger = AutomationDispatchLedger::default();
+        assert!(ledger.sync_enabled(["weekly"], enabled_at));
+        let earlier = enabled_at - chrono::Duration::hours(5);
+        let later = enabled_at + chrono::Duration::minutes(1);
+        assert!(ledger.before_enabled("weekly", earlier));
+        assert!(!ledger.before_enabled("weekly", later));
+
+        // A restart keeps the original stamp.
+        assert!(!ledger.sync_enabled(["weekly"], later));
+        assert!(ledger.before_enabled("weekly", earlier));
+
+        // Disabling forgets it, so re-enabling starts a fresh window.
+        assert!(ledger.sync_enabled([], later));
+        assert!(ledger.sync_enabled(["weekly"], later));
+        assert!(ledger.before_enabled("weekly", enabled_at));
     }
 
     #[test]
